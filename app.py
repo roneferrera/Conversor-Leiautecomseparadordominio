@@ -457,20 +457,9 @@ def main():
     )
 
     with st.sidebar:
-        st.markdown(f"### Sobre")
+        st.markdown("### Sobre")
         st.markdown(f"**Versao:** {VERSAO}")
         st.markdown("**Thomson Reuters - Dominio Sistemas**")
-        st.markdown("---")
-        st.markdown("### Estrutura gerada")
-        st.markdown("**Tipo X** (1 debito, 1 credito):")
-        st.code("|6000|X||||\n|6100|DATA|DEB|CRED|VALOR||HIST|||||||", language=None)
-        st.markdown("**Tipo D** (1 debito, N creditos):")
-        st.code("|6000|D||||\n|6100|DATA|DEB||VALOR||HIST|||||||\n|6100|DATA||CRED|VALOR||HIST|||||||", language=None)
-        st.markdown("**Tipo C** (N debitos, 1 credito):")
-        st.code("|6000|C||||\n|6100|DATA||CRED|VALOR||HIST|||||||\n|6100|DATA|DEB||VALOR||HIST|||||||", language=None)
-        st.markdown("---")
-        st.markdown("### Tipos")
-        st.markdown("| Tipo | Regra |\n|------|-------|\n| X | 1 deb, 1 cred |\n| D | 1 deb, N cred |\n| C | N deb, 1 cred |\n| V | N deb, N cred |")
         st.markdown("---")
         st.markdown("### Versoes")
         st.markdown("**V3.1** - C: credito primeiro, X: numa linha")
@@ -528,11 +517,19 @@ def main():
 
     arquivo = st.file_uploader("Arquivo SPED ECD", type=["txt"])
 
-    gerar_6110 = st.checkbox(
-        "Gerar registro 6110 (analitico por partida)",
-        value=False,
-        help="Quando ativado, gera uma linha 6110 apos cada linha 6100. Desabilitado por padrao.",
-    )
+    col_op1, col_op2 = st.columns(2)
+    with col_op1:
+        gerar_6110 = st.checkbox(
+            "Gerar registro 6110 (analitico por partida)",
+            value=False,
+            help="Quando ativado, gera uma linha 6110 apos cada linha 6100.",
+        )
+    with col_op2:
+        exibir_log = st.checkbox(
+            "Exibir log de processamento",
+            value=False,
+            help="Quando ativado, exibe o log detalhado apos a conversao.",
+        )
 
     st.markdown("")
     b1, b2 = st.columns(2)
@@ -605,18 +602,19 @@ def main():
             type="primary",
         )
 
-    st.markdown("**Log de processamento**")
-    log_txt  = "\n".join(st.session_state.log)
-    tem_erro = any(str(l).startswith("ERRO") for l in st.session_state.log)
-    cor      = "#D32F2F" if tem_erro else "#388E3C"
-    st.markdown(
-        "<div style='background:#FCFCFC;border:1px solid " + cor + ";border-radius:6px;"
-        "padding:14px;font-family:Consolas,monospace;font-size:13px;"
-        "white-space:pre-wrap;max-height:500px;overflow-y:auto;color:#1F1F1F;'>"
-        + log_txt +
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    if exibir_log:
+        st.markdown("**Log de processamento**")
+        log_txt  = "\n".join(st.session_state.log)
+        tem_erro = any(str(l).startswith("ERRO") for l in st.session_state.log)
+        cor      = "#D32F2F" if tem_erro else "#388E3C"
+        st.markdown(
+            "<div style='background:#FCFCFC;border:1px solid " + cor + ";border-radius:6px;"
+            "padding:14px;font-family:Consolas,monospace;font-size:13px;"
+            "white-space:pre-wrap;max-height:500px;overflow-y:auto;color:#1F1F1F;'>"
+            + log_txt +
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":
