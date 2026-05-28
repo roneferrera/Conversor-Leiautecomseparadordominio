@@ -2,12 +2,13 @@ import re
 import io
 import os
 import traceback
+import unicodedata
 import streamlit as st
 
 # ==============================
 # VERSÃO
 # ==============================
-VERSAO = "V1.1"
+VERSAO = "V1.2"
 
 # ==============================
 # TEMA TR
@@ -99,6 +100,101 @@ class SpedECD:
 
 
 # ==============================
+# NORMALIZAÇÃO DE HISTÓRICO
+# ==============================
+
+# Mapa de substituição de caracteres especiais comuns no português
+# para equivalentes aceitos pelo Domínio Sistemas (latin-1 estendido)
+_MAPA_ESPECIAIS = {
+    # aspas tipográficas → aspas simples/duplas retas
+    "\u2018": "'", "\u2019": "'",
+    "\u201C": '"', "\u201D": '"',
+    # travessão / meia-risca → hífen
+    "\u2013": "-", "\u2014": "-",
+    # reticências → três pontos
+    "\u2026": "...",
+    # espaço não-quebrável → espaço normal
+    "\u00A0": " ",
+    # outros símbolos comuns
+    "\u00B0": "°",   # grau          → mantém (latin-1)
+    "\u00BA": "º",   # ordinal masc  → mantém (latin-1)
+    "\u00AA": "ª",   # ordinal fem   → mantém (latin-1)
+    "\u00B2": "2",   # superscript 2 → 2
+    "\u00B3": "3",   # superscript 3 → 3
+    "\u00BC": "1/4",
+    "\u00BD": "1/2",
+    "\u00BE": "3/4",
+    "\u00D7": "x",   # multiplicação → x
+    "\u00F7": "/",   # divisão       → /
+    "\u20AC": "EUR", # euro          → EUR
+    "\u00A7": "S/",  # parágrafo     → S/
+    "\u00AE": "(R)", # registrado
+    "\u00A9": "(C)", # copyright
+    "\u2122": "(TM)",
+}
+
+# Caracteres de controle que devem ser removidos
+_CTRL = set(range(0x00, 0x20)) - {0x09, 0x0A, 0x0D}  # mantém tab, LF, CR
+
+
+def normalizar_historico(texto):
+    """
+    Normaliza o histórico para compatibilidade com o Domínio Sistemas:
+
+    1. Aplica mapa de substituições explícitas (aspas, travessão, etc.)
+    2. Tenta codificar em latin-1; caracteres fora do range são convertidos
+       pelo método NFC → decomposição → remoção de diacríticos → recomposição,
+       garantindo que letras acentuadas do português sejam preservadas.
+    3. Remove caracteres de controle.
+    4. Normaliza espaços múltiplos e strip final.
+    5. Limita a 250 caracteres.
+
+    Exemplos preservados: á é í ó ú â ê ô ã õ ç ü ñ
+    Exemplos convertidos: " " → " | – — → - | … → ...
+    """
+    if not texto:
+        return ""
+
+    # Passo 1 — substituições explícitas
+    for orig, dest in _MAPA_ESPECIAIS.items():
+        texto = texto.replace(orig, dest)
+
+    # Passo 2 — normalização NFC para garantir forma canônica
+    texto = unicodedata.normalize("NFC", texto)
+
+    # Passo 3 — tenta latin-1; para cada char fora do range, tenta
+    #            decomposição NFD para separar base + diacrítico e
+    #            mantém a letra base (ex.: ñ → n, ü → u apenas se
+    #            não estiver em latin-1, o que não é o caso do português)
+    resultado = []
+    for ch in texto:
+        if ord(ch) < 0x20 and ord(ch) not in (0x09, 0x0A, 0x0D):
+            # caractere de controle → descarta
+            continue
+        try:
+            ch.encode("latin-1")
+            resultado.append(ch)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            # Tenta decompor (NFD) e pegar apenas a letra base
+            decomposto = unicodedata.normalize("NFD", ch)
+            base = decomposto[0]
+            try:
+                base.encode("latin-1")
+                resultado.append(base)
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                # Último recurso: descarta o caractere
+                pass
+
+    texto = "".join(resultado)
+
+    # Passo 4 — normaliza espaços múltiplos e strip
+    texto = re.sub(r" {2,}", " ", texto).strip()
+
+    # Passo 5 — limita a 250 caracteres
+    return texto[:250]
+
+
+# ==============================
 # PARSE DO SPED ECD
 # ==============================
 
@@ -116,21 +212,26 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     lote_atual = None
     erros      = 0
 
-    try:
+    # Tenta decodificar em UTF-8; se falhar, tenta latin-1
+    for encoding in ("utf-8", "latin-1", "cp1252"):
+        try:
+            texto = conteudo_bytes.decode(encoding, errors="strict")
+            log.append(f"Arquivo decodificado com encoding: {encoding}")
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
         texto = conteudo_bytes.decode("utf-8", errors="replace")
-    except Exception as e:
-        log.append(f"ERRO ao decodificar arquivo: {e}")
-        return None
+        log.append("Aviso: encoding não identificado; usando UTF-8 com substituição.")
 
-    linhas_total = texto.count("\n") or 1
     linhas_lista = texto.splitlines()
-    total        = len(linhas_lista)
+    total        = len(linhas_lista) or 1
 
     status_text.text("📖 Lendo registros do SPED ECD...")
 
     for num_linha, linha in enumerate(linhas_lista, start=1):
 
-        # Atualiza progresso a cada 500 linhas (fase 1 = 0% → 50%)
+        # Progresso fase 1: 0% → 50%
         if num_linha % 500 == 0 or num_linha == total:
             pct = int((num_linha / total) * 50)
             progress_bar.progress(pct)
@@ -144,10 +245,13 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
         registro = campos[0] if campos else ""
 
         try:
+            # ---- 0000 – Identificação da empresa ----
             if registro == "0000":
+                # |0000|LECD|DT_INI|DT_FIN|NOME|CNPJ|...
                 if len(campos) > 5:
                     ecd.cnpj = campos[5].strip()
 
+            # ---- I050 – Plano de contas ----
             elif registro == "I050":
                 if len(campos) > 7:
                     cod  = campos[5].strip()
@@ -155,10 +259,14 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                     if cod:
                         ecd.contas[cod] = nome
 
+            # ---- I075 – Históricos padrão ----
             elif registro == "I075":
                 if len(campos) > 2:
-                    ecd.historicos[campos[1].strip()] = campos[2].strip()
+                    cod   = campos[1].strip()
+                    descr = normalizar_historico(campos[2])
+                    ecd.historicos[cod] = descr
 
+            # ---- I200 – Cabeçalho do lançamento ----
             elif registro == "I200":
                 if len(campos) > 3:
                     lote_atual = {
@@ -169,6 +277,7 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                     }
                     ecd.lancamentos.append(lote_atual)
 
+            # ---- I250 – Partidas do lançamento ----
             elif registro == "I250":
                 if lote_atual is not None and len(campos) > 4:
                     partida = {
@@ -176,7 +285,10 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                         "valor"     : campos[3].strip(),
                         "dc"        : campos[4].strip().upper(),
                         "cod_hist"  : campos[6].strip() if len(campos) > 6 else "",
-                        "descr_hist": campos[7].strip() if len(campos) > 7 else "",
+                        # Normaliza já na leitura
+                        "descr_hist": normalizar_historico(
+                            campos[7] if len(campos) > 7 else ""
+                        ),
                     }
                     lote_atual["partidas"].append(partida)
 
@@ -205,6 +317,7 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 # ==============================
 
 def formatar_data_dominio(data_sped):
+    """DDMMAAAA → DD/MM/AAAA. Mantém se já tiver barra."""
     d = data_sped.strip()
     if "/" in d:
         return d
@@ -214,13 +327,19 @@ def formatar_data_dominio(data_sped):
 
 
 def formatar_valor(valor_str):
+    """
+    Garante separador decimal com vírgula e pelo menos duas casas decimais.
+    Ex.: '5571.24' → '5571,24' | '5571' → '5571,00'
+    """
     v = valor_str.strip()
+
     if "." in v and "," not in v:
         v = v.replace(".", ",")
     elif "." in v and "," in v:
         if v.index(".") < v.index(","):
             v = v.replace(".", "").replace(",", ".")
             v = v.replace(".", ",")
+
     if "," not in v:
         v += ",00"
     else:
@@ -228,23 +347,38 @@ def formatar_valor(valor_str):
         if len(partes[1]) < 2:
             partes[1] = partes[1].ljust(2, "0")
         v = ",".join(partes)
+
     return v
 
 
 def montar_historico(partida, historicos):
+    """
+    Prioridade: descrição completa da partida (I250 campo 7) > padrão I075.
+    Já normalizado na leitura; aqui apenas garante o fallback.
+    """
     descr = partida.get("descr_hist", "").strip()
     cod   = partida.get("cod_hist",   "").strip()
+
     if descr:
-        return descr[:250]
+        return descr  # já normalizado
+
     if cod and cod in historicos:
-        return historicos[cod][:250]
+        return historicos[cod]  # já normalizado
+
     return ""
 
 
 def identificar_tipo_lancamento(partidas):
+    """
+    X = 1 débito × 1 crédito
+    D = 1 débito × vários créditos
+    C = vários débitos × 1 crédito
+    V = vários débitos × vários créditos
+    """
     debitos  = [p for p in partidas if p["dc"] == "D"]
     creditos = [p for p in partidas if p["dc"] == "C"]
     nd, nc   = len(debitos), len(creditos)
+
     if nd == 1 and nc == 1:
         return "X"
     if nd == 1 and nc > 1:
@@ -255,6 +389,7 @@ def identificar_tipo_lancamento(partidas):
 
 
 def primeiro_historico(partidas, historicos):
+    """Retorna o primeiro histórico não-vazio encontrado nas partidas."""
     for p in partidas:
         h = montar_historico(p, historicos)
         if h:
@@ -267,6 +402,10 @@ def primeiro_historico(partidas, historicos):
 # ==============================
 
 def gerar_dominio(ecd, log, progress_bar, status_text):
+    """
+    Gera as linhas do layout Domínio Sistemas.
+    Registros: 0000 / 6000 / 6100 / 6110
+    """
     linhas     = []
     total_6100 = 0
     total_6110 = 0
@@ -281,7 +420,7 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
 
     for idx, lanc in enumerate(ecd.lancamentos):
 
-        # Atualiza progresso a cada 100 lançamentos (fase 2 = 50% → 100%)
+        # Progresso fase 2: 50% → 99%
         if idx % 100 == 0 or idx == total_lanc - 1:
             pct = 50 + int(((idx + 1) / total_lanc) * 50)
             progress_bar.progress(min(pct, 99))
@@ -458,6 +597,21 @@ def main():
 | `6110`   | Partidas adicionais (rateio) |
             """
         )
+        st.markdown("---")
+        st.markdown("### 🔤 Caracteres especiais")
+        st.markdown(
+            """
+Históricos são normalizados automaticamente para compatibilidade com o Domínio:
+
+| Original | Convertido |
+|----------|-----------|
+| `"` `"` | `"` |
+| `'` `'` | `'` |
+| `–` `—` | `-` |
+| `…`     | `...` |
+| Outros  | Preservados se latin-1 |
+            """
+        )
 
     # ---- Instruções ----
     with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
@@ -498,6 +652,10 @@ def main():
                     automaticamente pelo número de partidas.</li>
                 <li>O histórico é extraído do campo descritivo do <code>I250</code>;
                     se vazio, usa o padrão do <code>I075</code>.</li>
+                <li>Caracteres especiais (aspas tipográficas, travessão, reticências, etc.)
+                    são convertidos automaticamente para equivalentes compatíveis com
+                    o Domínio Sistemas (latin-1). Letras acentuadas do português
+                    (<b>á é í ó ú â ê ô ã õ ç</b>) são sempre preservadas.</li>
                 <li>Verifique sempre o <b>Log de processamento</b> ao final da página.</li>
             </ul>
 
@@ -551,7 +709,6 @@ def main():
         st.session_state.nome_arquivo = "lancamentos_dominio.txt"
         st.session_state.metricas     = {}
 
-        # Cria os widgets de progresso
         status_text  = st.empty()
         progress_bar = st.progress(0)
 
@@ -567,8 +724,11 @@ def main():
             progress_bar.progress(100)
             status_text.text("✅ Conversão concluída!")
 
+            # Grava em latin-1 para máxima compatibilidade com o Domínio
             conteudo_txt = "\n".join(linhas) + "\n"
-            st.session_state.txt_gerado   = conteudo_txt.encode("utf-8", errors="replace")
+            st.session_state.txt_gerado = conteudo_txt.encode(
+                "latin-1", errors="replace"
+            )
             cnpj_num = re.sub(r"\D", "", ecd.cnpj)
             st.session_state.nome_arquivo = (
                 f"ECD_{cnpj_num}_lancamentos_dominio.txt"
