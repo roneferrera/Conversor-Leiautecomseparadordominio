@@ -3,7 +3,7 @@ import traceback
 import unicodedata
 import streamlit as st
 
-VERSAO = "V1.9"
+VERSAO = "V2.0"
 
 # ==============================
 # TEMA TR
@@ -164,7 +164,6 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                     ecd.historicos[cod] = descr
 
             elif registro == "I200":
-                # ── Fecha lote anterior e abre novo ──────────────────────
                 lote_atual = {
                     "num"     : campos[1].strip() if len(campos) > 1 else "",
                     "data"    : campos[2].strip() if len(campos) > 2 else "",
@@ -174,10 +173,8 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                 ecd.lancamentos.append(lote_atual)
 
             elif registro == "I250":
-                # ── Só adiciona se houver lote aberto ────────────────────
                 if lote_atual is not None and len(campos) > 4:
                     dc_raw = campos[4].strip().upper()
-                    # Garante que só aceita D ou C
                     if dc_raw not in ("D", "C"):
                         log.append(
                             f"Aviso: I250 com dc='{dc_raw}' ignorado (esperado D ou C)."
@@ -211,23 +208,15 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     log.append(f"  Históricos (I075) : {len(ecd.historicos)}")
     log.append(f"  Lançamentos (I200): {len(ecd.lancamentos)}")
 
-    # ── DEBUG: primeiros 15 lançamentos ──────────────────────────────────
+    # DEBUG — primeiros 20 lançamentos
     log.append("─" * 60)
-    log.append("DEBUG — primeiros 15 lançamentos lidos do SPED:")
-    for i, lanc in enumerate(ecd.lancamentos[:15]):
+    log.append("DEBUG — primeiros 20 lançamentos lidos do SPED:")
+    for i, lanc in enumerate(ecd.lancamentos[:20]):
         debitos  = [p for p in lanc["partidas"] if p["dc"] == "D"]
         creditos = [p for p in lanc["partidas"] if p["dc"] == "C"]
-        nd = len(debitos)
-        nc = len(creditos)
-        if nd == 1 and nc == 1:
-            tipo = "X"
-        elif nd == 1 and nc > 1:
-            tipo = "D"
-        elif nc == 1 and nd > 1:
-            tipo = "C"
-        else:
-            tipo = "V"
-        debs = ", ".join(f"{p['conta']}({p['valor']})" for p in debitos)
+        nd, nc   = len(debitos), len(creditos)
+        tipo = "X" if nd==1 and nc==1 else "D" if nd==1 and nc>1 else "C" if nc==1 and nd>1 else "V"
+        debs  = ", ".join(f"{p['conta']}({p['valor']})" for p in debitos)
         creds = ", ".join(f"{p['conta']}({p['valor']})" for p in creditos)
         log.append(
             f"  [{i+1:03d}] data={lanc['data']} tipo={tipo} "
@@ -300,10 +289,7 @@ def primeiro_historico(partidas):
 
 
 def agrupar_partidas_por_conta(partidas):
-    """
-    Agrupa por (conta, dc) — mantém os dois lados separados.
-    Soma os valores de partidas com mesma conta E mesmo lado.
-    """
+    """Agrupa por (conta, dc) somando valores — mantém os lados D e C separados."""
     agrupado = {}
     for p in partidas:
         chave = (p["conta"], p["dc"])
@@ -321,8 +307,7 @@ def agrupar_partidas_por_conta(partidas):
 
 
 def classificar_lancamento(debitos, creditos):
-    nd = len(debitos)
-    nc = len(creditos)
+    nd, nc = len(debitos), len(creditos)
     if nd == 1 and nc == 1:
         return "X"
     if nd == 1 and nc > 1:
@@ -333,39 +318,116 @@ def classificar_lancamento(debitos, creditos):
 
 
 # ==============================
-# REGISTRO 6100 — layout oficial Domínio
+# MONTAGEM DAS LINHAS DO LAYOUT
 # ==============================
-def _linha_6100(data, conta_deb, conta_cred, valor, descr):
-    """
-    Layout Domínio — registro 6100 com 13 campos fixos:
-    REG | DATA | COD_RED_DEB | COD_RED_CRED | VALOR | COD_HIST |
-    COMPLEMENTO | NUM_DOC | COD_MOEDA | TAXA_CONV | NUM_LANC | IND_CTA_PART |
 
-    Total: 12 campos internos = 13 pipes (incluindo os delimitadores externos).
-    Exemplo: |6100|01/01/2022|686|10001|4287,68||Historico||||||
+def _6100_X(data, db, cr, historico):
     """
-    descr_safe = (descr or "").replace("|", " ").strip()
-    return (
-        f"|6100|{data}|{conta_deb}|{conta_cred}"
-        f"|{valor}||{descr_safe}||||||"
-    )
+    Tipo X — 1 débito × 1 crédito.
+    6100 com débito E crédito preenchidos (único caso permitido).
+    Formato: |6100|DATA|DEB|CRED|VALOR||HIST||||||
+    """
+    val = formatar_valor(db["valor"])
+    dsc = (montar_historico(db) or historico).replace("|", " ")
+    return [f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}||{dsc}||||||"]
+
+
+def _6100_D(data, db, creditos, historico, gerar_6110):
+    """
+    Tipo D — 1 débito × N créditos.
+
+    Regra Domínio:
+      6100 → só débito preenchido (crédito VAZIO)
+      6110 → um registro por crédito (todos, inclusive o primeiro)
+
+    Formato 6100: |6100|DATA|DEB||VALOR||HIST||||||
+    Formato 6110: |6110||CRED|VALOR|
+    """
+    linhas = []
+    val = formatar_valor(db["valor"])
+    dsc = (montar_historico(db) or historico).replace("|", " ")
+    linhas.append(f"|6100|{data}|{db['conta']}||{val}||{dsc}||||||")
+    if gerar_6110:
+        for cr in creditos:                          # TODOS os créditos no 6110
+            vr = formatar_valor(cr["valor"])
+            linhas.append(f"|6110||{cr['conta']}|{vr}|")
+    return linhas
+
+
+def _6100_C(data, creditos, debitos, historico, gerar_6110):
+    """
+    Tipo C — N débitos × 1 crédito.
+
+    Regra Domínio:
+      6100 → só crédito preenchido (débito VAZIO)
+      6110 → um registro por débito (todos, inclusive o primeiro)
+
+    Formato 6100: |6100|DATA||CRED|VALOR||HIST||||||
+    Formato 6110: |6110|DEB||VALOR|
+    """
+    linhas = []
+    cr  = creditos[0]
+    val = formatar_valor(cr["valor"])
+    dsc = (primeiro_historico(debitos) or historico).replace("|", " ")
+    linhas.append(f"|6100|{data}||{cr['conta']}|{val}||{dsc}||||||")
+    if gerar_6110:
+        for db in debitos:                           # TODOS os débitos no 6110
+            vr = formatar_valor(db["valor"])
+            linhas.append(f"|6110|{db['conta']}||{vr}|")
+    return linhas
+
+
+def _6100_V(data, debitos, creditos, historico, gerar_6110):
+    """
+    Tipo V — N débitos × N créditos.
+
+    Regra Domínio:
+      6100 → só débito principal (crédito VAZIO)
+      6110 → demais débitos + todos os créditos
+
+    Formato 6100: |6100|DATA|DEB||VALOR||HIST||||||
+    Formato 6110 débito : |6110|DEB||VALOR|
+    Formato 6110 crédito: |6110||CRED|VALOR|
+    """
+    linhas = []
+    db0 = debitos[0]
+    val = formatar_valor(db0["valor"])
+    dsc = (montar_historico(db0) or historico).replace("|", " ")
+    linhas.append(f"|6100|{data}|{db0['conta']}||{val}||{dsc}||||||")
+    if gerar_6110:
+        for db in debitos[1:]:
+            vr = formatar_valor(db["valor"])
+            linhas.append(f"|6110|{db['conta']}||{vr}|")
+        for cr in creditos:
+            vr = formatar_valor(cr["valor"])
+            linhas.append(f"|6110||{cr['conta']}|{vr}|")
+    return linhas
 
 
 # ==============================
-# GERADOR DO LAYOUT DOMÍNIO — V1.9
+# GERADOR DO LAYOUT DOMÍNIO — V2.0
 # ==============================
 def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
     """
-    V1.9 — Diagnóstico + correções:
-    • Debug de classificação: loga lançamentos com tipo inesperado
-    • _linha_6100 com 13 pipes (12 campos internos) — formato correto
-    • Agrupamento por (conta, dc) — lados D e C sempre separados
-    • Classificação X/D/C/V baseada em contas distintas por lado
+    V2.0 — Correção definitiva da regra de preenchimento do 6100:
+
+    ┌──────┬─────────────────────────────────────────────────────────┐
+    │ Tipo │ Regra de preenchimento                                  │
+    ├──────┼─────────────────────────────────────────────────────────┤
+    │  X   │ 6100: DEB + CRED + VALOR   (sem 6110)                  │
+    │  D   │ 6100: DEB + VAZIO + VALOR  → 6110: todos os créditos   │
+    │  C   │ 6100: VAZIO + CRED + VALOR → 6110: todos os débitos    │
+    │  V   │ 6100: DEB + VAZIO + VALOR  → 6110: outros D + todos C  │
+    └──────┴─────────────────────────────────────────────────────────┘
+
+    O erro "não é permitido ter débito e crédito no mesmo lançamento
+    se o tipo for diferente de 'um débito para um crédito'" ocorre
+    exatamente quando o 6100 tem DEB e CRED preenchidos com tipo D/C/V.
     """
-    linhas     = []
-    total_6100 = 0
-    total_6110 = 0
-    ignorados  = 0
+    linhas      = []
+    total_6100  = 0
+    total_6110  = 0
+    ignorados   = 0
     debug_tipos = {"X": 0, "D": 0, "C": 0, "V": 0}
 
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
@@ -379,18 +441,14 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
         if idx % 100 == 0 or idx == total_lanc - 1:
             pct = 50 + int(((idx + 1) / total_lanc) * 50)
             progress_bar.progress(min(pct, 99))
-            status_text.text(
-                f"⚙ Gerando lançamento {idx + 1:,} de {total_lanc:,}..."
-            )
+            status_text.text(f"⚙ Gerando lançamento {idx+1:,} de {total_lanc:,}...")
 
         partidas_brutas = lanc.get("partidas", [])
         if not partidas_brutas:
             ignorados += 1
             continue
 
-        # Agrupa por (conta, dc)
         partidas = agrupar_partidas_por_conta(partidas_brutas)
-
         debitos  = [p for p in partidas if p["dc"] == "D"]
         creditos = [p for p in partidas if p["dc"] == "C"]
 
@@ -399,66 +457,26 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
             continue
 
         data      = formatar_data_dominio(lanc["data"])
-        tipo_lanc = classificar_lancamento(debitos, creditos)
+        tipo      = classificar_lancamento(debitos, creditos)
         historico = primeiro_historico(partidas_brutas)
-        debug_tipos[tipo_lanc] = debug_tipos.get(tipo_lanc, 0) + 1
+        debug_tipos[tipo] = debug_tipos.get(tipo, 0) + 1
 
-        # ── Registro 6000 ─────────────────────────────────────────────────
-        linhas.append(f"|6000|{tipo_lanc}||||")
+        # ── Registro 6000 ─────────────────────────────────────────────
+        linhas.append(f"|6000|{tipo}||||")
 
-        # ── Tipo X ───────────────────────────────────────────────────────
-        if tipo_lanc == "X":
-            db  = debitos[0]
-            cr  = creditos[0]
-            val = formatar_valor(db["valor"])
-            dsc = montar_historico(db) or historico
-            linhas.append(_linha_6100(data, db["conta"], cr["conta"], val, dsc))
-            total_6100 += 1
-
-        # ── Tipo D: 1 débito × N créditos ────────────────────────────────
-        elif tipo_lanc == "D":
-            db  = debitos[0]
-            val = formatar_valor(db["valor"])
-            dsc = montar_historico(db) or historico
-            linhas.append(_linha_6100(data, db["conta"], creditos[0]["conta"], val, dsc))
-            total_6100 += 1
-            if gerar_6110:
-                for cr in creditos[1:]:
-                    vr = formatar_valor(cr["valor"])
-                    linhas.append(f"|6110||{cr['conta']}|{vr}|")
-                    total_6110 += 1
-
-        # ── Tipo C: N débitos × 1 crédito ────────────────────────────────
-        elif tipo_lanc == "C":
-            cr  = creditos[0]
-            db0 = debitos[0]
-            val = formatar_valor(cr["valor"])
-            dsc = montar_historico(db0) or historico
-            linhas.append(_linha_6100(data, db0["conta"], cr["conta"], val, dsc))
-            total_6100 += 1
-            if gerar_6110:
-                for db in debitos[1:]:
-                    vr = formatar_valor(db["valor"])
-                    linhas.append(f"|6110|{db['conta']}||{vr}|")
-                    total_6110 += 1
-
-        # ── Tipo V: N débitos × N créditos ───────────────────────────────
+        # ── Registros 6100 / 6110 ─────────────────────────────────────
+        if tipo == "X":
+            novas = _6100_X(data, debitos[0], creditos[0], historico)
+        elif tipo == "D":
+            novas = _6100_D(data, debitos[0], creditos, historico, gerar_6110)
+        elif tipo == "C":
+            novas = _6100_C(data, creditos, debitos, historico, gerar_6110)
         else:
-            db0 = debitos[0]
-            cr0 = creditos[0]
-            val = formatar_valor(db0["valor"])
-            dsc = montar_historico(db0) or historico
-            linhas.append(_linha_6100(data, db0["conta"], cr0["conta"], val, dsc))
-            total_6100 += 1
-            if gerar_6110:
-                for db in debitos[1:]:
-                    vr = formatar_valor(db["valor"])
-                    linhas.append(f"|6110|{db['conta']}||{vr}|")
-                    total_6110 += 1
-                for cr in creditos[1:]:
-                    vr = formatar_valor(cr["valor"])
-                    linhas.append(f"|6110||{cr['conta']}|{vr}|")
-                    total_6110 += 1
+            novas = _6100_V(data, debitos, creditos, historico, gerar_6110)
+
+        linhas.extend(novas)
+        total_6100 += 1
+        total_6110 += sum(1 for l in novas if l.startswith("|6110|"))
 
     log.append(f"Registros 6100 gerados        : {total_6100}")
     log.append(f"Registros 6110 gerados        : {total_6110}")
@@ -470,8 +488,8 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
         log.append(f"Lançamentos ignorados (sem D/C): {ignorados}")
     log.append(f"Total de linhas geradas       : {len(linhas)}")
     log.append(
-        f"Tipos gerados — X:{debug_tipos['X']} D:{debug_tipos['D']} "
-        f"C:{debug_tipos['C']} V:{debug_tipos['V']}"
+        f"Tipos — X:{debug_tipos['X']}  D:{debug_tipos['D']}  "
+        f"C:{debug_tipos['C']}  V:{debug_tipos['V']}"
     )
     return linhas
 
@@ -483,17 +501,15 @@ def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text, gerar_611
     try:
         log.append("Iniciando leitura do SPED ECD...")
         ecd = parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text)
-
         if ecd is None:
             log.append("ERRO: Leitura do SPED ECD falhou. Abortando.")
             return None, None
 
         log.append(
-            f"Gerando layout Domínio Sistemas "
+            f"Gerando layout Domínio V2.0 "
             f"(6110: {'SIM' if gerar_6110 else 'NÃO'})..."
         )
         linhas = gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=gerar_6110)
-
         if not linhas:
             log.append("ERRO: Nenhuma linha foi gerada.")
             return None, None
@@ -553,25 +569,28 @@ def main():
             """
         )
         st.markdown("---")
-        st.markdown("### 🔀 Classificação D/C/X/V")
+        st.markdown("### 🔀 Regras D/C/X/V — V2.0")
         st.markdown(
             """
-| Tipo | Regra |
-|------|-------|
-| **X** | 1 débito × 1 crédito |
-| **D** | 1 débito × vários créditos |
-| **C** | vários débitos × 1 crédito |
-| **V** | vários débitos × vários créditos |
+| Tipo | 6100 | 6110 |
+|------|------|------|
+| **X** | DEB + CRED | — |
+| **D** | DEB + vazio | todos créditos |
+| **C** | vazio + CRED | todos débitos |
+| **V** | DEB + vazio | outros D + todos C |
             """
         )
         st.markdown("---")
         st.markdown("### ✅ Versões")
         st.markdown(
             """
+**V2.0** — Fix definitivo regra 6100/6110
+- Tipo D/C/V: 6100 nunca tem DEB+CRED juntos
+- Tipo D: crédito sempre vai para 6110
+- Tipo C: débito sempre vai para 6110
+- Tipo V: créditos sempre vão para 6110
+
 **V1.9** — Debug de classificação
-- Log dos 15 primeiros lançamentos com D/C detectados
-- Valida dc=D ou C no I250 (ignora inválidos)
-- 6100 com 13 pipes (formato definitivo)
 
 **V1.8** — Agrupamento por (conta, dc)
 
@@ -585,28 +604,35 @@ def main():
         st.markdown(
             """
             <div class="instrucoes-box">
-            <h4>🔹 Passo 1 — Obter o arquivo SPED ECD</h4>
-            <p>Exporte o SPED ECD com os registros <code>0000, I050, I075, I200, I250</code>.</p>
+            <h4>🔹 Regra fundamental do layout Domínio (V2.0)</h4>
+            <p>O registro <b>6100</b> só pode ter débito E crédito preenchidos
+            simultaneamente quando o tipo for <b>X</b> (um débito para um crédito).
+            Para os tipos D, C e V, o campo oposto fica <b>vazio</b> no 6100,
+            e as partidas adicionais (incluindo a primeira do lado oposto)
+            vão todas para o <b>6110</b>.</p>
 
-            <h4>🔹 Passo 2 — Converter</h4>
+            <h4>🔹 Estrutura por tipo</h4>
+            <ul>
+                <li><b>X</b>: <code>|6100|DATA|DEB|CRED|VALOR||HIST||||||</code></li>
+                <li><b>D</b>: <code>|6100|DATA|DEB||VALOR||HIST||||||</code> + 6110 p/ cada crédito</li>
+                <li><b>C</b>: <code>|6100|DATA||CRED|VALOR||HIST||||||</code> + 6110 p/ cada débito</li>
+                <li><b>V</b>: <code>|6100|DATA|DEB||VALOR||HIST||||||</code> + 6110 p/ outros D e todos C</li>
+            </ul>
+
+            <h4>🔹 Passo a passo</h4>
             <ol>
-                <li>Selecione o arquivo e configure as opções.</li>
-                <li>Clique em <b>▶ Converter</b>.</li>
-                <li>Verifique o <b>Log de debug</b> — ele mostra os primeiros 15
-                    lançamentos com os débitos/créditos detectados.</li>
-                <li>Baixe o arquivo e importe no Domínio.</li>
+                <li>Selecione o arquivo SPED ECD (<code>.txt</code>).</li>
+                <li>Escolha se deseja gerar os registros <b>6110</b>.</li>
+                <li>Clique em <b>▶ Converter</b> e aguarde.</li>
+                <li>Verifique o log e baixe o arquivo gerado.</li>
+                <li>Importe no Domínio: <b>Utilitários → Importação → Lançamentos em Lote</b>.</li>
             </ol>
-
-            <h4>🔹 Estrutura do 6100 (V1.9)</h4>
-            <code>|6100|DATA|DEB|CRED|VALOR||HISTORICO||||||</code><br>
-            <small>12 campos internos = 13 pipes totais</small>
 
             <h4>⚠ Observações</h4>
             <ul>
-                <li>O log DEBUG mostra exatamente como cada lançamento foi lido.</li>
-                <li>Se um lançamento simples (1D×1C) aparecer como C/D/V no debug,
-                    o SPED ECD possui partidas I250 duplicadas ou com dc inválido.</li>
+                <li>Partidas com mesma conta e mesmo lado (D ou C) são <b>somadas</b>.</li>
                 <li>Arquivo gravado em <b>latin-1</b>.</li>
+                <li>Lançamentos sem débito e crédito simultâneos são ignorados.</li>
             </ul>
             </div>
             """,
@@ -665,7 +691,7 @@ def main():
 
     if converter and arquivo is not None:
         st.session_state.log = [
-            f"Iniciando conversão V1.9 (6110: {'SIM' if gerar_6110 else 'NÃO'})..."
+            f"Iniciando conversão V2.0 (6110: {'SIM' if gerar_6110 else 'NÃO'})..."
         ]
         st.session_state.txt_gerado   = None
         st.session_state.nome_arquivo = "lancamentos_dominio.txt"
@@ -696,7 +722,6 @@ def main():
                 f"ECD_{cnpj_num}_lancamentos_dominio{sufixo}.txt"
             )
 
-            total_linhas = len(linhas)
             t6000 = sum(1 for l in linhas if l.startswith("|6000|"))
             t6100 = sum(1 for l in linhas if l.startswith("|6100|"))
             t6110 = sum(1 for l in linhas if l.startswith("|6110|"))
@@ -705,7 +730,7 @@ def main():
                 "Lançamentos (6000)": t6000,
                 "Linhas 6100"       : t6100,
                 "Linhas 6110"       : t6110,
-                "Total de linhas"   : total_linhas,
+                "Total de linhas"   : len(linhas),
             }
         else:
             progress_bar.progress(100)
@@ -716,12 +741,9 @@ def main():
     if st.session_state.metricas:
         st.markdown("#### 📊 Resumo da conversão")
         m      = st.session_state.metricas
-        labels = list(m.keys())
-        values = list(m.values())
         cols   = st.columns(5)
-        for i, col in enumerate(cols):
-            if i < len(labels):
-                col.metric(labels[i], values[i])
+        for i, (k, v) in enumerate(m.items()):
+            cols[i].metric(k, v)
         st.markdown("")
 
     if st.session_state.txt_gerado is not None:
