@@ -6,41 +6,25 @@ import streamlit as st
 VERSAO = "V3.1"
 
 def apply_tr_theme():
-    st.markdown("""
-        <style>
-        html, body, [class*="css"] {
-            font-family: 'Segoe UI', 'Arial', sans-serif;
-            color: #444444;
-        }
-        h1, h2, h3 { color: #FF8000; font-weight: 700; }
-        section[data-testid="stSidebar"] { background-color: #444444; color: #FFFFFF; }
-        section[data-testid="stSidebar"] * { color: #FFFFFF !important; }
-        .stButton > button {
-            background-color: #FF8000; color: #FFFFFF;
-            border: none; border-radius: 4px; font-weight: bold;
-        }
-        .stButton > button:hover { background-color: #D64001; color: #FFFFFF; }
-        .stDownloadButton > button {
-            background-color: #FF8000; color: #FFFFFF;
-            border: none; border-radius: 4px; font-weight: bold;
-        }
-        .stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }
-        hr { border-color: #FF8000; }
-        [data-testid="metric-container"] {
-            background-color: #E9E9E9;
-            border-left: 4px solid #FF8000;
-            border-radius: 4px; padding: 10px;
-        }
-        .instrucoes-box {
-            background-color: #E9E9E9; border-left: 4px solid #FF8000;
-            border-radius: 4px; padding: 16px 20px; margin: 12px 0;
-            color: #444444; font-family: 'Segoe UI', Arial, sans-serif;
-        }
-        .instrucoes-box h4 { color: #FF8000; margin-top: 14px; margin-bottom: 6px; }
-        .instrucoes-box h4:first-child { margin-top: 0; }
-        .stProgress > div > div > div > div { background-color: #FF8000 !important; }
-        </style>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        "<style>"
+        "html, body, [class*='css'] { font-family: 'Segoe UI', 'Arial', sans-serif; color: #444444; }"
+        "h1, h2, h3 { color: #FF8000; font-weight: 700; }"
+        "section[data-testid='stSidebar'] { background-color: #444444; color: #FFFFFF; }"
+        "section[data-testid='stSidebar'] * { color: #FFFFFF !important; }"
+        ".stButton > button { background-color: #FF8000; color: #FFFFFF; border: none; border-radius: 4px; font-weight: bold; }"
+        ".stButton > button:hover { background-color: #D64001; color: #FFFFFF; }"
+        ".stDownloadButton > button { background-color: #FF8000; color: #FFFFFF; border: none; border-radius: 4px; font-weight: bold; }"
+        ".stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }"
+        "hr { border-color: #FF8000; }"
+        "[data-testid='metric-container'] { background-color: #E9E9E9; border-left: 4px solid #FF8000; border-radius: 4px; padding: 10px; }"
+        ".instrucoes-box { background-color: #E9E9E9; border-left: 4px solid #FF8000; border-radius: 4px; padding: 16px 20px; margin: 12px 0; color: #444444; font-family: 'Segoe UI', Arial, sans-serif; }"
+        ".instrucoes-box h4 { color: #FF8000; margin-top: 14px; margin-bottom: 6px; }"
+        ".instrucoes-box h4:first-child { margin-top: 0; }"
+        ".stProgress > div > div > div > div { background-color: #FF8000 !important; }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
 
 
 class SpedECD:
@@ -312,7 +296,12 @@ def _fmt6100_credito(data, conta, valor, hist):
     return f"|6100|{data}||{conta}|{valor}||{h}|||||||"
 
 
-def gerar_linhas_lancamento(lanc):
+def _fmt6110(data, conta, valor, dc, hist):
+    h = (hist or "").replace("|", " ").strip()
+    return f"|6110|{data}|{conta}|{valor}|{dc}||{h}|||||||"
+
+
+def gerar_linhas_lancamento(lanc, gerar_6110=False):
     partidas = agrupar_partidas_por_conta(lanc["partidas"])
     debs  = [p for p in partidas if p["dc"] == "D"]
     creds = [p for p in partidas if p["dc"] == "C"]
@@ -331,43 +320,58 @@ def gerar_linhas_lancamento(lanc):
         val = formatar_valor(db["valor"])
         h   = montar_historico(db) or hist
         out.append(_fmt6100_x(data, db["conta"], cr["conta"], val, h))
+        if gerar_6110:
+            out.append(_fmt6110(data, db["conta"], val, "D", h))
+            out.append(_fmt6110(data, cr["conta"], val, "C", h))
 
     elif tipo == "D":
         for db in debs:
             val = formatar_valor(db["valor"])
             h   = montar_historico(db) or hist
             out.append(_fmt6100_debito(data, db["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, db["conta"], val, "D", h))
         for cr in creds:
             val = formatar_valor(cr["valor"])
             h   = montar_historico(cr) or hist
             out.append(_fmt6100_credito(data, cr["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, cr["conta"], val, "C", h))
 
     elif tipo == "C":
         for cr in creds:
             val = formatar_valor(cr["valor"])
             h   = montar_historico(cr) or hist
             out.append(_fmt6100_credito(data, cr["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, cr["conta"], val, "C", h))
         for db in debs:
             val = formatar_valor(db["valor"])
             h   = montar_historico(db) or hist
             out.append(_fmt6100_debito(data, db["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, db["conta"], val, "D", h))
 
     else:
         for db in debs:
             val = formatar_valor(db["valor"])
             h   = montar_historico(db) or hist
             out.append(_fmt6100_debito(data, db["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, db["conta"], val, "D", h))
         for cr in creds:
             val = formatar_valor(cr["valor"])
             h   = montar_historico(cr) or hist
             out.append(_fmt6100_credito(data, cr["conta"], val, h))
+            if gerar_6110:
+                out.append(_fmt6110(data, cr["conta"], val, "C", h))
 
     return out
 
 
-def gerar_dominio(ecd, log, progress_bar, status_text):
+def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=False):
     linhas      = []
-    t6000 = t6100 = ignorados = 0
+    t6000 = t6100 = t6110 = ignorados = 0
     debug_tipos = {"X": 0, "D": 0, "C": 0, "V": 0}
 
     cnpj_num = re.sub(r"\D", "", ecd.cnpj)
@@ -386,7 +390,7 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
             ignorados += 1
             continue
 
-        novas = gerar_linhas_lancamento(lanc)
+        novas = gerar_linhas_lancamento(lanc, gerar_6110=gerar_6110)
         if not novas:
             ignorados += 1
             continue
@@ -398,11 +402,15 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
                 t6000 += 1
             elif l.startswith("|6100|"):
                 t6100 += 1
+            elif l.startswith("|6110|"):
+                t6110 += 1
 
         linhas.extend(novas)
 
     log.append(f"Registros 6000 : {t6000}")
     log.append(f"Registros 6100 : {t6100}")
+    if gerar_6110:
+        log.append(f"Registros 6110 : {t6110}")
     log.append(f"Ignorados      : {ignorados}")
     log.append(f"Total linhas   : {len(linhas)}")
     log.append(
@@ -412,12 +420,12 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
     return linhas
 
 
-def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
+def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text, gerar_6110=False):
     try:
         ecd = parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text)
         if ecd is None:
             return None, None
-        linhas = gerar_dominio(ecd, log, progress_bar, status_text)
+        linhas = gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=gerar_6110)
         if not linhas:
             log.append("ERRO: Nenhuma linha gerada.")
             return None, None
@@ -477,6 +485,7 @@ def main():
             "<li><b>Tipo X</b>: uma unica linha 6100 com debito E credito preenchidos.</li>"
             "<li><b>Tipo C</b>: credito na primeira linha 6100, debitos nas linhas seguintes.</li>"
             "<li><b>Tipos D e V</b>: debitos primeiro, creditos depois, uma linha 6100 por partida.</li>"
+            "<li><b>Registro 6110</b>: opcional, gera uma linha analitica por partida apos o 6100.</li>"
             "</ul>"
             "<h4>Exemplo tipo X</h4>"
             "<pre>|6000|X||||\n|6100|07/01/2022|686|10001|4287,68||Historico|||||||</pre>"
@@ -491,6 +500,7 @@ def main():
             "<h4>Passo a passo</h4>"
             "<ol>"
             "<li>Selecione o arquivo SPED ECD.</li>"
+            "<li>Ative o registro 6110 se necessario (desabilitado por padrao).</li>"
             "<li>Clique em Converter.</li>"
             "<li>Verifique o log e baixe o arquivo.</li>"
             "<li>Importe no Dominio: Utilitarios &gt; Importacao &gt; Lancamentos em Lote.</li>"
@@ -518,6 +528,12 @@ def main():
 
     arquivo = st.file_uploader("Arquivo SPED ECD", type=["txt"])
 
+    gerar_6110 = st.checkbox(
+        "Gerar registro 6110 (analitico por partida)",
+        value=False,
+        help="Quando ativado, gera uma linha 6110 apos cada linha 6100. Desabilitado por padrao.",
+    )
+
     st.markdown("")
     b1, b2 = st.columns(2)
     with b1:
@@ -538,7 +554,7 @@ def main():
         st.rerun()
 
     if converter and arquivo:
-        st.session_state.log        = ["Iniciando V3.1..."]
+        st.session_state.log        = [f"Iniciando V3.1 | 6110: {'SIM' if gerar_6110 else 'NAO'}..."]
         st.session_state.txt_gerado = None
         st.session_state.metricas   = {}
 
@@ -550,6 +566,7 @@ def main():
             st.session_state.log,
             progress_bar,
             status_text,
+            gerar_6110=gerar_6110,
         )
 
         if linhas and ecd:
@@ -563,6 +580,7 @@ def main():
                 "CNPJ"        : ecd.cnpj,
                 "Lanc. (6000)": sum(1 for l in linhas if l.startswith("|6000|")),
                 "Linhas 6100" : sum(1 for l in linhas if l.startswith("|6100|")),
+                "Linhas 6110" : sum(1 for l in linhas if l.startswith("|6110|")),
                 "Total linhas": len(linhas),
             }
         else:
@@ -572,7 +590,7 @@ def main():
 
     if st.session_state.metricas:
         st.markdown("#### Resumo")
-        cols = st.columns(4)
+        cols = st.columns(5)
         for i, (k, v) in enumerate(st.session_state.metricas.items()):
             cols[i].metric(k, v)
 
