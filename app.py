@@ -5,6 +5,8 @@ Suporta:
   • Lançamentos Contábeis (TXT/Excel) → 0000 + 6000 + 6100
   • SPED ECD (.txt)                   → 0000 + 6000 + 6100
 Identificação automática do tipo de arquivo no upload.
+CNPJ preenchido automaticamente para SPED ECD.
+CNPJ solicitado após upload para TXT/Excel.
 """
 import os
 import re
@@ -41,7 +43,7 @@ COLS_PADRAO = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEMA — Thomson Reuters
+# TEMA
 # ═══════════════════════════════════════════════════════════════════════════════
 def apply_theme():
     st.markdown("""
@@ -79,15 +81,34 @@ def apply_theme():
         padding:14px; font-family:Consolas,monospace; font-size:12px;
         white-space:pre-wrap; max-height:520px; overflow-y:auto; color:#E8ECF0;
     }
-    .badge-ecd   { color:#F472B6; font-weight:700; }
-    .badge-excel { color:#00C896; font-weight:700; }
-    .badge-lote  { color:#FFD166; font-weight:700; }
-    .badge-erro  { color:#FF4444; font-weight:700; }
-    .badge-ok    { color:#00C896; font-weight:700; }
+    .badge-ecd   { background:#1a0a2e; color:#F472B6; font-weight:700;
+                   padding:6px 14px; border-radius:6px;
+                   border:1px solid #F472B6; display:inline-block; }
+    .badge-excel { background:#0a2e1a; color:#00C896; font-weight:700;
+                   padding:6px 14px; border-radius:6px;
+                   border:1px solid #00C896; display:inline-block; }
+    .badge-lote  { background:#2e2a0a; color:#FFD166; font-weight:700;
+                   padding:6px 14px; border-radius:6px;
+                   border:1px solid #FFD166; display:inline-block; }
     .header-box {
         background:#102040; padding:20px 24px 14px;
         border-radius:8px; border-top:5px solid #FF6B00;
         margin-bottom:20px;
+    }
+    .cnpj-box {
+        background:#0D1526; border:1px solid #1A3050;
+        border-radius:8px; padding:16px 20px; margin:10px 0 16px 0;
+    }
+    .cnpj-auto {
+        background:#0a2e1a; border:1px solid #00C896;
+        border-radius:8px; padding:12px 18px; margin:10px 0 16px 0;
+        color:#00C896; font-weight:700;
+    }
+    .cnpj-auto span { color:#FFD166; }
+    .info-box {
+        background:#102040; border-left:4px solid #FF6B00;
+        border-radius:4px; padding:12px 16px; margin:8px 0;
+        font-size:13px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -221,7 +242,7 @@ def fmt_cpf(n):
     return f"{c[:3]}.{c[3:6]}.{c[6:9]}-{c[9:]}" if len(c)==11 else n
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FORMATAÇÃO DE REGISTROS DE SAÍDA
+# FORMATAÇÃO DE REGISTROS
 # ═══════════════════════════════════════════════════════════════════════════════
 def fmt_reg_0000(ni): return f"|0000|{ni}|"
 def fmt_reg_6000(tp): return f"|6000|{tp}||||"
@@ -254,9 +275,7 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
 # IDENTIFICAÇÃO AUTOMÁTICA DO TIPO DE ARQUIVO
 # ═══════════════════════════════════════════════════════════════════════════════
 def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
-    """
-    Retorna 'ecd', 'excel' ou 'lote'.
-    """
+    """Retorna 'ecd', 'excel' ou 'lote'."""
     ext = os.path.splitext(nome_arquivo)[1].lower()
     if ext in (".xlsx", ".xls", ".xlsm"):
         return "excel"
@@ -320,6 +339,11 @@ class SpedECD:
         self.cnpj=""; self.contas={}; self.historicos={}; self.lancamentos=[]
 
 def _parse_ecd(conteudo: bytes, log: list) -> tuple:
+    """
+    Faz o parse do SPED ECD.
+    Retorna (SpedECD, registros_erro).
+    O CNPJ é extraído automaticamente do registro 0000.
+    """
     ecd = SpedECD(); lote_atual=None; erros_parse=0
     registros_erro=[]; contas_invalidas=0
 
@@ -339,7 +363,8 @@ def _parse_ecd(conteudo: bytes, log: list) -> tuple:
         reg = campos[0]
         try:
             if reg == "0000":
-                if len(campos) > 5: ecd.cnpj = campos[5].strip()
+                if len(campos) > 5:
+                    ecd.cnpj = campos[5].strip()
             elif reg == "I050":
                 if len(campos) > 7:
                     cod = campos[5].strip(); nome = campos[7].strip()
@@ -388,9 +413,10 @@ def _parse_ecd(conteudo: bytes, log: list) -> tuple:
                 log.append("ERRO: muitos erros — abortando."); return None, registros_erro
 
     if not ecd.cnpj:
-        log.append("ERRO: CNPJ não encontrado."); return None, registros_erro
+        log.append("ERRO: CNPJ não encontrado no registro 0000.")
+        return None, registros_erro
 
-    log.append(f"  CNPJ: {ecd.cnpj}")
+    log.append(f"  CNPJ extraído do arquivo: {ecd.cnpj}")
     log.append(f"  Contas: {len(ecd.contas):,} | Históricos: {len(ecd.historicos):,}")
     log.append(f"  Lançamentos (I200): {len(ecd.lancamentos):,}")
     if contas_invalidas:  log.append(f"  Contas inválidas ignoradas: {contas_invalidas:,}")
@@ -461,16 +487,16 @@ def _linhas_ecd(lanc):
     tipo=_classif(len(debs),len(creds))
     hist=_primeiro_hist(lanc["partidas"])
     out=[fmt_reg_6000(tipo)]
-    def h6(db,cr):
-        val=_fmt_valor_ecd(db["valor"]); h=_montar_hist(db) or hist
-        return f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}||{h}|||||||"
     def hd(db):
         val=_fmt_valor_ecd(db["valor"]); h=_montar_hist(db) or hist
         return f"|6100|{data}|{db['conta']}||{val}||{h}|||||||"
     def hc(cr):
         val=_fmt_valor_ecd(cr["valor"]); h=_montar_hist(cr) or hist
         return f"|6100|{data}||{cr['conta']}|{val}||{h}|||||||"
-    if   tipo=="X": out.append(h6(debs[0],creds[0]))
+    def hx(db,cr):
+        val=_fmt_valor_ecd(db["valor"]); h=_montar_hist(db) or hist
+        return f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}||{h}|||||||"
+    if   tipo=="X": out.append(hx(debs[0],creds[0]))
     elif tipo=="D": [out.append(hd(db)) for db in debs]; [out.append(hc(cr)) for cr in creds]
     elif tipo=="C": [out.append(hc(cr)) for cr in creds]; [out.append(hd(db)) for db in debs]
     else:           [out.append(hd(db)) for db in debs]; [out.append(hc(cr)) for cr in creds]
@@ -739,9 +765,9 @@ def processar_lote(df):
 def _montar_bytes_saida(ni, gerador) -> bytes:
     buf=io.StringIO()
     buf.write(fmt_reg_0000(ni)+"\n")
-    bloco=[]; total=0
+    bloco=[]; 
     for linha in gerador:
-        bloco.append(linha); total+=1
+        bloco.append(linha)
         if len(bloco)>=WRITE_CHUNK:
             buf.write("\n".join(bloco)+"\n"); bloco.clear()
     if bloco: buf.write("\n".join(bloco)+"\n")
@@ -754,7 +780,7 @@ def _montar_bytes_ecd(linhas: list) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RELATÓRIO DE LOG (LOTE)
+# LOG LOTE
 # ═══════════════════════════════════════════════════════════════════════════════
 def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados,
                      ignoradas, enc, crono: Cronometro) -> str:
@@ -798,7 +824,7 @@ def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados,
     return "\n".join(L)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTERFACE STREAMLIT
+# SESSION STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 def _init_state():
     defaults = {
@@ -818,6 +844,9 @@ def _init_state():
         "arquivo_bytes":    None,
         "arquivo_nome":     "",
         "processado":       False,
+        # CNPJ automático do ECD
+        "cnpj_ecd":         "",       # CNPJ extraído do arquivo ECD
+        "cnpj_ecd_fmt":     "",       # CNPJ formatado para exibição
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -827,7 +856,8 @@ def _reset():
     keys = ["resultado_bytes","resultado_nome","erros_bytes","erros_nome",
             "log_bytes","log_nome","log_linhas","resumo","erros_lote",
             "metricas","tipo_detectado","sheets","sheet_sel",
-            "arquivo_bytes","arquivo_nome","processado"]
+            "arquivo_bytes","arquivo_nome","processado",
+            "cnpj_ecd","cnpj_ecd_fmt"]
     for k in keys:
         st.session_state[k] = ([] if k in ("log_linhas","resumo","erros_lote","sheets")
                                 else {} if k=="metricas"
@@ -835,6 +865,27 @@ def _reset():
                                 else False if k=="processado"
                                 else "")
 
+def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
+    """
+    Lê apenas as primeiras linhas do ECD para extrair o CNPJ do registro 0000.
+    Retorna o CNPJ numérico ou string vazia.
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:
+        amostra = conteudo[:4096].decode(enc, errors="replace")
+    except Exception:
+        amostra = conteudo[:4096].decode("utf-8", errors="replace")
+    for linha in amostra.splitlines():
+        campos = _split_pipe(linha.strip())
+        if campos and campos[0] == "0000" and len(campos) > 5:
+            cnpj = re.sub(r"\D", "", campos[5].strip())
+            if len(cnpj) == 14:
+                return cnpj
+    return ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERFACE STREAMLIT
+# ═══════════════════════════════════════════════════════════════════════════════
 def main():
     st.set_page_config(
         page_title="Domínio Sistemas | Thomson Reuters",
@@ -858,39 +909,32 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙ Configurações")
         st.markdown("---")
-        cnpj_raw = st.text_input("CNPJ / CPF", placeholder="00.000.000/0001-00",
-                                  help="Informe o CNPJ (14 dígitos) ou CPF (11 dígitos).")
-        ok_insc, ti, ni = validar_inscricao(cnpj_raw)
-        if cnpj_raw:
-            if ok_insc:
-                inf = fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
-                st.success(f"✔ {ti} válido: {inf}")
-                st.code(fmt_reg_0000(ni), language=None)
-            else:
-                st.error("✖ CNPJ/CPF inválido")
-                inf = ""
-        else:
-            inf = ""
-
-        st.markdown("---")
         exibir_log = st.checkbox("Exibir log de processamento", value=False)
         st.markdown("---")
-        st.markdown("### Versões")
-        st.markdown("**V1.0** — Conversor Unificado")
+        st.markdown("### ℹ Sobre")
+        st.markdown(f"**Versão:** {VERSAO}")
+        st.markdown("**Thomson Reuters — Domínio Sistemas**")
         st.markdown("---")
         st.markdown("**Formatos suportados:**")
-        st.markdown("- 📊 Excel (.xlsx/.xls)")
+        st.markdown("- 📊 Excel (.xlsx / .xls)")
         st.markdown("- 📄 TXT separado por `;`")
         st.markdown("- 📋 SPED ECD (.txt)")
+        st.markdown("---")
+        st.markdown("**Saída gerada:**")
+        st.code("|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST|||||||",
+                language=None)
 
-    # ── Upload ────────────────────────────────────────────────────────────────
-    st.markdown("#### 📂 Selecionar Arquivo")
+    # ══════════════════════════════════════════════════════════════════════════
+    # PASSO 1 — UPLOAD DO ARQUIVO
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
     uploaded = st.file_uploader(
-        "Arraste ou clique para selecionar",
+        "Arraste ou clique para selecionar (Excel, TXT ou SPED ECD)",
         type=["xlsx","xls","xlsm","txt","csv"],
-        label_visibility="collapsed",
+        label_visibility="visible",
     )
 
+    # Detecta tipo ao fazer upload
     if uploaded is not None:
         conteudo = uploaded.read()
         if (conteudo != st.session_state.arquivo_bytes or
@@ -898,9 +942,10 @@ def main():
             _reset()
             st.session_state.arquivo_bytes = conteudo
             st.session_state.arquivo_nome  = uploaded.name
+
             tipo = identificar_tipo(uploaded.name, conteudo)
             st.session_state.tipo_detectado = tipo
-            # Detectar sheets se Excel
+
             if tipo == "excel":
                 try:
                     xl = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
@@ -910,68 +955,145 @@ def main():
                 except Exception:
                     st.session_state.sheets = []
 
-    # ── Badge tipo detectado ──────────────────────────────────────────────────
-    if st.session_state.tipo_detectado:
-        tipo = st.session_state.tipo_detectado
-        badges = {
-            "ecd":   ("<span class='badge-ecd'>📋 SPED ECD detectado</span>", "ECD"),
-            "excel": ("<span class='badge-excel'>📊 Excel — Lançamentos em Lote</span>", "Excel"),
-            "lote":  ("<span class='badge-lote'>📄 TXT — Lançamentos em Lote</span>", "TXT"),
-        }
-        badge_html, _ = badges.get(tipo, ("", ""))
-        st.markdown(badge_html, unsafe_allow_html=True)
+            elif tipo == "ecd":
+                # Extrai CNPJ automaticamente
+                cnpj_num = _pre_scan_cnpj_ecd(conteudo)
+                st.session_state.cnpj_ecd = cnpj_num
+                st.session_state.cnpj_ecd_fmt = fmt_cnpj(cnpj_num) if cnpj_num else ""
 
-    # ── Opções específicas por tipo ───────────────────────────────────────────
-    sheet_sel  = ""
-    linha_h    = 3
-    auto_head  = True
+    # ── Nenhum arquivo ainda ──────────────────────────────────────────────────
+    if st.session_state.arquivo_bytes is None:
+        st.markdown(
+            "<div class='info-box'>"
+            "⬆ Selecione um arquivo para começar.<br>"
+            "O tipo será identificado automaticamente após o upload."
+            "</div>", unsafe_allow_html=True)
+        return  # Para aqui — não exibe nada mais até ter arquivo
 
-    if st.session_state.tipo_detectado == "excel" and st.session_state.sheets:
+    # ══════════════════════════════════════════════════════════════════════════
+    # PASSO 2 — TIPO DETECTADO + CNPJ (condicional)
+    # ══════════════════════════════════════════════════════════════════════════
+    tipo = st.session_state.tipo_detectado
+
+    # Badge do tipo
+    badges = {
+        "ecd":   "<span class='badge-ecd'>📋 SPED ECD detectado</span>",
+        "excel": "<span class='badge-excel'>📊 Excel — Lançamentos em Lote</span>",
+        "lote":  "<span class='badge-lote'>📄 TXT — Lançamentos em Lote</span>",
+    }
+    st.markdown(badges.get(tipo,""), unsafe_allow_html=True)
+    st.markdown("")
+
+    # ── Opções Excel ──────────────────────────────────────────────────────────
+    sheet_sel = ""; linha_h = 3; auto_head = True
+    if tipo == "excel" and st.session_state.sheets:
+        st.markdown("#### 📋 Passo 2 — Configurar Excel")
         col1, col2, col3 = st.columns([2,1,1])
         with col1:
-            sheet_sel = st.selectbox("Aba (Sheet)", st.session_state.sheets,
-                index=st.session_state.sheets.index(st.session_state.sheet_sel)
-                      if st.session_state.sheet_sel in st.session_state.sheets else 0)
+            sheet_sel = st.selectbox(
+                "Aba (Sheet)", st.session_state.sheets,
+                index=(st.session_state.sheets.index(st.session_state.sheet_sel)
+                       if st.session_state.sheet_sel in st.session_state.sheets else 0))
             st.session_state.sheet_sel = sheet_sel
         with col2:
             auto_head = st.checkbox("Detectar cabeçalho automaticamente", value=True)
         with col3:
             if not auto_head:
-                linha_h = st.number_input("Linha do cabeçalho", min_value=1,
-                                          max_value=50, value=4) - 1
-            else:
-                linha_h = 3
+                linha_h = st.number_input("Linha do cabeçalho",
+                                          min_value=1, max_value=50, value=4) - 1
 
-    # ── Opções gerais ─────────────────────────────────────────────────────────
+    # ── CNPJ — comportamento condicional ─────────────────────────────────────
+    ni = ""; ok_insc = False; ti = ""; inf = ""
+
+    if tipo == "ecd":
+        # ── ECD: CNPJ preenchido automaticamente ─────────────────────────────
+        st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
+        cnpj_ecd = st.session_state.cnpj_ecd
+        cnpj_fmt = st.session_state.cnpj_ecd_fmt
+
+        if cnpj_ecd and validar_cnpj(cnpj_ecd):
+            st.markdown(
+                f"<div class='cnpj-auto'>"
+                f"✔ CNPJ extraído do arquivo SPED ECD: "
+                f"<span>{cnpj_fmt}</span>"
+                f"<br><small style='color:#6B7A8D;'>Registro 0000 do arquivo</small>"
+                f"</div>", unsafe_allow_html=True)
+            st.code(fmt_reg_0000(cnpj_ecd), language=None)
+            ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd; inf = cnpj_fmt
+        else:
+            # Fallback: solicita manualmente se não encontrou
+            st.warning("⚠ CNPJ não encontrado no arquivo. Informe manualmente.")
+            cnpj_raw = st.text_input("CNPJ / CPF",
+                                      placeholder="00.000.000/0001-00",
+                                      key="cnpj_manual_ecd")
+            ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+            if cnpj_raw:
+                if ok_insc:
+                    inf = fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
+                    st.success(f"✔ {ti} válido: {inf}")
+                    st.code(fmt_reg_0000(ni), language=None)
+                else:
+                    st.error("✖ CNPJ/CPF inválido")
+
+    else:
+        # ── TXT / Excel: solicita CNPJ após identificação ─────────────────────
+        st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
+        st.markdown(
+            "<div class='cnpj-box'>"
+            "Informe o CNPJ ou CPF do titular dos lançamentos."
+            "</div>", unsafe_allow_html=True)
+
+        cnpj_raw = st.text_input(
+            "CNPJ / CPF",
+            placeholder="00.000.000/0001-00  ou  000.000.000-00",
+            help="Digite o CNPJ (14 dígitos) ou CPF (11 dígitos).",
+            key="cnpj_lote",
+        )
+        ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+        if cnpj_raw:
+            if ok_insc:
+                inf = fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
+                col_a, col_b = st.columns([1,2])
+                with col_a:
+                    st.success(f"✔ {ti} válido")
+                with col_b:
+                    st.code(fmt_reg_0000(ni), language=None)
+            else:
+                st.error("✖ CNPJ/CPF inválido — verifique os dígitos.")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PASSO 3 — OPÇÕES E BOTÃO CONVERTER
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
+
     col_op1, col_op2 = st.columns(2)
     with col_op1:
         gerar_6110 = st.checkbox(
             "Gerar registro 6110 (apenas SPED ECD)",
             value=False,
-            help="Gera linha analítica 6110 após cada 6100 (somente para SPED ECD).")
-    with col_op2:
-        st.markdown("")   # espaçador
+            help="Gera linha analítica 6110 após cada 6100 (somente para SPED ECD).",
+            disabled=(tipo != "ecd"))
 
-    st.markdown("---")
-
-    # ── Botões ────────────────────────────────────────────────────────────────
-    col_b1, col_b2 = st.columns(2)
+    col_b1, col_b2 = st.columns([2,1])
     with col_b1:
         btn_converter = st.button(
             "▶ CONVERTER",
-            disabled=(st.session_state.arquivo_bytes is None or not ok_insc),
-            use_container_width=True, type="primary")
+            disabled=(not ok_insc),
+            use_container_width=True,
+            type="primary",
+        )
     with col_b2:
-        btn_limpar = st.button("🗑 Limpar", use_container_width=True)
+        btn_limpar = st.button("🗑 Limpar tudo", use_container_width=True)
 
     if btn_limpar:
         _reset(); st.rerun()
 
-    # ── CONVERSÃO ─────────────────────────────────────────────────────────────
-    if btn_converter and st.session_state.arquivo_bytes and ok_insc:
+    # ══════════════════════════════════════════════════════════════════════════
+    # CONVERSÃO
+    # ══════════════════════════════════════════════════════════════════════════
+    if btn_converter and ok_insc:
         conteudo = st.session_state.arquivo_bytes
-        nome     = st.session_state.arquivo_nome
-        tipo     = st.session_state.tipo_detectado
         log      = []
         crono    = Cronometro(); crono.iniciar()
 
@@ -989,11 +1111,14 @@ def main():
                 prog_bar.progress(10)
 
                 ecd, registros_erro = _parse_ecd(conteudo, log)
+
                 if ecd is None:
-                    st.error("Falha na leitura do SPED ECD. Verifique o log.")
+                    st.error("Falha na leitura do SPED ECD. Ative o log para detalhes.")
                     st.session_state.log_linhas = log
                 else:
-                    cnpj_final = ni if ni else re.sub(r"\D","",ecd.cnpj)
+                    # Usa o CNPJ do próprio arquivo (já preenchido em ni)
+                    cnpj_final = ni
+
                     prog_bar.progress(50)
                     status_txt.text("Gerando registros...")
                     crono.etapa("Geração dos registros")
@@ -1027,30 +1152,29 @@ def main():
                     status_txt.text("Montando arquivo...")
 
                     resultado_bytes = _montar_bytes_ecd(linhas_ecd)
-                    nome_saida = f"ECD_{re.sub(chr(92)+'D','',ecd.cnpj)}_dominio.txt"
+                    nome_saida = f"ECD_{cnpj_final}_dominio.txt"
 
                     st.session_state.resultado_bytes = resultado_bytes
                     st.session_state.resultado_nome  = nome_saida
                     st.session_state.metricas = {
-                        "CNPJ": ecd.cnpj,
+                        "CNPJ":               ecd.cnpj,
                         "Lançamentos (I200)": f"{len(ecd.lancamentos):,}",
-                        "Registros 6000": sum(1 for l in linhas_ecd if l.startswith("|6000|")),
-                        "Registros 6100": sum(1 for l in linhas_ecd if l.startswith("|6100|")),
-                        "Total linhas":   len(linhas_ecd),
+                        "Registros 6000":     sum(1 for l in linhas_ecd if l.startswith("|6000|")),
+                        "Registros 6100":     sum(1 for l in linhas_ecd if l.startswith("|6100|")),
+                        "Total linhas":       len(linhas_ecd),
                     }
 
                     if registros_erro:
                         erros_txt = _txt_erros_ecd(registros_erro, ecd.cnpj)
                         st.session_state.erros_bytes = erros_txt.encode("utf-8-sig")
-                        st.session_state.erros_nome  = (
-                            f"ECD_{re.sub(chr(92)+'D','',ecd.cnpj)}_erros.txt")
+                        st.session_state.erros_nome  = f"ECD_{cnpj_final}_erros.txt"
 
                     total_seg = crono.encerrar()
                     log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
                     for e in crono.etapas:
                         log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-                    st.session_state.log_linhas  = log
-                    st.session_state.processado  = True
+                    st.session_state.log_linhas = log
+                    st.session_state.processado = True
                     prog_bar.progress(100)
                     status_txt.text("Concluído!")
 
@@ -1112,8 +1236,8 @@ def main():
                 total_seg = crono.encerrar()
                 log_txt = _montar_log_lote(resumo, erros, ni, ti, inf,
                                            n_gravados, ignoradas, enc_usado, crono)
-                st.session_state.log_bytes  = log_txt.encode("utf-8-sig")
-                st.session_state.log_nome   = "log_conversao.txt"
+                st.session_state.log_bytes = log_txt.encode("utf-8-sig")
+                st.session_state.log_nome  = "log_conversao.txt"
                 log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
                 for e in crono.etapas:
                     log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
@@ -1145,19 +1269,20 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     if st.session_state.processado:
 
-        # ── Métricas ──────────────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### 📊 Resultado")
+
+        # Métricas
         if st.session_state.metricas:
-            st.markdown("#### 📊 Resumo")
             cols = st.columns(len(st.session_state.metricas))
             for i,(k,v) in enumerate(st.session_state.metricas.items()):
                 cols[i].metric(k, v)
 
-        # ── Tabela de validação (lote) ─────────────────────────────────────────
+        # Tabela de validação (lote)
         if st.session_state.resumo:
             st.markdown("#### ✅ Validação dos Lotes")
-            resumo = st.session_state.resumo
             rows = []
-            for v in resumo:
+            for v in st.session_state.resumo:
                 rows.append({
                     "Lote":      v["num_lote"],
                     "Linhas":    v["faixa_linhas"],
@@ -1167,10 +1292,8 @@ def main():
                     "Diferença": f"R$ {v['diferenca']:.2f}",
                     "Status":    "✔ OK" if v["balanceado"] else "✖ ERRO",
                 })
-            df_res = pd.DataFrame(rows)
-            st.dataframe(df_res, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            # Diagnóstico de erros
             erros = st.session_state.erros_lote
             if erros:
                 st.markdown("#### ⚠ Diagnóstico dos Lotes com Erro")
@@ -1196,27 +1319,30 @@ def main():
                                  "conta_credito","valor","descricao"]]
                             st.dataframe(df_det, use_container_width=True, hide_index=True)
 
-        # ── Downloads ─────────────────────────────────────────────────────────
+        # Downloads
         st.markdown("#### ⬇ Downloads")
         dl1, dl2, dl3 = st.columns(3)
 
         with dl1:
             if st.session_state.resultado_bytes:
-                st.success("Arquivo gerado!")
+                st.success("Arquivo gerado com sucesso!")
                 st.download_button(
                     "⬇ Baixar arquivo convertido",
                     data=st.session_state.resultado_bytes,
                     file_name=st.session_state.resultado_nome,
-                    mime="text/plain", use_container_width=True, type="primary")
+                    mime="text/plain",
+                    use_container_width=True,
+                    type="primary")
 
         with dl2:
             if st.session_state.erros_bytes:
-                st.warning("Há linhas com erro.")
+                st.warning(f"{len(st.session_state.erros_lote or [])} linha(s) com erro.")
                 st.download_button(
                     "⬇ Baixar relatório de erros",
                     data=st.session_state.erros_bytes,
                     file_name=st.session_state.erros_nome,
-                    mime="text/plain", use_container_width=True)
+                    mime="text/plain",
+                    use_container_width=True)
 
         with dl3:
             if st.session_state.log_bytes:
@@ -1224,14 +1350,14 @@ def main():
                     "⬇ Baixar log completo",
                     data=st.session_state.log_bytes,
                     file_name=st.session_state.log_nome,
-                    mime="text/plain", use_container_width=True)
+                    mime="text/plain",
+                    use_container_width=True)
 
-        # ── Log no console ────────────────────────────────────────────────────
+        # Log no console
         if exibir_log and st.session_state.log_linhas:
             st.markdown("#### 🖥 Log de Processamento")
             log_txt = "\n".join(str(l) for l in st.session_state.log_linhas)
-            tem_erro = any("ERRO" in str(l).upper()
-                           for l in st.session_state.log_linhas)
+            tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
             cor = "#FF4444" if tem_erro else "#1A3050"
             st.markdown(
                 f"<div class='bloco-log' style='border-color:{cor};'>"
