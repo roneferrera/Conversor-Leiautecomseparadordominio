@@ -1,7 +1,6 @@
 import re
 import io
 import os
-import base64
 import traceback
 import streamlit as st
 
@@ -84,19 +83,22 @@ def apply_tr_theme():
 
 
 # ==============================
-# PARSE DO SPED ECD
+# ESTRUTURA DE DADOS
 # ==============================
 
 class SpedECD:
     def __init__(self):
         self.cnpj        = ""
-        self.contas      = {}      # cod_reduzido -> nome
-        self.historicos  = {}      # cod -> descricao (I075)
-        self.lancamentos = []      # lista de lançamentos (I200 + I250)
+        self.contas      = {}   # cod_reduzido -> nome
+        self.historicos  = {}   # cod -> descricao (I075)
+        self.lancamentos = []   # lista de dicts com I200 + I250
 
 
-def _split_pipe(linha: str) -> list[str]:
-    """Divide a linha pelo pipe e remove os campos vazios das bordas."""
+# ==============================
+# PARSE DO SPED ECD
+# ==============================
+
+def _split_pipe(linha):
     campos = linha.strip().split("|")
     if campos and campos[0] == "":
         campos = campos[1:]
@@ -105,11 +107,10 @@ def _split_pipe(linha: str) -> list[str]:
     return campos
 
 
-def parse_sped_ecd(conteudo_bytes: bytes, log: list) -> SpedECD | None:
-    """Lê o arquivo SPED ECD e retorna o objeto SpedECD preenchido."""
-    ecd          = SpedECD()
-    lote_atual   = None
-    erros        = 0
+def parse_sped_ecd(conteudo_bytes, log):
+    ecd        = SpedECD()
+    lote_atual = None
+    erros      = 0
 
     try:
         texto = conteudo_bytes.decode("utf-8", errors="replace")
@@ -129,8 +130,8 @@ def parse_sped_ecd(conteudo_bytes: bytes, log: list) -> SpedECD | None:
             # ---- 0000 – Identificação da empresa ----
             if registro == "0000":
                 # |0000|LECD|DT_INI|DT_FIN|NOME|CNPJ|...
-                if len(campos) > 6:
-                    ecd.cnpj = campos[6]
+                if len(campos) > 5:
+                    ecd.cnpj = campos[5].strip()
 
             # ---- I050 – Plano de contas ----
             elif registro == "I050":
@@ -152,21 +153,21 @@ def parse_sped_ecd(conteudo_bytes: bytes, log: list) -> SpedECD | None:
                 # |I200|NUM_LANC|DT_LANC|VL_LANC|IND_DC|IND_LANC|...
                 if len(campos) > 3:
                     lote_atual = {
-                        "num"    : campos[1].strip(),
-                        "data"   : campos[2].strip(),
-                        "valor"  : campos[3].strip(),
+                        "num"     : campos[1].strip(),
+                        "data"    : campos[2].strip(),
+                        "valor"   : campos[3].strip(),
                         "partidas": [],
                     }
                     ecd.lancamentos.append(lote_atual)
 
             # ---- I250 – Partidas do lançamento ----
             elif registro == "I250":
-                # |I250|COD_CTA|COD_CCUS|VL_DC|IND_DC|NUM_ARQ|COD_HIST|DESCR_HIST|...
+                # |I250|COD_CTA|COD_CCUS|VL_DC|IND_DC|NUM_ARQ|COD_HIST|DESCR_HIST|
                 if lote_atual is not None and len(campos) > 4:
                     partida = {
                         "conta"     : campos[1].strip(),
                         "valor"     : campos[3].strip(),
-                        "dc"        : campos[4].strip().upper(),   # D ou C
+                        "dc"        : campos[4].strip().upper(),
                         "cod_hist"  : campos[6].strip() if len(campos) > 6 else "",
                         "descr_hist": campos[7].strip() if len(campos) > 7 else "",
                     }
@@ -191,11 +192,11 @@ def parse_sped_ecd(conteudo_bytes: bytes, log: list) -> SpedECD | None:
 
 
 # ==============================
-# FUNÇÕES AUXILIARES DE FORMATAÇÃO
+# FUNÇÕES AUXILIARES
 # ==============================
 
-def formatar_data_dominio(data_sped: str) -> str:
-    """Converte DDMMAAAA → DD/MM/AAAA (mantém se já tiver barra)."""
+def formatar_data_dominio(data_sped):
+    """DDMMAAAA → DD/MM/AAAA. Mantém se já tiver barra."""
     d = data_sped.strip()
     if "/" in d:
         return d
@@ -204,14 +205,14 @@ def formatar_data_dominio(data_sped: str) -> str:
     return d
 
 
-def formatar_valor(valor_str: str) -> str:
+def formatar_valor(valor_str):
     """
-    Garante separador decimal com vírgula e pelo menos duas casas.
+    Garante separador decimal com vírgula e pelo menos duas casas decimais.
     Ex.: '5571.24' → '5571,24' | '5571' → '5571,00'
     """
     v = valor_str.strip()
 
-    # Troca ponto por vírgula (padrão brasileiro)
+    # Troca ponto por vírgula (padrão SPED usa vírgula, mas por segurança)
     if "." in v and "," not in v:
         v = v.replace(".", ",")
     elif "." in v and "," in v:
@@ -220,7 +221,6 @@ def formatar_valor(valor_str: str) -> str:
             v = v.replace(".", "").replace(",", ".")
             v = v.replace(".", ",")
 
-    # Garante duas casas decimais
     if "," not in v:
         v += ",00"
     else:
@@ -232,10 +232,10 @@ def formatar_valor(valor_str: str) -> str:
     return v
 
 
-def montar_historico(partida: dict, historicos: dict) -> str:
+def montar_historico(partida, historicos):
     """
-    Monta a descrição do histórico para o campo 7 do registro 6100.
     Prioridade: descrição completa da partida (I250 campo 7) > padrão I075.
+    Limitado a 250 caracteres.
     """
     descr = partida.get("descr_hist", "").strip()
     cod   = partida.get("cod_hist",   "").strip()
@@ -247,13 +247,12 @@ def montar_historico(partida: dict, historicos: dict) -> str:
     return ""
 
 
-def identificar_tipo_lancamento(partidas: list) -> str:
+def identificar_tipo_lancamento(partidas):
     """
-    Determina o tipo do lançamento (campo 2 do 6000):
-      X = 1 débito × 1 crédito
-      D = 1 débito × vários créditos
-      C = vários débitos × 1 crédito
-      V = vários débitos × vários créditos
+    X = 1 débito × 1 crédito
+    D = 1 débito × vários créditos
+    C = vários débitos × 1 crédito
+    V = vários débitos × vários créditos
     """
     debitos  = [p for p in partidas if p["dc"] == "D"]
     creditos = [p for p in partidas if p["dc"] == "C"]
@@ -268,7 +267,7 @@ def identificar_tipo_lancamento(partidas: list) -> str:
     return "V"
 
 
-def primeiro_historico(partidas: list, historicos: dict) -> str:
+def primeiro_historico(partidas, historicos):
     """Retorna o primeiro histórico não-vazio encontrado nas partidas."""
     for p in partidas:
         h = montar_historico(p, historicos)
@@ -281,21 +280,24 @@ def primeiro_historico(partidas: list, historicos: dict) -> str:
 # GERADOR DO LAYOUT DOMÍNIO
 # ==============================
 
-def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
+def gerar_dominio(ecd, log):
     """
-    Converte o SpedECD para as linhas do layout Domínio Sistemas
-    (registros 0000 / 6000 / 6100 / 6110).
-    Retorna lista de strings (uma por linha).
+    Gera as linhas do layout Domínio Sistemas.
+    Registros: 0000 / 6000 / 6100 / 6110
+
+    Exemplo de saída esperada (arquivo exemplo_arquivo__lancamento_lote.txt):
+        |0000|33333333000191|
+        |6000|X||||
+        |6100|10/09/2015|55|5|5571,24|1|DESCRICAO DO HISTORICO CONTABIL|GERENTE|||
     """
-    linhas: list[str] = []
+    linhas     = []
+    total_6100 = 0
+    total_6110 = 0
+    ignorados  = 0
 
     # ---- Registro 0000 ----
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
     linhas.append(f"|0000|{cnpj_numerico}|")
-
-    total_6100 = 0
-    total_6110 = 0
-    ignorados  = 0
 
     for lanc in ecd.lancamentos:
         partidas = lanc.get("partidas", [])
@@ -312,24 +314,23 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
 
         data      = formatar_data_dominio(lanc["data"])
         tipo_lanc = identificar_tipo_lancamento(partidas)
-        historico = primeiro_historico(partidas, ecd.historicos)
 
         # ---- Registro 6000 ----
+        # Campos: |6000|TIPO|COD_LANC_PADRAO|LOCALIZADOR|RTT_FCONT|
         linhas.append(f"|6000|{tipo_lanc}||||")
 
         # ---- Monta 6100 / 6110 conforme o tipo ----
+
         if tipo_lanc == "X":
             # 1 débito × 1 crédito
             db  = debitos[0]
             cr  = creditos[0]
             val = formatar_valor(db["valor"])
             cod = db.get("cod_hist", "")
-            dsc = montar_historico(db, ecd.historicos) or historico
+            dsc = montar_historico(db, ecd.historicos)
 
-            linhas.append(
-                f"|6100|{data}|{db['conta']}|{cr['conta']}"
-                f"|{val}|{cod}|{dsc}|||"
-            )
+            # |6100|DATA|DEBITO|CREDITO|VALOR|COD_HIST|DESCR_HIST|USUARIO|COD_FILIAL|COD_SCP|
+            linhas.append(f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}|{cod}|{dsc}|||")
             total_6100 += 1
 
         elif tipo_lanc == "D":
@@ -337,7 +338,7 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
             db  = debitos[0]
             val = formatar_valor(db["valor"])
             cod = db.get("cod_hist", "")
-            dsc = montar_historico(db, ecd.historicos) or historico
+            dsc = montar_historico(db, ecd.historicos)
 
             cr_principal = creditos[0]
             linhas.append(
@@ -346,6 +347,8 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
             )
             total_6100 += 1
 
+            # Créditos adicionais → 6110
+            # |6110|CC_DEBITO|CC_CREDITO|VALOR_RATEIO|
             for cr in creditos[1:]:
                 vr = formatar_valor(cr["valor"])
                 linhas.append(f"|6110||{cr['conta']}|{vr}|")
@@ -358,7 +361,7 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
 
             db_principal = debitos[0]
             cod = db_principal.get("cod_hist", "")
-            dsc = montar_historico(db_principal, ecd.historicos) or historico
+            dsc = montar_historico(db_principal, ecd.historicos)
 
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr['conta']}"
@@ -366,6 +369,7 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
             )
             total_6100 += 1
 
+            # Débitos adicionais → 6110
             for db in debitos[1:]:
                 vr = formatar_valor(db["valor"])
                 linhas.append(f"|6110|{db['conta']}||{vr}|")
@@ -377,7 +381,7 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
             cr_principal = creditos[0]
             val = formatar_valor(db_principal["valor"])
             cod = db_principal.get("cod_hist", "")
-            dsc = montar_historico(db_principal, ecd.historicos) or historico
+            dsc = montar_historico(db_principal, ecd.historicos)
 
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr_principal['conta']}"
@@ -400,15 +404,14 @@ def gerar_dominio(ecd: SpedECD, log: list) -> list[str]:
     if ignorados:
         log.append(f"Lançamentos ignorados  : {ignorados} (sem partidas D/C completas)")
     log.append(f"Total de linhas geradas: {len(linhas)}")
-
     return linhas
 
 
 # ==============================
-# PIPELINE PRINCIPAL (chamado pelo Streamlit)
+# PIPELINE PRINCIPAL
 # ==============================
 
-def converter_sped_ecd(conteudo_bytes: bytes, log: list) -> tuple[list[str] | None, SpedECD | None]:
+def converter_sped_ecd(conteudo_bytes, log):
     """Lê o SPED ECD e gera as linhas do layout Domínio."""
     try:
         log.append("Iniciando leitura do SPED ECD...")
@@ -456,7 +459,7 @@ def main():
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0; font-family:'Segoe UI',Arial,sans-serif;">
                 Selecione o arquivo SPED ECD e clique em
-                <strong>Converter</strong> para gerar o arquivo de importação
+                <strong>▶ Converter</strong> para gerar o arquivo de importação
                 do Domínio Contabilidade (registros 0000 / 6000 / 6100 / 6110).
             </p>
         </div>
@@ -474,12 +477,12 @@ def main():
         st.markdown("### 📋 Registros gerados")
         st.markdown(
             """
-            | Registro | Descrição |
-            |----------|-----------|
-            | `0000`   | Identificação da empresa (CNPJ) |
-            | `6000`   | Cabeçalho do lote |
-            | `6100`   | Lançamento principal |
-            | `6110`   | Partidas adicionais (rateio) |
+| Registro | Descrição |
+|----------|-----------|
+| `0000`   | CNPJ da empresa |
+| `6000`   | Cabeçalho do lote (tipo X/D/C/V) |
+| `6100`   | Lançamento principal |
+| `6110`   | Partidas adicionais (rateio) |
             """
         )
 
@@ -499,7 +502,8 @@ def main():
             <ol>
                 <li>Clique em <b>Browse files</b> e selecione o arquivo SPED ECD.</li>
                 <li>Clique em <b>▶ Converter</b>.</li>
-                <li>Aguarde o processamento e clique em <b>⬇ Baixar arquivo convertido</b>.</li>
+                <li>Aguarde o processamento e clique em
+                    <b>⬇ Baixar arquivo convertido</b>.</li>
             </ol>
 
             <h4>🔹 Passo 3 — Importar no Domínio Contabilidade</h4>
@@ -582,7 +586,6 @@ def main():
             cnpj_num = re.sub(r"\D", "", ecd.cnpj)
             st.session_state.nome_arquivo = f"ECD_{cnpj_num}_lancamentos_dominio.txt"
 
-            # Métricas para exibição
             total_linhas = len(linhas)
             total_6000   = sum(1 for l in linhas if l.startswith("|6000|"))
             total_6100   = sum(1 for l in linhas if l.startswith("|6100|"))
@@ -600,10 +603,10 @@ def main():
     # ---- Métricas ----
     if st.session_state.metricas:
         st.markdown("#### 📊 Resumo da conversão")
-        m = st.session_state.metricas
-        cols = st.columns(5)
+        m      = st.session_state.metricas
         labels = list(m.keys())
         values = list(m.values())
+        cols   = st.columns(5)
         for i, col in enumerate(cols):
             if i < len(labels):
                 col.metric(labels[i], values[i])
