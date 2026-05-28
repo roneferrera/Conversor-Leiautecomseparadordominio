@@ -81,10 +81,18 @@ def _split_pipe(linha):
     return campos
 
 
+# ─── NOVA FUNCAO DE VALIDACAO ────────────────────────────────────────────────
+def conta_valida(conta: str) -> bool:
+    """Retorna True se a conta contem apenas digitos (sem letras, pontos, hifens, etc.)."""
+    return bool(conta) and conta.isdigit()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
-    ecd        = SpedECD()
-    lote_atual = None
-    erros      = 0
+    ecd            = SpedECD()
+    lote_atual     = None
+    erros          = 0
+    contas_invalidas = 0   # contador para resumo no log
 
     for encoding in ("utf-8", "latin-1", "cp1252"):
         try:
@@ -148,12 +156,25 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                     continue
                 if len(campos) <= 4:
                     continue
+
                 dc_raw = campos[4].strip().upper()
                 if dc_raw not in ("D", "C"):
                     log.append(f"Aviso linha {num_linha}: I250 dc='{dc_raw}' invalido - ignorado.")
                     continue
+
+                conta = campos[1].strip()
+
+                # ── VALIDACAO DA CONTA ────────────────────────────────────
+                if not conta_valida(conta):
+                    log.append(
+                        f"Aviso linha {num_linha}: conta '{conta}' contem caracteres nao numericos - partida ignorada."
+                    )
+                    contas_invalidas += 1
+                    continue
+                # ─────────────────────────────────────────────────────────
+
                 partida = {
-                    "conta"     : campos[1].strip(),
+                    "conta"     : conta,
                     "valor"     : campos[3].strip(),
                     "dc"        : dc_raw,
                     "descr_hist": normalizar_historico(campos[7] if len(campos) > 7 else ""),
@@ -177,9 +198,11 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
         return None
 
     log.append(f"Leitura concluida - CNPJ: {ecd.cnpj}")
-    log.append(f"  Contas carregadas : {len(ecd.contas)}")
-    log.append(f"  Historicos (I075) : {len(ecd.historicos)}")
-    log.append(f"  Lancamentos (I200): {len(ecd.lancamentos)}")
+    log.append(f"  Contas carregadas      : {len(ecd.contas)}")
+    log.append(f"  Historicos (I075)      : {len(ecd.historicos)}")
+    log.append(f"  Lancamentos (I200)     : {len(ecd.lancamentos)}")
+    if contas_invalidas:
+        log.append(f"  Contas invalidas ignor.: {contas_invalidas}")
     log.append("-" * 60)
     log.append("DEBUG - primeiros 10 lancamentos:")
     for i, lanc in enumerate(ecd.lancamentos[:10]):
@@ -499,6 +522,7 @@ def main():
             "<li>Partidas com mesma conta e mesmo lado (D ou C) sao somadas.</li>"
             "<li>Arquivo gravado em latin-1.</li>"
             "<li>Lancamentos sem debito e credito simultaneos sao ignorados.</li>"
+            "<li>Contas com caracteres nao numericos sao ignoradas automaticamente.</li>"
             "</ul>"
             "</div>",
             unsafe_allow_html=True,
