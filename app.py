@@ -6,16 +6,7 @@ import streamlit as st
 # ==============================
 # VERSÃO
 # ==============================
-VERSAO = "V1.3"
-
-# ==============================
-# CONTAS TEMPORÁRIAS DO SPED
-# (não existem no plano de contas do Domínio)
-# ==============================
-CONTAS_IGNORAR = {
-    "5000", "5001", "5002", "5003", "5004",
-    "10000", "10001", "10002", "10003",
-}
+VERSAO = "V1.5"
 
 # ==============================
 # TEMA TR
@@ -64,9 +55,9 @@ def apply_tr_theme():
 class SpedECD:
     def __init__(self):
         self.cnpj        = ""
-        self.contas      = {}   # cod_reduzido -> nome
-        self.historicos  = {}   # cod -> descricao (I075)
-        self.lancamentos = []   # lista de dicts com I200 + I250
+        self.contas      = {}
+        self.historicos  = {}
+        self.lancamentos = []
 
 
 # ==============================
@@ -94,15 +85,9 @@ def normalizar_historico(texto):
     """
     if not texto:
         return ""
-
-    # Substituições explícitas
     for orig, dest in _MAPA_ESPECIAIS.items():
         texto = texto.replace(orig, dest)
-
-    # Normalização NFC
     texto = unicodedata.normalize("NFC", texto)
-
-    # Filtra caractere a caractere para latin-1
     resultado = []
     for ch in texto:
         if ord(ch) < 0x20 and ord(ch) not in (0x09, 0x0A, 0x0D):
@@ -118,7 +103,6 @@ def normalizar_historico(texto):
                 resultado.append(base)
             except (UnicodeEncodeError, UnicodeDecodeError):
                 pass
-
     texto = "".join(resultado)
     texto = re.sub(r" {2,}", " ", texto).strip()
     return texto[:250]
@@ -141,7 +125,6 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     lote_atual = None
     erros      = 0
 
-    # Detecta encoding
     for encoding in ("utf-8", "latin-1", "cp1252"):
         try:
             texto = conteudo_bytes.decode(encoding, errors="strict")
@@ -194,6 +177,7 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 
             # ---- I200 – Cabeçalho do lançamento ----
             elif registro == "I200":
+                # |I200|NUM_LANC|DT_LANC|VL_LANC|IND_DC|IND_LANC|
                 if len(campos) > 3:
                     lote_atual = {
                         "num"     : campos[1].strip(),
@@ -205,12 +189,12 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 
             # ---- I250 – Partidas do lançamento ----
             elif registro == "I250":
+                # |I250|COD_CTA|COD_CCUS|VL_DC|IND_DC|NUM_ARQ|COD_HIST|DESCR_HIST|
                 if lote_atual is not None and len(campos) > 4:
                     partida = {
                         "conta"     : campos[1].strip(),
                         "valor"     : campos[3].strip(),
                         "dc"        : campos[4].strip().upper(),
-                        # ▼ Não passa o código; usa só a descrição livre
                         "descr_hist": normalizar_historico(
                             campos[7] if len(campos) > 7 else ""
                         ),
@@ -240,6 +224,7 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 # ==============================
 # FUNÇÕES AUXILIARES
 # ==============================
+
 def formatar_data_dominio(data_sped):
     """DDMMAAAA → DD/MM/AAAA. Mantém se já tiver barra."""
     d = data_sped.strip()
@@ -269,34 +254,40 @@ def formatar_valor(valor_str):
     return v
 
 
-def tem_conta_ignorada(partidas):
-    """Retorna True se qualquer partida usa conta temporária do SPED."""
-    for p in partidas:
-        if p["conta"] in CONTAS_IGNORAR:
-            return True
-    return False
+def montar_historico(partida):
+    """Retorna a descrição livre da partida (já normalizada na leitura)."""
+    return partida.get("descr_hist", "").strip()
 
 
-def primeiro_historico_livre(partidas):
-    """
-    Retorna a primeira descrição livre não-vazia das partidas.
-    NÃO usa código de histórico — vai apenas o texto descritivo.
-    """
+def primeiro_historico(partidas):
+    """Retorna o primeiro histórico não-vazio encontrado nas partidas."""
     for p in partidas:
-        d = p.get("descr_hist", "").strip()
-        if d:
-            return d
+        h = montar_historico(p)
+        if h:
+            return h
     return ""
 
 
-def identificar_tipo_lancamento(debitos, creditos):
+def classificar_lancamento(debitos, creditos):
     """
-    X = 1 débito × 1 crédito
-    D = 1 débito × vários créditos
-    C = vários débitos × 1 crédito
-    V = vários débitos × vários créditos
+    Classifica o lançamento conforme o layout do Domínio Sistemas (registro 6000):
+
+        X = 1 débito  ×  1 crédito        (Um débito p/ um crédito)
+        D = 1 débito  ×  N créditos       (Um débito p/ vários créditos)
+        C = N débitos ×  1 crédito        (Um crédito p/ vários débitos)
+        V = N débitos ×  N créditos       (Vários débitos p/ vários créditos)
+
+    A classificação é feita com base no número de contas DISTINTAS
+    em cada lado, não no número de partidas brutas — isso evita que
+    partidas repetidas (mesma conta, valores diferentes) inflem
+    artificialmente o tipo para V quando deveria ser X.
     """
-    nd, nc = len(debitos), len(creditos)
+    contas_debito  = set(p["conta"] for p in debitos)
+    contas_credito = set(p["conta"] for p in creditos)
+
+    nd = len(contas_debito)
+    nc = len(contas_credito)
+
     if nd == 1 and nc == 1:
         return "X"
     if nd == 1 and nc > 1:
@@ -306,25 +297,60 @@ def identificar_tipo_lancamento(debitos, creditos):
     return "V"
 
 
+def agrupar_partidas_por_conta(partidas):
+    """
+    Agrupa partidas pelo código de conta, somando os valores.
+    Retorna lista de dicts {conta, valor_total, dc, descr_hist}.
+    Preserva a descrição da primeira partida encontrada para cada conta.
+    """
+    agrupado = {}
+    for p in partidas:
+        conta = p["conta"]
+        if conta not in agrupado:
+            agrupado[conta] = {
+                "conta"     : conta,
+                "valor"     : 0.0,
+                "dc"        : p["dc"],
+                "descr_hist": p.get("descr_hist", ""),
+            }
+        try:
+            v = float(p["valor"].replace(",", ".")) if isinstance(p["valor"], str) else float(p["valor"])
+        except Exception:
+            v = 0.0
+        agrupado[conta]["valor"] += v
+        # Mantém a primeira descrição não-vazia
+        if not agrupado[conta]["descr_hist"] and p.get("descr_hist"):
+            agrupado[conta]["descr_hist"] = p["descr_hist"]
+
+    resultado = list(agrupado.values())
+    # Reformata o valor de volta para string com vírgula
+    for r in resultado:
+        r["valor"] = f"{r['valor']:.2f}".replace(".", ",")
+    return resultado
+
+
 # ==============================
 # GERADOR DO LAYOUT DOMÍNIO
 # ==============================
+
 def gerar_dominio(ecd, log, progress_bar, status_text):
     """
     Gera as linhas do layout Domínio Sistemas.
     Registros: 0000 / 6000 / 6100 / 6110
 
-    Correções V1.3:
-    - Campo 6 do 6100 sempre vazio (evita erro 'histórico não cadastrado')
-    - Campo 7 do 6100 recebe apenas a descrição livre (normalizada em latin-1)
-    - Lançamentos com contas temporárias (5000,5001,10000,10001…) são ignorados
-    - Encoding de saída: latin-1 (sem mojibake)
+    V1.5 — Classificação D/C/X/V correta:
+    ─────────────────────────────────────
+    • Agrupa partidas I250 por conta (evita falso V por partidas repetidas).
+    • Classifica com base em contas DISTINTAS de cada lado (D/C/X/V).
+    • Gera um 6000 + 6100 + eventuais 6110 por lançamento I200.
+    • Campo 6 do 6100 sempre vazio (evita 'histórico não cadastrado').
+    • Campo 7 do 6100 = descrição livre normalizada em latin-1.
+    • Arquivo de saída em latin-1.
     """
     linhas     = []
     total_6100 = 0
     total_6110 = 0
     ignorados  = 0
-    ignorados_conta = 0
 
     # Registro 0000
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
@@ -343,15 +369,13 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
                 f"⚙ Gerando lançamento {idx + 1:,} de {total_lanc:,}..."
             )
 
-        partidas = lanc.get("partidas", [])
-        if not partidas:
+        partidas_brutas = lanc.get("partidas", [])
+        if not partidas_brutas:
             ignorados += 1
             continue
 
-        # Ignora lançamentos com contas temporárias do SPED
-        if tem_conta_ignorada(partidas):
-            ignorados_conta += 1
-            continue
+        # ── Agrupa por conta (soma valores de partidas com mesma conta) ──
+        partidas = agrupar_partidas_por_conta(partidas_brutas)
 
         debitos  = [p for p in partidas if p["dc"] == "D"]
         creditos = [p for p in partidas if p["dc"] == "C"]
@@ -361,65 +385,79 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
             continue
 
         data      = formatar_data_dominio(lanc["data"])
-        tipo_lanc = identificar_tipo_lancamento(debitos, creditos)
+        tipo_lanc = classificar_lancamento(debitos, creditos)
+        historico = primeiro_historico(partidas_brutas)  # usa brutas p/ histórico
 
-        # Histórico: apenas descrição livre, sem código
-        historico = primeiro_historico_livre(partidas)
-
-        # ---- Registro 6000 ----
+        # ── Registro 6000 ──────────────────────────────────────────────
         # |6000|TIPO|COD_LANC_PADRAO|LOCALIZADOR|RTT_FCONT|
         linhas.append(f"|6000|{tipo_lanc}||||")
 
+        # ── Registros 6100 / 6110 ──────────────────────────────────────
+        #
+        # Tipo X: 1 débito × 1 crédito
+        # ─────────────────────────────
         if tipo_lanc == "X":
             db  = debitos[0]
             cr  = creditos[0]
             val = formatar_valor(db["valor"])
-            dsc = db.get("descr_hist", "").strip() or historico
-            # Campo 6 (cod_hist) = vazio; campo 7 = descrição livre
+            dsc = montar_historico(db) or historico
+            # |6100|DATA|DEBITO|CREDITO|VALOR||HISTORICO|USUARIO|FILIAL|SCP|
             linhas.append(
                 f"|6100|{data}|{db['conta']}|{cr['conta']}"
                 f"|{val}||{dsc}|||"
             )
             total_6100 += 1
 
+        # Tipo D: 1 débito × vários créditos
+        # ────────────────────────────────────
+        # 6100 → débito principal + primeiro crédito
+        # 6110 → créditos adicionais
         elif tipo_lanc == "D":
-            # 1 débito × vários créditos
             db           = debitos[0]
             cr_principal = creditos[0]
             val = formatar_valor(db["valor"])
-            dsc = db.get("descr_hist", "").strip() or historico
+            dsc = montar_historico(db) or historico
             linhas.append(
                 f"|6100|{data}|{db['conta']}|{cr_principal['conta']}"
                 f"|{val}||{dsc}|||"
             )
             total_6100 += 1
+            # Créditos adicionais → 6110
+            # |6110|CC_DEBITO|CC_CREDITO|VALOR_RATEIO|
             for cr in creditos[1:]:
                 vr = formatar_valor(cr["valor"])
                 linhas.append(f"|6110||{cr['conta']}|{vr}|")
                 total_6110 += 1
 
+        # Tipo C: vários débitos × 1 crédito
+        # ────────────────────────────────────
+        # 6100 → primeiro débito + crédito principal
+        # 6110 → débitos adicionais
         elif tipo_lanc == "C":
-            # vários débitos × 1 crédito
             cr           = creditos[0]
             db_principal = debitos[0]
             val = formatar_valor(cr["valor"])
-            dsc = db_principal.get("descr_hist", "").strip() or historico
+            dsc = montar_historico(db_principal) or historico
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr['conta']}"
                 f"|{val}||{dsc}|||"
             )
             total_6100 += 1
+            # Débitos adicionais → 6110
             for db in debitos[1:]:
                 vr = formatar_valor(db["valor"])
                 linhas.append(f"|6110|{db['conta']}||{vr}|")
                 total_6110 += 1
 
+        # Tipo V: vários débitos × vários créditos
+        # ──────────────────────────────────────────
+        # 6100 → primeiro débito + primeiro crédito
+        # 6110 → demais débitos e demais créditos
         else:
-            # V — vários débitos × vários créditos
             db_principal = debitos[0]
             cr_principal = creditos[0]
             val = formatar_valor(db_principal["valor"])
-            dsc = db_principal.get("descr_hist", "").strip() or historico
+            dsc = montar_historico(db_principal) or historico
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr_principal['conta']}"
                 f"|{val}||{dsc}|||"
@@ -439,10 +477,6 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
     if ignorados:
         log.append(
             f"Lançamentos ignorados (sem D/C): {ignorados}"
-        )
-    if ignorados_conta:
-        log.append(
-            f"Lançamentos ignorados (conta temp. SPED): {ignorados_conta}"
         )
     log.append(f"Total de linhas geradas       : {len(linhas)}")
     return linhas
@@ -524,13 +558,35 @@ def main():
             """
         )
         st.markdown("---")
-        st.markdown("### ✅ Correções V1.3")
+        st.markdown("### 🔀 Classificação D/C/X/V")
         st.markdown(
             """
-- Campo 6 (cód. histórico) sempre **vazio** — evita erro *histórico não cadastrado*
-- Histórico gravado apenas como **descrição livre** no campo 7
-- Lançamentos com contas temporárias do SPED (`5000`, `5001`, `10000`, `10001`…) são **ignorados** automaticamente
-- Arquivo gerado em **latin-1** — elimina caracteres corrompidos (`ï¿½`)
+| Tipo | Regra |
+|------|-------|
+| **X** | 1 débito × 1 crédito |
+| **D** | 1 débito × vários créditos |
+| **C** | vários débitos × 1 crédito |
+| **V** | vários débitos × vários créditos |
+
+A classificação é feita por **contas distintas**, não por número de partidas brutas.
+            """
+        )
+        st.markdown("---")
+        st.markdown("### ✅ Histórico de versões")
+        st.markdown(
+            """
+**V1.5** — Classificação D/C/X/V correta
+- Agrupa partidas I250 por conta antes de classificar
+- Usa contas **distintas** para determinar o tipo
+- Gera 6000/6100/6110 corretamente para todos os tipos
+
+**V1.4** — Filtro de contas removido
+
+**V1.3** — Campo 6 vazio; latin-1; histórico livre
+
+**V1.2** — Caracteres especiais; encoding automático
+
+**V1.1** — Barra de progresso
             """
         )
 
@@ -565,19 +621,18 @@ def main():
 
             <h4>⚠ Observações importantes</h4>
             <ul>
-                <li>O arquivo de saída segue o layout separado por pipe <code>|</code>
-                    exigido pelo Domínio Sistemas.</li>
-                <li>Lançamentos com contas temporárias do SPED
-                    (<code>5000</code>, <code>5001</code>, <code>10000</code>, <code>10001</code>…)
-                    são ignorados automaticamente — essas contas não existem no Domínio.</li>
-                <li>O campo de código do histórico é deixado em branco para evitar
-                    o erro <i>"histórico não cadastrado"</i>. O texto descritivo é
-                    colocado diretamente no campo de descrição livre.</li>
                 <li>O tipo do lançamento (<b>X / D / C / V</b>) é detectado
-                    automaticamente pelo número de partidas.</li>
+                    automaticamente com base nas <b>contas distintas</b> de cada lado
+                    (débito/crédito), evitando classificação incorreta por partidas
+                    repetidas da mesma conta.</li>
+                <li>Partidas I250 com a mesma conta contábil são <b>agrupadas</b>
+                    (valores somados) antes da classificação.</li>
+                <li>O campo de código do histórico é deixado em branco para evitar
+                    o erro <i>"histórico não cadastrado"</i>.</li>
+                <li>Lançamentos sem partidas de débito <b>e</b> crédito simultâneas
+                    são ignorados.</li>
                 <li>Letras acentuadas do português são preservadas.
-                    O arquivo é gravado em <b>latin-1</b> para compatibilidade
-                    com o Domínio.</li>
+                    O arquivo é gravado em <b>latin-1</b>.</li>
                 <li>Verifique sempre o <b>Log de processamento</b> ao final da página.</li>
             </ul>
 
@@ -645,7 +700,6 @@ def main():
             progress_bar.progress(100)
             status_text.text("✅ Conversão concluída!")
 
-            # Grava em latin-1 — encoding nativo do Domínio
             conteudo_txt = "\n".join(linhas) + "\n"
             st.session_state.txt_gerado = conteudo_txt.encode(
                 "latin-1", errors="replace"
