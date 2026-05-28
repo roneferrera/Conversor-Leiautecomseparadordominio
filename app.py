@@ -3,7 +3,7 @@ import traceback
 import unicodedata
 import streamlit as st
 
-VERSAO = "V1.8"
+VERSAO = "V1.9"
 
 # ==============================
 # TEMA TR
@@ -164,21 +164,29 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                     ecd.historicos[cod] = descr
 
             elif registro == "I200":
-                if len(campos) > 3:
-                    lote_atual = {
-                        "num"     : campos[1].strip(),
-                        "data"    : campos[2].strip(),
-                        "valor"   : campos[3].strip(),
-                        "partidas": [],
-                    }
-                    ecd.lancamentos.append(lote_atual)
+                # ── Fecha lote anterior e abre novo ──────────────────────
+                lote_atual = {
+                    "num"     : campos[1].strip() if len(campos) > 1 else "",
+                    "data"    : campos[2].strip() if len(campos) > 2 else "",
+                    "valor"   : campos[3].strip() if len(campos) > 3 else "",
+                    "partidas": [],
+                }
+                ecd.lancamentos.append(lote_atual)
 
             elif registro == "I250":
+                # ── Só adiciona se houver lote aberto ────────────────────
                 if lote_atual is not None and len(campos) > 4:
+                    dc_raw = campos[4].strip().upper()
+                    # Garante que só aceita D ou C
+                    if dc_raw not in ("D", "C"):
+                        log.append(
+                            f"Aviso: I250 com dc='{dc_raw}' ignorado (esperado D ou C)."
+                        )
+                        continue
                     partida = {
                         "conta"     : campos[1].strip(),
                         "valor"     : campos[3].strip(),
-                        "dc"        : campos[4].strip().upper(),
+                        "dc"        : dc_raw,
                         "descr_hist": normalizar_historico(
                             campos[7] if len(campos) > 7 else ""
                         ),
@@ -202,6 +210,31 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     log.append(f"  Contas carregadas : {len(ecd.contas)}")
     log.append(f"  Históricos (I075) : {len(ecd.historicos)}")
     log.append(f"  Lançamentos (I200): {len(ecd.lancamentos)}")
+
+    # ── DEBUG: primeiros 15 lançamentos ──────────────────────────────────
+    log.append("─" * 60)
+    log.append("DEBUG — primeiros 15 lançamentos lidos do SPED:")
+    for i, lanc in enumerate(ecd.lancamentos[:15]):
+        debitos  = [p for p in lanc["partidas"] if p["dc"] == "D"]
+        creditos = [p for p in lanc["partidas"] if p["dc"] == "C"]
+        nd = len(debitos)
+        nc = len(creditos)
+        if nd == 1 and nc == 1:
+            tipo = "X"
+        elif nd == 1 and nc > 1:
+            tipo = "D"
+        elif nc == 1 and nd > 1:
+            tipo = "C"
+        else:
+            tipo = "V"
+        debs = ", ".join(f"{p['conta']}({p['valor']})" for p in debitos)
+        creds = ", ".join(f"{p['conta']}({p['valor']})" for p in creditos)
+        log.append(
+            f"  [{i+1:03d}] data={lanc['data']} tipo={tipo} "
+            f"D=[{debs}] C=[{creds}]"
+        )
+    log.append("─" * 60)
+
     return ecd
 
 
@@ -268,41 +301,26 @@ def primeiro_historico(partidas):
 
 def agrupar_partidas_por_conta(partidas):
     """
-    Agrupa partidas pelo código de conta + lado (D/C), somando os valores.
-    
-    IMPORTANTE — V1.8:
-    Uma mesma conta pode aparecer como D em uma partida e C em outra
-    (ex: estorno). Por isso agrupamos por (conta, dc) e não só por conta.
-    Isso evita que um lançamento 1D×1C seja classificado erroneamente
-    como C/D/V por ter a mesma conta nos dois lados.
+    Agrupa por (conta, dc) — mantém os dois lados separados.
+    Soma os valores de partidas com mesma conta E mesmo lado.
     """
-    agrupado = {}  # chave: (conta, dc)
+    agrupado = {}
     for p in partidas:
-        conta = p["conta"]
-        dc    = p["dc"]
-        chave = (conta, dc)
+        chave = (p["conta"], p["dc"])
         if chave not in agrupado:
             agrupado[chave] = {
-                "conta"     : conta,
+                "conta"     : p["conta"],
                 "valor"     : 0.0,
-                "dc"        : dc,
+                "dc"        : p["dc"],
                 "descr_hist": p.get("descr_hist", ""),
             }
         agrupado[chave]["valor"] += _str_to_float(p["valor"])
         if not agrupado[chave]["descr_hist"] and p.get("descr_hist"):
             agrupado[chave]["descr_hist"] = p["descr_hist"]
-
     return list(agrupado.values())
 
 
 def classificar_lancamento(debitos, creditos):
-    """
-    Classifica com base em pares (conta, dc) distintos já agrupados:
-        X = 1 débito  × 1 crédito
-        D = 1 débito  × N créditos
-        C = N débitos × 1 crédito
-        V = N débitos × N créditos
-    """
     nd = len(debitos)
     nc = len(creditos)
     if nd == 1 and nc == 1:
@@ -315,48 +333,40 @@ def classificar_lancamento(debitos, creditos):
 
 
 # ==============================
-# GERADOR DO LAYOUT DOMÍNIO — V1.8
+# REGISTRO 6100 — layout oficial Domínio
 # ==============================
 def _linha_6100(data, conta_deb, conta_cred, valor, descr):
     """
-    Monta o registro 6100 com todos os 12 campos exigidos pelo layout Domínio.
+    Layout Domínio — registro 6100 com 13 campos fixos:
+    REG | DATA | COD_RED_DEB | COD_RED_CRED | VALOR | COD_HIST |
+    COMPLEMENTO | NUM_DOC | COD_MOEDA | TAXA_CONV | NUM_LANC | IND_CTA_PART |
 
-    Posições:
-      1  REG          = 6100
-      2  DATA         = dd/mm/aaaa
-      3  COD_RED_DEB  = código reduzido conta débito
-      4  COD_RED_CRED = código reduzido conta crédito
-      5  VALOR        = valor com vírgula decimal
-      6  COD_HIST     = vazio (evita erro "histórico não cadastrado")
-      7  COMPLEMENTO  = texto livre do histórico
-      8  NUM_DOC      = vazio
-      9  COD_MOEDA    = vazio (moeda padrão da empresa)
-     10  TAXA_CONV    = vazio
-     11  NUM_LANC     = vazio
-     12  IND_CTA_PART = vazio
-
-    Resultado: |6100|DATA|DEB|CRED|VALOR||COMPLEMENTO|||||  |
-    Total de pipes internos: 12  →  13 delimitadores no total (incluindo externos)
+    Total: 12 campos internos = 13 pipes (incluindo os delimitadores externos).
+    Exemplo: |6100|01/01/2022|686|10001|4287,68||Historico||||||
     """
-    descr_safe = descr.replace("|", " ").strip()
-    return f"|6100|{data}|{conta_deb}|{conta_cred}|{valor}||{descr_safe}|||||"
+    descr_safe = (descr or "").replace("|", " ").strip()
+    return (
+        f"|6100|{data}|{conta_deb}|{conta_cred}"
+        f"|{valor}||{descr_safe}||||||"
+    )
 
 
+# ==============================
+# GERADOR DO LAYOUT DOMÍNIO — V1.9
+# ==============================
 def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
     """
-    Gera as linhas do layout Domínio Sistemas.
-
-    V1.8 — Correções definitivas:
-    ──────────────────────────────
-    • Agrupa por (conta, dc) — não só por conta — evitando classificação
-      errada quando a mesma conta aparece como D e C no mesmo lançamento.
-    • Registro 6100 com 12 campos (13 pipes) conforme layout oficial Domínio.
-    • Opção gerar_6110: se False, omite os registros 6110.
+    V1.9 — Diagnóstico + correções:
+    • Debug de classificação: loga lançamentos com tipo inesperado
+    • _linha_6100 com 13 pipes (12 campos internos) — formato correto
+    • Agrupamento por (conta, dc) — lados D e C sempre separados
+    • Classificação X/D/C/V baseada em contas distintas por lado
     """
     linhas     = []
     total_6100 = 0
     total_6110 = 0
     ignorados  = 0
+    debug_tipos = {"X": 0, "D": 0, "C": 0, "V": 0}
 
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
     linhas.append(f"|0000|{cnpj_numerico}|")
@@ -378,7 +388,7 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
             ignorados += 1
             continue
 
-        # Agrupa por (conta, dc) — fix V1.8
+        # Agrupa por (conta, dc)
         partidas = agrupar_partidas_por_conta(partidas_brutas)
 
         debitos  = [p for p in partidas if p["dc"] == "D"]
@@ -391,11 +401,12 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
         data      = formatar_data_dominio(lanc["data"])
         tipo_lanc = classificar_lancamento(debitos, creditos)
         historico = primeiro_historico(partidas_brutas)
+        debug_tipos[tipo_lanc] = debug_tipos.get(tipo_lanc, 0) + 1
 
         # ── Registro 6000 ─────────────────────────────────────────────────
         linhas.append(f"|6000|{tipo_lanc}||||")
 
-        # ── Tipo X: 1 débito × 1 crédito ─────────────────────────────────
+        # ── Tipo X ───────────────────────────────────────────────────────
         if tipo_lanc == "X":
             db  = debitos[0]
             cr  = creditos[0]
@@ -403,9 +414,8 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
             dsc = montar_historico(db) or historico
             linhas.append(_linha_6100(data, db["conta"], cr["conta"], val, dsc))
             total_6100 += 1
-            # Tipo X: sem 6110
 
-        # ── Tipo D: 1 débito × vários créditos ───────────────────────────
+        # ── Tipo D: 1 débito × N créditos ────────────────────────────────
         elif tipo_lanc == "D":
             db  = debitos[0]
             val = formatar_valor(db["valor"])
@@ -418,7 +428,7 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
                     linhas.append(f"|6110||{cr['conta']}|{vr}|")
                     total_6110 += 1
 
-        # ── Tipo C: vários débitos × 1 crédito ───────────────────────────
+        # ── Tipo C: N débitos × 1 crédito ────────────────────────────────
         elif tipo_lanc == "C":
             cr  = creditos[0]
             db0 = debitos[0]
@@ -432,7 +442,7 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
                     linhas.append(f"|6110|{db['conta']}||{vr}|")
                     total_6110 += 1
 
-        # ── Tipo V: vários débitos × vários créditos ─────────────────────
+        # ── Tipo V: N débitos × N créditos ───────────────────────────────
         else:
             db0 = debitos[0]
             cr0 = creditos[0]
@@ -454,11 +464,15 @@ def gerar_dominio(ecd, log, progress_bar, status_text, gerar_6110=True):
     log.append(f"Registros 6110 gerados        : {total_6110}")
     log.append(
         f"Registros 6110 "
-        f"{'habilitados' if gerar_6110 else 'DESABILITADOS (opção do usuário)'}"
+        f"{'habilitados' if gerar_6110 else 'DESABILITADOS'}"
     )
     if ignorados:
         log.append(f"Lançamentos ignorados (sem D/C): {ignorados}")
     log.append(f"Total de linhas geradas       : {len(linhas)}")
+    log.append(
+        f"Tipos gerados — X:{debug_tipos['X']} D:{debug_tipos['D']} "
+        f"C:{debug_tipos['C']} V:{debug_tipos['V']}"
+    )
     return linhas
 
 
@@ -514,7 +528,7 @@ def main():
             <p style="color:#DDDDDD; margin:6px 0 0 0; font-family:'Segoe UI',Arial,sans-serif;">
                 Selecione o arquivo SPED ECD e clique em
                 <strong>▶ Converter</strong> para gerar o arquivo de importação
-                do Domínio Contabilidade (registros 0000 / 6000 / 6100 / 6110).
+                do Domínio Contabilidade.
             </p>
         </div>
         """,
@@ -548,77 +562,52 @@ def main():
 | **D** | 1 débito × vários créditos |
 | **C** | vários débitos × 1 crédito |
 | **V** | vários débitos × vários créditos |
-
-Agrupamento por **(conta + lado D/C)** antes de classificar.
             """
         )
         st.markdown("---")
-        st.markdown("### ✅ Histórico de versões")
+        st.markdown("### ✅ Versões")
         st.markdown(
             """
-**V1.8** — Fix definitivo dos dois erros do PDF
-- Agrupa por **(conta, dc)** — não só por conta
-- Evita classificação errada quando a mesma conta aparece como D e C
-- 6100 com **12 campos** (13 pipes) conforme layout oficial
+**V1.9** — Debug de classificação
+- Log dos 15 primeiros lançamentos com D/C detectados
+- Valida dc=D ou C no I250 (ignora inválidos)
+- 6100 com 13 pipes (formato definitivo)
 
-**V1.7** — 6100 com campos extras + fix classificação
+**V1.8** — Agrupamento por (conta, dc)
+
+**V1.7** — 6100 com campos extras
 
 **V1.6** — Soma de valores + opção 6110
-
-**V1.5** — Classificação D/C/X/V por contas distintas
-
-**V1.4** — Filtro de contas removido
-
-**V1.3** — Campo 6 vazio; latin-1; histórico livre
             """
         )
 
-    with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
+    with st.expander("📖 **Instruções de Uso**", expanded=False):
         st.markdown(
             """
             <div class="instrucoes-box">
-
             <h4>🔹 Passo 1 — Obter o arquivo SPED ECD</h4>
-            <p>Exporte o arquivo SPED ECD da sua contabilidade (extensão <code>.txt</code>).
-            Certifique-se de que o arquivo contém os registros
-            <code>0000</code>, <code>I050</code>, <code>I075</code>,
-            <code>I200</code> e <code>I250</code>.</p>
+            <p>Exporte o SPED ECD com os registros <code>0000, I050, I075, I200, I250</code>.</p>
 
-            <h4>🔹 Passo 2 — Configurar e Converter</h4>
+            <h4>🔹 Passo 2 — Converter</h4>
             <ol>
-                <li>Clique em <b>Browse files</b> e selecione o arquivo SPED ECD.</li>
-                <li>Escolha se deseja gerar os registros <b>6110</b>.</li>
+                <li>Selecione o arquivo e configure as opções.</li>
                 <li>Clique em <b>▶ Converter</b>.</li>
-                <li>Aguarde e clique em <b>⬇ Baixar arquivo convertido</b>.</li>
+                <li>Verifique o <b>Log de debug</b> — ele mostra os primeiros 15
+                    lançamentos com os débitos/créditos detectados.</li>
+                <li>Baixe o arquivo e importe no Domínio.</li>
             </ol>
 
-            <h4>🔹 Estrutura do registro 6100 (V1.8)</h4>
-            <p>O 6100 agora é gerado com os <b>12 campos</b> exigidos pelo layout Domínio:</p>
-            <code>|6100|DATA|DEB|CRED|VALOR||HISTORICO|||||</code>
+            <h4>🔹 Estrutura do 6100 (V1.9)</h4>
+            <code>|6100|DATA|DEB|CRED|VALOR||HISTORICO||||||</code><br>
+            <small>12 campos internos = 13 pipes totais</small>
 
-            <h4>🔹 Por que o tipo X era gerado errado?</h4>
-            <p>Quando a mesma conta contábil aparecia como débito em uma partida I250
-            e crédito em outra (ex: estornos), o agrupamento anterior mesclava os dois
-            lados. A V1.8 agrupa por <b>(conta + D/C)</b>, mantendo os lados separados
-            e garantindo a classificação correta.</p>
-
-            <h4>🔹 Passo 3 — Importar no Domínio Contabilidade</h4>
-            <ol>
-                <li>Abra o <b>Domínio Contabilidade</b>.</li>
-                <li>Acesse <b>Utilitários → Importação → Lançamentos em Lote</b>.</li>
-                <li>Selecione o arquivo <code>.txt</code> gerado e confirme.</li>
-            </ol>
-
-            <hr>
-            <h4>⚠ Observações importantes</h4>
+            <h4>⚠ Observações</h4>
             <ul>
-                <li>Partidas I250 com a <b>mesma conta e mesmo lado (D ou C)</b> são somadas.</li>
-                <li>O campo de código do histórico é deixado em branco para evitar
-                    o erro <i>"histórico não cadastrado"</i>.</li>
-                <li>O arquivo é gravado em <b>latin-1</b>.</li>
-                <li>Lançamentos sem débito <b>e</b> crédito simultâneos são ignorados.</li>
+                <li>O log DEBUG mostra exatamente como cada lançamento foi lido.</li>
+                <li>Se um lançamento simples (1D×1C) aparecer como C/D/V no debug,
+                    o SPED ECD possui partidas I250 duplicadas ou com dc inválido.</li>
+                <li>Arquivo gravado em <b>latin-1</b>.</li>
             </ul>
-
             </div>
             """,
             unsafe_allow_html=True,
@@ -647,11 +636,7 @@ Agrupamento por **(conta + lado D/C)** antes de classificar.
         gerar_6110 = st.toggle(
             "Gerar registros 6110 (partidas adicionais)",
             value=True,
-            help=(
-                "Ative para gerar os registros 6110 com as contas adicionais "
-                "dos lançamentos dos tipos D, C e V.\n\n"
-                "Desative se o seu Domínio não utiliza centro de custos."
-            ),
+            help="Desative se o Domínio não usa centro de custos.",
         )
     with col_opt2:
         if gerar_6110:
@@ -660,7 +645,6 @@ Agrupamento por **(conta + lado D/C)** antes de classificar.
             st.warning("⚠ **6110 desabilitado** — apenas registros 6100 serão gerados.")
 
     st.markdown("")
-
     col1, col2 = st.columns([1, 1])
     with col1:
         converter = st.button(
@@ -681,7 +665,7 @@ Agrupamento por **(conta + lado D/C)** antes de classificar.
 
     if converter and arquivo is not None:
         st.session_state.log = [
-            f"Iniciando conversão V1.8 (6110: {'SIM' if gerar_6110 else 'NÃO'})..."
+            f"Iniciando conversão V1.9 (6110: {'SIM' if gerar_6110 else 'NÃO'})..."
         ]
         st.session_state.txt_gerado   = None
         st.session_state.nome_arquivo = "lancamentos_dominio.txt"
@@ -713,14 +697,14 @@ Agrupamento por **(conta + lado D/C)** antes de classificar.
             )
 
             total_linhas = len(linhas)
-            total_6000   = sum(1 for l in linhas if l.startswith("|6000|"))
-            total_6100   = sum(1 for l in linhas if l.startswith("|6100|"))
-            total_6110_c = sum(1 for l in linhas if l.startswith("|6110|"))
+            t6000 = sum(1 for l in linhas if l.startswith("|6000|"))
+            t6100 = sum(1 for l in linhas if l.startswith("|6100|"))
+            t6110 = sum(1 for l in linhas if l.startswith("|6110|"))
             st.session_state.metricas = {
                 "CNPJ"              : ecd.cnpj,
-                "Lançamentos (6000)": total_6000,
-                "Linhas 6100"       : total_6100,
-                "Linhas 6110"       : total_6110_c,
+                "Lançamentos (6000)": t6000,
+                "Linhas 6100"       : t6100,
+                "Linhas 6110"       : t6110,
                 "Total de linhas"   : total_linhas,
             }
         else:
@@ -755,13 +739,12 @@ Agrupamento por **(conta + lado D/C)** antes de classificar.
     log_texto = "\n".join(st.session_state.log)
     tem_erro  = any(str(l).startswith("ERRO") for l in st.session_state.log)
     cor_borda = "#D32F2F" if tem_erro else "#388E3C"
-
     st.markdown(
         f"""
         <div style="background:#FCFCFC; border:1px solid {cor_borda};
                     border-radius:6px; padding:14px;
                     font-family:Consolas,monospace; font-size:13px;
-                    white-space:pre-wrap; max-height:340px;
+                    white-space:pre-wrap; max-height:500px;
                     overflow-y:auto; color:#1F1F1F;">
 {log_texto}
         </div>
