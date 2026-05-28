@@ -1,6 +1,4 @@
 import re
-import io
-import os
 import traceback
 import unicodedata
 import streamlit as st
@@ -8,7 +6,16 @@ import streamlit as st
 # ==============================
 # VERSÃO
 # ==============================
-VERSAO = "V1.2"
+VERSAO = "V1.3"
+
+# ==============================
+# CONTAS TEMPORÁRIAS DO SPED
+# (não existem no plano de contas do Domínio)
+# ==============================
+CONTAS_IGNORAR = {
+    "5000", "5001", "5002", "5003", "5004",
+    "10000", "10001", "10002", "10003",
+}
 
 # ==============================
 # TEMA TR
@@ -20,69 +27,33 @@ def apply_tr_theme():
             font-family: 'Segoe UI', 'Arial', sans-serif;
             color: #444444;
         }
-        h1, h2, h3 {
-            color: #FF8000;
-            font-weight: 700;
-        }
-        section[data-testid="stSidebar"] {
-            background-color: #444444;
-            color: #FFFFFF;
-        }
-        section[data-testid="stSidebar"] * {
-            color: #FFFFFF !important;
-        }
+        h1, h2, h3 { color: #FF8000; font-weight: 700; }
+        section[data-testid="stSidebar"] { background-color: #444444; color: #FFFFFF; }
+        section[data-testid="stSidebar"] * { color: #FFFFFF !important; }
         .stButton > button {
-            background-color: #FF8000;
-            color: #FFFFFF;
-            border: none;
-            border-radius: 4px;
-            font-weight: bold;
+            background-color: #FF8000; color: #FFFFFF;
+            border: none; border-radius: 4px; font-weight: bold;
         }
-        .stButton > button:hover {
-            background-color: #D64001;
-            color: #FFFFFF;
-        }
+        .stButton > button:hover { background-color: #D64001; color: #FFFFFF; }
         .stDownloadButton > button {
-            background-color: #FF8000;
-            color: #FFFFFF;
-            border: none;
-            border-radius: 4px;
-            font-weight: bold;
+            background-color: #FF8000; color: #FFFFFF;
+            border: none; border-radius: 4px; font-weight: bold;
         }
-        .stDownloadButton > button:hover {
-            background-color: #D64001;
-            color: #FFFFFF;
-        }
-        hr {
-            border-color: #FF8000;
-        }
+        .stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }
+        hr { border-color: #FF8000; }
         [data-testid="metric-container"] {
             background-color: #E9E9E9;
             border-left: 4px solid #FF8000;
-            border-radius: 4px;
-            padding: 10px;
+            border-radius: 4px; padding: 10px;
         }
         .instrucoes-box {
-            background-color: #E9E9E9;
-            border-left: 4px solid #FF8000;
-            border-radius: 4px;
-            padding: 16px 20px;
-            margin: 12px 0;
-            color: #444444;
-            font-family: 'Segoe UI', Arial, sans-serif;
+            background-color: #E9E9E9; border-left: 4px solid #FF8000;
+            border-radius: 4px; padding: 16px 20px; margin: 12px 0;
+            color: #444444; font-family: 'Segoe UI', Arial, sans-serif;
         }
-        .instrucoes-box h4 {
-            color: #FF8000;
-            margin-top: 14px;
-            margin-bottom: 6px;
-        }
-        .instrucoes-box h4:first-child {
-            margin-top: 0;
-        }
-        /* Barra de progresso laranja */
-        .stProgress > div > div > div > div {
-            background-color: #FF8000 !important;
-        }
+        .instrucoes-box h4 { color: #FF8000; margin-top: 14px; margin-bottom: 6px; }
+        .instrucoes-box h4:first-child { margin-top: 0; }
+        .stProgress > div > div > div > div { background-color: #FF8000 !important; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -90,114 +61,72 @@ def apply_tr_theme():
 # ==============================
 # ESTRUTURA DE DADOS
 # ==============================
-
 class SpedECD:
     def __init__(self):
         self.cnpj        = ""
-        self.contas      = {}
-        self.historicos  = {}
-        self.lancamentos = []
+        self.contas      = {}   # cod_reduzido -> nome
+        self.historicos  = {}   # cod -> descricao (I075)
+        self.lancamentos = []   # lista de dicts com I200 + I250
 
 
 # ==============================
 # NORMALIZAÇÃO DE HISTÓRICO
 # ==============================
-
-# Mapa de substituição de caracteres especiais comuns no português
-# para equivalentes aceitos pelo Domínio Sistemas (latin-1 estendido)
 _MAPA_ESPECIAIS = {
-    # aspas tipográficas → aspas simples/duplas retas
     "\u2018": "'", "\u2019": "'",
     "\u201C": '"', "\u201D": '"',
-    # travessão / meia-risca → hífen
     "\u2013": "-", "\u2014": "-",
-    # reticências → três pontos
     "\u2026": "...",
-    # espaço não-quebrável → espaço normal
     "\u00A0": " ",
-    # outros símbolos comuns
-    "\u00B0": "°",   # grau          → mantém (latin-1)
-    "\u00BA": "º",   # ordinal masc  → mantém (latin-1)
-    "\u00AA": "ª",   # ordinal fem   → mantém (latin-1)
-    "\u00B2": "2",   # superscript 2 → 2
-    "\u00B3": "3",   # superscript 3 → 3
-    "\u00BC": "1/4",
-    "\u00BD": "1/2",
-    "\u00BE": "3/4",
-    "\u00D7": "x",   # multiplicação → x
-    "\u00F7": "/",   # divisão       → /
-    "\u20AC": "EUR", # euro          → EUR
-    "\u00A7": "S/",  # parágrafo     → S/
-    "\u00AE": "(R)", # registrado
-    "\u00A9": "(C)", # copyright
+    "\u00D7": "x", "\u00F7": "/",
+    "\u20AC": "EUR",
+    "\u00A7": "S/",
+    "\u00AE": "(R)",
+    "\u00A9": "(C)",
     "\u2122": "(TM)",
 }
-
-# Caracteres de controle que devem ser removidos
-_CTRL = set(range(0x00, 0x20)) - {0x09, 0x0A, 0x0D}  # mantém tab, LF, CR
 
 
 def normalizar_historico(texto):
     """
-    Normaliza o histórico para compatibilidade com o Domínio Sistemas:
-
-    1. Aplica mapa de substituições explícitas (aspas, travessão, etc.)
-    2. Tenta codificar em latin-1; caracteres fora do range são convertidos
-       pelo método NFC → decomposição → remoção de diacríticos → recomposição,
-       garantindo que letras acentuadas do português sejam preservadas.
-    3. Remove caracteres de controle.
-    4. Normaliza espaços múltiplos e strip final.
-    5. Limita a 250 caracteres.
-
-    Exemplos preservados: á é í ó ú â ê ô ã õ ç ü ñ
-    Exemplos convertidos: " " → " | – — → - | … → ...
+    Normaliza o histórico para compatibilidade com o Domínio Sistemas (latin-1).
+    Preserva letras acentuadas do português: á é í ó ú â ê ô ã õ ç ü etc.
     """
     if not texto:
         return ""
 
-    # Passo 1 — substituições explícitas
+    # Substituições explícitas
     for orig, dest in _MAPA_ESPECIAIS.items():
         texto = texto.replace(orig, dest)
 
-    # Passo 2 — normalização NFC para garantir forma canônica
+    # Normalização NFC
     texto = unicodedata.normalize("NFC", texto)
 
-    # Passo 3 — tenta latin-1; para cada char fora do range, tenta
-    #            decomposição NFD para separar base + diacrítico e
-    #            mantém a letra base (ex.: ñ → n, ü → u apenas se
-    #            não estiver em latin-1, o que não é o caso do português)
+    # Filtra caractere a caractere para latin-1
     resultado = []
     for ch in texto:
         if ord(ch) < 0x20 and ord(ch) not in (0x09, 0x0A, 0x0D):
-            # caractere de controle → descarta
             continue
         try:
             ch.encode("latin-1")
             resultado.append(ch)
         except (UnicodeEncodeError, UnicodeDecodeError):
-            # Tenta decompor (NFD) e pegar apenas a letra base
             decomposto = unicodedata.normalize("NFD", ch)
             base = decomposto[0]
             try:
                 base.encode("latin-1")
                 resultado.append(base)
             except (UnicodeEncodeError, UnicodeDecodeError):
-                # Último recurso: descarta o caractere
                 pass
 
     texto = "".join(resultado)
-
-    # Passo 4 — normaliza espaços múltiplos e strip
     texto = re.sub(r" {2,}", " ", texto).strip()
-
-    # Passo 5 — limita a 250 caracteres
     return texto[:250]
 
 
 # ==============================
 # PARSE DO SPED ECD
 # ==============================
-
 def _split_pipe(linha):
     campos = linha.strip().split("|")
     if campos and campos[0] == "":
@@ -212,11 +141,11 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     lote_atual = None
     erros      = 0
 
-    # Tenta decodificar em UTF-8; se falhar, tenta latin-1
+    # Detecta encoding
     for encoding in ("utf-8", "latin-1", "cp1252"):
         try:
             texto = conteudo_bytes.decode(encoding, errors="strict")
-            log.append(f"Arquivo decodificado com encoding: {encoding}")
+            log.append(f"Encoding detectado: {encoding}")
             break
         except (UnicodeDecodeError, LookupError):
             continue
@@ -226,12 +155,9 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 
     linhas_lista = texto.splitlines()
     total        = len(linhas_lista) or 1
-
     status_text.text("📖 Lendo registros do SPED ECD...")
 
     for num_linha, linha in enumerate(linhas_lista, start=1):
-
-        # Progresso fase 1: 0% → 50%
         if num_linha % 500 == 0 or num_linha == total:
             pct = int((num_linha / total) * 50)
             progress_bar.progress(pct)
@@ -284,8 +210,7 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
                         "conta"     : campos[1].strip(),
                         "valor"     : campos[3].strip(),
                         "dc"        : campos[4].strip().upper(),
-                        "cod_hist"  : campos[6].strip() if len(campos) > 6 else "",
-                        # Normaliza já na leitura
+                        # ▼ Não passa o código; usa só a descrição livre
                         "descr_hist": normalizar_historico(
                             campos[7] if len(campos) > 7 else ""
                         ),
@@ -315,7 +240,6 @@ def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 # ==============================
 # FUNÇÕES AUXILIARES
 # ==============================
-
 def formatar_data_dominio(data_sped):
     """DDMMAAAA → DD/MM/AAAA. Mantém se já tiver barra."""
     d = data_sped.strip()
@@ -327,19 +251,14 @@ def formatar_data_dominio(data_sped):
 
 
 def formatar_valor(valor_str):
-    """
-    Garante separador decimal com vírgula e pelo menos duas casas decimais.
-    Ex.: '5571.24' → '5571,24' | '5571' → '5571,00'
-    """
+    """Garante separador decimal com vírgula e pelo menos duas casas decimais."""
     v = valor_str.strip()
-
     if "." in v and "," not in v:
         v = v.replace(".", ",")
     elif "." in v and "," in v:
         if v.index(".") < v.index(","):
             v = v.replace(".", "").replace(",", ".")
             v = v.replace(".", ",")
-
     if "," not in v:
         v += ",00"
     else:
@@ -347,38 +266,37 @@ def formatar_valor(valor_str):
         if len(partes[1]) < 2:
             partes[1] = partes[1].ljust(2, "0")
         v = ",".join(partes)
-
     return v
 
 
-def montar_historico(partida, historicos):
+def tem_conta_ignorada(partidas):
+    """Retorna True se qualquer partida usa conta temporária do SPED."""
+    for p in partidas:
+        if p["conta"] in CONTAS_IGNORAR:
+            return True
+    return False
+
+
+def primeiro_historico_livre(partidas):
     """
-    Prioridade: descrição completa da partida (I250 campo 7) > padrão I075.
-    Já normalizado na leitura; aqui apenas garante o fallback.
+    Retorna a primeira descrição livre não-vazia das partidas.
+    NÃO usa código de histórico — vai apenas o texto descritivo.
     """
-    descr = partida.get("descr_hist", "").strip()
-    cod   = partida.get("cod_hist",   "").strip()
-
-    if descr:
-        return descr  # já normalizado
-
-    if cod and cod in historicos:
-        return historicos[cod]  # já normalizado
-
+    for p in partidas:
+        d = p.get("descr_hist", "").strip()
+        if d:
+            return d
     return ""
 
 
-def identificar_tipo_lancamento(partidas):
+def identificar_tipo_lancamento(debitos, creditos):
     """
     X = 1 débito × 1 crédito
     D = 1 débito × vários créditos
     C = vários débitos × 1 crédito
     V = vários débitos × vários créditos
     """
-    debitos  = [p for p in partidas if p["dc"] == "D"]
-    creditos = [p for p in partidas if p["dc"] == "C"]
-    nd, nc   = len(debitos), len(creditos)
-
+    nd, nc = len(debitos), len(creditos)
     if nd == 1 and nc == 1:
         return "X"
     if nd == 1 and nc > 1:
@@ -388,28 +306,25 @@ def identificar_tipo_lancamento(partidas):
     return "V"
 
 
-def primeiro_historico(partidas, historicos):
-    """Retorna o primeiro histórico não-vazio encontrado nas partidas."""
-    for p in partidas:
-        h = montar_historico(p, historicos)
-        if h:
-            return h
-    return ""
-
-
 # ==============================
 # GERADOR DO LAYOUT DOMÍNIO
 # ==============================
-
 def gerar_dominio(ecd, log, progress_bar, status_text):
     """
     Gera as linhas do layout Domínio Sistemas.
     Registros: 0000 / 6000 / 6100 / 6110
+
+    Correções V1.3:
+    - Campo 6 do 6100 sempre vazio (evita erro 'histórico não cadastrado')
+    - Campo 7 do 6100 recebe apenas a descrição livre (normalizada em latin-1)
+    - Lançamentos com contas temporárias (5000,5001,10000,10001…) são ignorados
+    - Encoding de saída: latin-1 (sem mojibake)
     """
     linhas     = []
     total_6100 = 0
     total_6110 = 0
     ignorados  = 0
+    ignorados_conta = 0
 
     # Registro 0000
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
@@ -433,6 +348,11 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
             ignorados += 1
             continue
 
+        # Ignora lançamentos com contas temporárias do SPED
+        if tem_conta_ignorada(partidas):
+            ignorados_conta += 1
+            continue
+
         debitos  = [p for p in partidas if p["dc"] == "D"]
         creditos = [p for p in partidas if p["dc"] == "C"]
 
@@ -441,32 +361,36 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
             continue
 
         data      = formatar_data_dominio(lanc["data"])
-        tipo_lanc = identificar_tipo_lancamento(partidas)
+        tipo_lanc = identificar_tipo_lancamento(debitos, creditos)
 
-        # Registro 6000
+        # Histórico: apenas descrição livre, sem código
+        historico = primeiro_historico_livre(partidas)
+
+        # ---- Registro 6000 ----
+        # |6000|TIPO|COD_LANC_PADRAO|LOCALIZADOR|RTT_FCONT|
         linhas.append(f"|6000|{tipo_lanc}||||")
 
         if tipo_lanc == "X":
             db  = debitos[0]
             cr  = creditos[0]
             val = formatar_valor(db["valor"])
-            cod = db.get("cod_hist", "")
-            dsc = montar_historico(db, ecd.historicos)
+            dsc = db.get("descr_hist", "").strip() or historico
+            # Campo 6 (cod_hist) = vazio; campo 7 = descrição livre
             linhas.append(
                 f"|6100|{data}|{db['conta']}|{cr['conta']}"
-                f"|{val}|{cod}|{dsc}|||"
+                f"|{val}||{dsc}|||"
             )
             total_6100 += 1
 
         elif tipo_lanc == "D":
+            # 1 débito × vários créditos
             db           = debitos[0]
             cr_principal = creditos[0]
             val = formatar_valor(db["valor"])
-            cod = db.get("cod_hist", "")
-            dsc = montar_historico(db, ecd.historicos)
+            dsc = db.get("descr_hist", "").strip() or historico
             linhas.append(
                 f"|6100|{data}|{db['conta']}|{cr_principal['conta']}"
-                f"|{val}|{cod}|{dsc}|||"
+                f"|{val}||{dsc}|||"
             )
             total_6100 += 1
             for cr in creditos[1:]:
@@ -475,14 +399,14 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
                 total_6110 += 1
 
         elif tipo_lanc == "C":
+            # vários débitos × 1 crédito
             cr           = creditos[0]
             db_principal = debitos[0]
             val = formatar_valor(cr["valor"])
-            cod = db_principal.get("cod_hist", "")
-            dsc = montar_historico(db_principal, ecd.historicos)
+            dsc = db_principal.get("descr_hist", "").strip() or historico
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr['conta']}"
-                f"|{val}|{cod}|{dsc}|||"
+                f"|{val}||{dsc}|||"
             )
             total_6100 += 1
             for db in debitos[1:]:
@@ -490,15 +414,15 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
                 linhas.append(f"|6110|{db['conta']}||{vr}|")
                 total_6110 += 1
 
-        else:  # V
+        else:
+            # V — vários débitos × vários créditos
             db_principal = debitos[0]
             cr_principal = creditos[0]
             val = formatar_valor(db_principal["valor"])
-            cod = db_principal.get("cod_hist", "")
-            dsc = montar_historico(db_principal, ecd.historicos)
+            dsc = db_principal.get("descr_hist", "").strip() or historico
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr_principal['conta']}"
-                f"|{val}|{cod}|{dsc}|||"
+                f"|{val}||{dsc}|||"
             )
             total_6100 += 1
             for db in debitos[1:]:
@@ -510,20 +434,23 @@ def gerar_dominio(ecd, log, progress_bar, status_text):
                 linhas.append(f"|6110||{cr['conta']}|{vr}|")
                 total_6110 += 1
 
-    log.append(f"Registros 6100 gerados : {total_6100}")
-    log.append(f"Registros 6110 gerados : {total_6110}")
+    log.append(f"Registros 6100 gerados        : {total_6100}")
+    log.append(f"Registros 6110 gerados        : {total_6110}")
     if ignorados:
         log.append(
-            f"Lançamentos ignorados  : {ignorados} (sem partidas D/C completas)"
+            f"Lançamentos ignorados (sem D/C): {ignorados}"
         )
-    log.append(f"Total de linhas geradas: {len(linhas)}")
+    if ignorados_conta:
+        log.append(
+            f"Lançamentos ignorados (conta temp. SPED): {ignorados_conta}"
+        )
+    log.append(f"Total de linhas geradas       : {len(linhas)}")
     return linhas
 
 
 # ==============================
 # PIPELINE PRINCIPAL
 # ==============================
-
 def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     try:
         log.append("Iniciando leitura do SPED ECD...")
@@ -551,7 +478,6 @@ def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
 # ==============================
 # INTERFACE STREAMLIT
 # ==============================
-
 def main():
     st.set_page_config(
         page_title="Domínio Sistemas | Thomson Reuters",
@@ -598,18 +524,13 @@ def main():
             """
         )
         st.markdown("---")
-        st.markdown("### 🔤 Caracteres especiais")
+        st.markdown("### ✅ Correções V1.3")
         st.markdown(
             """
-Históricos são normalizados automaticamente para compatibilidade com o Domínio:
-
-| Original | Convertido |
-|----------|-----------|
-| `"` `"` | `"` |
-| `'` `'` | `'` |
-| `–` `—` | `-` |
-| `…`     | `...` |
-| Outros  | Preservados se latin-1 |
+- Campo 6 (cód. histórico) sempre **vazio** — evita erro *histórico não cadastrado*
+- Histórico gravado apenas como **descrição livre** no campo 7
+- Lançamentos com contas temporárias do SPED (`5000`, `5001`, `10000`, `10001`…) são **ignorados** automaticamente
+- Arquivo gerado em **latin-1** — elimina caracteres corrompidos (`ï¿½`)
             """
         )
 
@@ -646,16 +567,17 @@ Históricos são normalizados automaticamente para compatibilidade com o Domíni
             <ul>
                 <li>O arquivo de saída segue o layout separado por pipe <code>|</code>
                     exigido pelo Domínio Sistemas.</li>
-                <li>Lançamentos sem partidas de débito <b>e</b> crédito simultâneas
-                    são ignorados.</li>
+                <li>Lançamentos com contas temporárias do SPED
+                    (<code>5000</code>, <code>5001</code>, <code>10000</code>, <code>10001</code>…)
+                    são ignorados automaticamente — essas contas não existem no Domínio.</li>
+                <li>O campo de código do histórico é deixado em branco para evitar
+                    o erro <i>"histórico não cadastrado"</i>. O texto descritivo é
+                    colocado diretamente no campo de descrição livre.</li>
                 <li>O tipo do lançamento (<b>X / D / C / V</b>) é detectado
                     automaticamente pelo número de partidas.</li>
-                <li>O histórico é extraído do campo descritivo do <code>I250</code>;
-                    se vazio, usa o padrão do <code>I075</code>.</li>
-                <li>Caracteres especiais (aspas tipográficas, travessão, reticências, etc.)
-                    são convertidos automaticamente para equivalentes compatíveis com
-                    o Domínio Sistemas (latin-1). Letras acentuadas do português
-                    (<b>á é í ó ú â ê ô ã õ ç</b>) são sempre preservadas.</li>
+                <li>Letras acentuadas do português são preservadas.
+                    O arquivo é gravado em <b>latin-1</b> para compatibilidade
+                    com o Domínio.</li>
                 <li>Verifique sempre o <b>Log de processamento</b> ao final da página.</li>
             </ul>
 
@@ -684,7 +606,6 @@ Históricos são normalizados automaticamente para compatibilidade com o Domíni
     )
 
     col1, col2 = st.columns([1, 1])
-
     with col1:
         converter = st.button(
             "▶ Converter",
@@ -724,7 +645,7 @@ Históricos são normalizados automaticamente para compatibilidade com o Domíni
             progress_bar.progress(100)
             status_text.text("✅ Conversão concluída!")
 
-            # Grava em latin-1 para máxima compatibilidade com o Domínio
+            # Grava em latin-1 — encoding nativo do Domínio
             conteudo_txt = "\n".join(linhas) + "\n"
             st.session_state.txt_gerado = conteudo_txt.encode(
                 "latin-1", errors="replace"
