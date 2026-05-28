@@ -493,8 +493,17 @@ def main():
         st.markdown("---")
         st.markdown("""### Estrutura gerada
 **Tipo X** (1 debito, 1 credito):
+|6000|X||||
+|6100|DATA|DEB|CRED|VALOR||HIST|||||||
 
-                    st.markdown("---")
+
+**Tipos D / C / V** (multiplos):
+|6000|D||||
+|6100|DATA|DEB||VALOR||HIST|||||||
+|6100|DATA||CRED|VALOR||HIST|||||||
+
+
+        st.markdown("---")
         st.markdown("""### Tipos X/D/C/V
 | Tipo | Regra |
 |------|-------|
