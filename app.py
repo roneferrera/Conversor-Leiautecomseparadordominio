@@ -7,7 +7,7 @@ import streamlit as st
 # ==============================
 # VERSÃO
 # ==============================
-VERSAO = "V1.0"
+VERSAO = "V1.1"
 
 # ==============================
 # TEMA TR
@@ -78,6 +78,10 @@ def apply_tr_theme():
         .instrucoes-box h4:first-child {
             margin-top: 0;
         }
+        /* Barra de progresso laranja */
+        .stProgress > div > div > div > div {
+            background-color: #FF8000 !important;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -89,9 +93,9 @@ def apply_tr_theme():
 class SpedECD:
     def __init__(self):
         self.cnpj        = ""
-        self.contas      = {}   # cod_reduzido -> nome
-        self.historicos  = {}   # cod -> descricao (I075)
-        self.lancamentos = []   # lista de dicts com I200 + I250
+        self.contas      = {}
+        self.historicos  = {}
+        self.lancamentos = []
 
 
 # ==============================
@@ -107,7 +111,7 @@ def _split_pipe(linha):
     return campos
 
 
-def parse_sped_ecd(conteudo_bytes, log):
+def parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     ecd        = SpedECD()
     lote_atual = None
     erros      = 0
@@ -118,7 +122,20 @@ def parse_sped_ecd(conteudo_bytes, log):
         log.append(f"ERRO ao decodificar arquivo: {e}")
         return None
 
-    for num_linha, linha in enumerate(texto.splitlines(), start=1):
+    linhas_total = texto.count("\n") or 1
+    linhas_lista = texto.splitlines()
+    total        = len(linhas_lista)
+
+    status_text.text("📖 Lendo registros do SPED ECD...")
+
+    for num_linha, linha in enumerate(linhas_lista, start=1):
+
+        # Atualiza progresso a cada 500 linhas (fase 1 = 0% → 50%)
+        if num_linha % 500 == 0 or num_linha == total:
+            pct = int((num_linha / total) * 50)
+            progress_bar.progress(pct)
+            status_text.text(f"📖 Lendo linha {num_linha:,} de {total:,}...")
+
         linha = linha.strip()
         if not linha:
             continue
@@ -127,30 +144,22 @@ def parse_sped_ecd(conteudo_bytes, log):
         registro = campos[0] if campos else ""
 
         try:
-            # ---- 0000 – Identificação da empresa ----
             if registro == "0000":
-                # |0000|LECD|DT_INI|DT_FIN|NOME|CNPJ|...
                 if len(campos) > 5:
                     ecd.cnpj = campos[5].strip()
 
-            # ---- I050 – Plano de contas ----
             elif registro == "I050":
-                # |I050|DT_INI|COD_EMP|IND_DC|NIVEL|COD_CTA|COD_CTA_SUP|NOME_CTA|
                 if len(campos) > 7:
                     cod  = campos[5].strip()
                     nome = campos[7].strip()
                     if cod:
                         ecd.contas[cod] = nome
 
-            # ---- I075 – Históricos padrão ----
             elif registro == "I075":
-                # |I075|COD_HIST|DESCR_HIST|
                 if len(campos) > 2:
                     ecd.historicos[campos[1].strip()] = campos[2].strip()
 
-            # ---- I200 – Cabeçalho do lançamento ----
             elif registro == "I200":
-                # |I200|NUM_LANC|DT_LANC|VL_LANC|IND_DC|IND_LANC|...
                 if len(campos) > 3:
                     lote_atual = {
                         "num"     : campos[1].strip(),
@@ -160,9 +169,7 @@ def parse_sped_ecd(conteudo_bytes, log):
                     }
                     ecd.lancamentos.append(lote_atual)
 
-            # ---- I250 – Partidas do lançamento ----
             elif registro == "I250":
-                # |I250|COD_CTA|COD_CCUS|VL_DC|IND_DC|NUM_ARQ|COD_HIST|DESCR_HIST|
                 if lote_atual is not None and len(campos) > 4:
                     partida = {
                         "conta"     : campos[1].strip(),
@@ -180,6 +187,8 @@ def parse_sped_ecd(conteudo_bytes, log):
                 log.append("ERRO: muitos erros de parse. Abortando leitura.")
                 return None
 
+    progress_bar.progress(50)
+
     if not ecd.cnpj:
         log.append("ERRO: CNPJ não encontrado no registro 0000.")
         return None
@@ -196,7 +205,6 @@ def parse_sped_ecd(conteudo_bytes, log):
 # ==============================
 
 def formatar_data_dominio(data_sped):
-    """DDMMAAAA → DD/MM/AAAA. Mantém se já tiver barra."""
     d = data_sped.strip()
     if "/" in d:
         return d
@@ -206,21 +214,13 @@ def formatar_data_dominio(data_sped):
 
 
 def formatar_valor(valor_str):
-    """
-    Garante separador decimal com vírgula e pelo menos duas casas decimais.
-    Ex.: '5571.24' → '5571,24' | '5571' → '5571,00'
-    """
     v = valor_str.strip()
-
-    # Troca ponto por vírgula (padrão SPED usa vírgula, mas por segurança)
     if "." in v and "," not in v:
         v = v.replace(".", ",")
     elif "." in v and "," in v:
-        # Formato 1.234,56 → já ok; formato 1,234.56 → converte
         if v.index(".") < v.index(","):
             v = v.replace(".", "").replace(",", ".")
             v = v.replace(".", ",")
-
     if "," not in v:
         v += ",00"
     else:
@@ -228,18 +228,12 @@ def formatar_valor(valor_str):
         if len(partes[1]) < 2:
             partes[1] = partes[1].ljust(2, "0")
         v = ",".join(partes)
-
     return v
 
 
 def montar_historico(partida, historicos):
-    """
-    Prioridade: descrição completa da partida (I250 campo 7) > padrão I075.
-    Limitado a 250 caracteres.
-    """
     descr = partida.get("descr_hist", "").strip()
     cod   = partida.get("cod_hist",   "").strip()
-
     if descr:
         return descr[:250]
     if cod and cod in historicos:
@@ -248,16 +242,9 @@ def montar_historico(partida, historicos):
 
 
 def identificar_tipo_lancamento(partidas):
-    """
-    X = 1 débito × 1 crédito
-    D = 1 débito × vários créditos
-    C = vários débitos × 1 crédito
-    V = vários débitos × vários créditos
-    """
     debitos  = [p for p in partidas if p["dc"] == "D"]
     creditos = [p for p in partidas if p["dc"] == "C"]
     nd, nc   = len(debitos), len(creditos)
-
     if nd == 1 and nc == 1:
         return "X"
     if nd == 1 and nc > 1:
@@ -268,7 +255,6 @@ def identificar_tipo_lancamento(partidas):
 
 
 def primeiro_historico(partidas, historicos):
-    """Retorna o primeiro histórico não-vazio encontrado nas partidas."""
     for p in partidas:
         h = montar_historico(p, historicos)
         if h:
@@ -280,26 +266,29 @@ def primeiro_historico(partidas, historicos):
 # GERADOR DO LAYOUT DOMÍNIO
 # ==============================
 
-def gerar_dominio(ecd, log):
-    """
-    Gera as linhas do layout Domínio Sistemas.
-    Registros: 0000 / 6000 / 6100 / 6110
-
-    Exemplo de saída esperada (arquivo exemplo_arquivo__lancamento_lote.txt):
-        |0000|33333333000191|
-        |6000|X||||
-        |6100|10/09/2015|55|5|5571,24|1|DESCRICAO DO HISTORICO CONTABIL|GERENTE|||
-    """
+def gerar_dominio(ecd, log, progress_bar, status_text):
     linhas     = []
     total_6100 = 0
     total_6110 = 0
     ignorados  = 0
 
-    # ---- Registro 0000 ----
+    # Registro 0000
     cnpj_numerico = re.sub(r"\D", "", ecd.cnpj)
     linhas.append(f"|0000|{cnpj_numerico}|")
 
-    for lanc in ecd.lancamentos:
+    total_lanc = len(ecd.lancamentos)
+    status_text.text(f"⚙ Gerando layout Domínio — {total_lanc:,} lançamentos...")
+
+    for idx, lanc in enumerate(ecd.lancamentos):
+
+        # Atualiza progresso a cada 100 lançamentos (fase 2 = 50% → 100%)
+        if idx % 100 == 0 or idx == total_lanc - 1:
+            pct = 50 + int(((idx + 1) / total_lanc) * 50)
+            progress_bar.progress(min(pct, 99))
+            status_text.text(
+                f"⚙ Gerando lançamento {idx + 1:,} de {total_lanc:,}..."
+            )
+
         partidas = lanc.get("partidas", [])
         if not partidas:
             ignorados += 1
@@ -315,85 +304,68 @@ def gerar_dominio(ecd, log):
         data      = formatar_data_dominio(lanc["data"])
         tipo_lanc = identificar_tipo_lancamento(partidas)
 
-        # ---- Registro 6000 ----
-        # Campos: |6000|TIPO|COD_LANC_PADRAO|LOCALIZADOR|RTT_FCONT|
+        # Registro 6000
         linhas.append(f"|6000|{tipo_lanc}||||")
 
-        # ---- Monta 6100 / 6110 conforme o tipo ----
-
         if tipo_lanc == "X":
-            # 1 débito × 1 crédito
             db  = debitos[0]
             cr  = creditos[0]
             val = formatar_valor(db["valor"])
             cod = db.get("cod_hist", "")
             dsc = montar_historico(db, ecd.historicos)
-
-            # |6100|DATA|DEBITO|CREDITO|VALOR|COD_HIST|DESCR_HIST|USUARIO|COD_FILIAL|COD_SCP|
-            linhas.append(f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}|{cod}|{dsc}|||")
+            linhas.append(
+                f"|6100|{data}|{db['conta']}|{cr['conta']}"
+                f"|{val}|{cod}|{dsc}|||"
+            )
             total_6100 += 1
 
         elif tipo_lanc == "D":
-            # 1 débito × vários créditos
-            db  = debitos[0]
+            db           = debitos[0]
+            cr_principal = creditos[0]
             val = formatar_valor(db["valor"])
             cod = db.get("cod_hist", "")
             dsc = montar_historico(db, ecd.historicos)
-
-            cr_principal = creditos[0]
             linhas.append(
                 f"|6100|{data}|{db['conta']}|{cr_principal['conta']}"
                 f"|{val}|{cod}|{dsc}|||"
             )
             total_6100 += 1
-
-            # Créditos adicionais → 6110
-            # |6110|CC_DEBITO|CC_CREDITO|VALOR_RATEIO|
             for cr in creditos[1:]:
                 vr = formatar_valor(cr["valor"])
                 linhas.append(f"|6110||{cr['conta']}|{vr}|")
                 total_6110 += 1
 
         elif tipo_lanc == "C":
-            # vários débitos × 1 crédito
-            cr  = creditos[0]
-            val = formatar_valor(cr["valor"])
-
+            cr           = creditos[0]
             db_principal = debitos[0]
+            val = formatar_valor(cr["valor"])
             cod = db_principal.get("cod_hist", "")
             dsc = montar_historico(db_principal, ecd.historicos)
-
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr['conta']}"
                 f"|{val}|{cod}|{dsc}|||"
             )
             total_6100 += 1
-
-            # Débitos adicionais → 6110
             for db in debitos[1:]:
                 vr = formatar_valor(db["valor"])
                 linhas.append(f"|6110|{db['conta']}||{vr}|")
                 total_6110 += 1
 
-        else:
-            # V — vários débitos × vários créditos
+        else:  # V
             db_principal = debitos[0]
             cr_principal = creditos[0]
             val = formatar_valor(db_principal["valor"])
             cod = db_principal.get("cod_hist", "")
             dsc = montar_historico(db_principal, ecd.historicos)
-
             linhas.append(
                 f"|6100|{data}|{db_principal['conta']}|{cr_principal['conta']}"
                 f"|{val}|{cod}|{dsc}|||"
             )
             total_6100 += 1
-
             for db in debitos[1:]:
                 vr = formatar_valor(db["valor"])
                 linhas.append(f"|6110|{db['conta']}||{vr}|")
                 total_6110 += 1
-
             for cr in creditos[1:]:
                 vr = formatar_valor(cr["valor"])
                 linhas.append(f"|6110||{cr['conta']}|{vr}|")
@@ -402,7 +374,9 @@ def gerar_dominio(ecd, log):
     log.append(f"Registros 6100 gerados : {total_6100}")
     log.append(f"Registros 6110 gerados : {total_6110}")
     if ignorados:
-        log.append(f"Lançamentos ignorados  : {ignorados} (sem partidas D/C completas)")
+        log.append(
+            f"Lançamentos ignorados  : {ignorados} (sem partidas D/C completas)"
+        )
     log.append(f"Total de linhas geradas: {len(linhas)}")
     return linhas
 
@@ -411,18 +385,17 @@ def gerar_dominio(ecd, log):
 # PIPELINE PRINCIPAL
 # ==============================
 
-def converter_sped_ecd(conteudo_bytes, log):
-    """Lê o SPED ECD e gera as linhas do layout Domínio."""
+def converter_sped_ecd(conteudo_bytes, log, progress_bar, status_text):
     try:
         log.append("Iniciando leitura do SPED ECD...")
-        ecd = parse_sped_ecd(conteudo_bytes, log)
+        ecd = parse_sped_ecd(conteudo_bytes, log, progress_bar, status_text)
 
         if ecd is None:
             log.append("ERRO: Leitura do SPED ECD falhou. Abortando.")
             return None, None
 
         log.append("Gerando layout Domínio Sistemas...")
-        linhas = gerar_dominio(ecd, log)
+        linhas = gerar_dominio(ecd, log, progress_bar, status_text)
 
         if not linhas:
             log.append("ERRO: Nenhuma linha foi gerada.")
@@ -571,20 +544,35 @@ def main():
         st.session_state.metricas     = {}
         st.rerun()
 
+    # ---- Processamento com barra de progresso ----
     if converter and arquivo is not None:
         st.session_state.log          = ["Iniciando conversão..."]
         st.session_state.txt_gerado   = None
         st.session_state.nome_arquivo = "lancamentos_dominio.txt"
         st.session_state.metricas     = {}
 
+        # Cria os widgets de progresso
+        status_text  = st.empty()
+        progress_bar = st.progress(0)
+
         conteudo_bytes = arquivo.read()
-        linhas, ecd    = converter_sped_ecd(conteudo_bytes, st.session_state.log)
+        linhas, ecd    = converter_sped_ecd(
+            conteudo_bytes,
+            st.session_state.log,
+            progress_bar,
+            status_text,
+        )
 
         if linhas and ecd:
+            progress_bar.progress(100)
+            status_text.text("✅ Conversão concluída!")
+
             conteudo_txt = "\n".join(linhas) + "\n"
             st.session_state.txt_gerado   = conteudo_txt.encode("utf-8", errors="replace")
             cnpj_num = re.sub(r"\D", "", ecd.cnpj)
-            st.session_state.nome_arquivo = f"ECD_{cnpj_num}_lancamentos_dominio.txt"
+            st.session_state.nome_arquivo = (
+                f"ECD_{cnpj_num}_lancamentos_dominio.txt"
+            )
 
             total_linhas = len(linhas)
             total_6000   = sum(1 for l in linhas if l.startswith("|6000|"))
@@ -597,6 +585,9 @@ def main():
                 "Linhas 6110"       : total_6110,
                 "Total de linhas"   : total_linhas,
             }
+        else:
+            progress_bar.progress(100)
+            status_text.text("❌ Falha na conversão. Verifique o log abaixo.")
 
         st.rerun()
 
