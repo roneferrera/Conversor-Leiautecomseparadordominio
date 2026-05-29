@@ -28,7 +28,7 @@ VERSAO        = "V1.3"
 CHUNK_SIZE    = 100_000   # era 20_000 — menos overhead de setup por chunk
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
-MAX_UPLOAD_MB = 50
+MAX_UPLOAD_MB = 200
 
 COLS_PADRAO = [
     "Data",
