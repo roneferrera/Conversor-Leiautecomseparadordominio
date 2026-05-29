@@ -24,8 +24,8 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════════
-VERSAO        = "V1.2"
-CHUNK_SIZE    = 20_000
+VERSAO        = "V1.3"
+CHUNK_SIZE    = 100_000   # era 20_000 — menos overhead de setup por chunk
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
 MAX_UPLOAD_MB = 50
@@ -110,6 +110,18 @@ def apply_theme():
         background:#102040; border-left:4px solid #FF6B00;
         border-radius:4px; padding:12px 16px; margin:8px 0;
         font-size:13px;
+    }
+    .card-ok {
+        background:#0a2e1a; border:2px solid #00C896;
+        border-radius:10px; padding:18px 24px; margin:12px 0;
+    }
+    .card-err {
+        background:#2e0a0a; border:2px solid #FF4444;
+        border-radius:10px; padding:18px 24px; margin:12px 0;
+    }
+    .card-warn {
+        background:#1a1000; border-left:4px solid #FFD166;
+        border-radius:4px; padding:10px 16px; margin:8px 0;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -321,10 +333,6 @@ def fmt_reg_6100(
     _filial:  str = "",
     _scp:     str = "",
 ) -> str:
-    """
-    Layout idêntico ao SPED ECD:
-        |6100|DATA|DEB|CRED|VALOR||HIST|||||||
-    """
     valor_fmt = _fmt_valor_layout(valor)
     hist_fmt  = _norm_hist(desc)
     return (
@@ -399,9 +407,9 @@ class SpedECD:
 
 def _parse_ecd(conteudo: bytes, log: list) -> tuple:
     ecd = SpedECD()
-    lote_atual    = None
-    erros_parse   = 0
-    registros_erro = []
+    lote_atual       = None
+    erros_parse      = 0
+    registros_erro   = []
     contas_invalidas = 0
 
     enc = _detectar_encoding_bytes(conteudo)
@@ -657,13 +665,12 @@ def _filtrar_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
 def ler_txt_streaming(conteudo: bytes):
     """
     Gerador: yield (chunk_filtrado, encoding) um chunk por vez.
-    Nunca acumula tudo em memória.
+    Usa BytesIO direto — sem decode antecipado do arquivo inteiro.
+    Engine C (3-5x mais rápido que engine python).
+    Sem gc.collect() no loop quente.
     """
-    enc   = _detectar_encoding_bytes(conteudo)
-    texto = conteudo.decode(enc, errors="replace")
-    buf   = io.StringIO(texto)
-    del texto
-    gc.collect()
+    enc = _detectar_encoding_bytes(conteudo)
+    buf = io.BytesIO(conteudo)   # zero cópia extra — pandas decodifica por chunk
 
     reader = pd.read_csv(
         buf,
@@ -671,8 +678,9 @@ def ler_txt_streaming(conteudo: bytes):
         header=None,
         names=COLS_PADRAO,
         dtype=str,
+        encoding=enc,
         on_bad_lines="skip",
-        engine="python",
+        engine="c",              # era "python" — 3-5x mais rápido
         usecols=range(len(COLS_PADRAO)),
         chunksize=CHUNK_SIZE,
     )
@@ -688,7 +696,7 @@ def ler_txt_streaming(conteudo: bytes):
         if len(filtrado) > 0:
             yield filtrado, enc
         del filtrado
-        gc.collect()
+        # sem gc.collect() no loop — reduz overhead em 200k+ linhas
 
 def tipo_lancamento(nd, nc):
     if nd == 1 and nc == 1: return "X"
@@ -742,7 +750,6 @@ def diagnosticar_lote(W: pd.DataFrame, dif: float) -> dict:
     }
 
 def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list:
-    """Gera apenas as linhas 6100 para um lote já classificado."""
     out = []
     if tp == "X":
         rd   = debs.iloc[0]
@@ -769,7 +776,6 @@ def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list
                 float(rd["vf"]), "", desc,
             ))
     else:
-        # V: N×N — cross join vetorizado
         cross = debs[["cd", "vf", "desc", "dt"]].merge(
             creds[["cc", "desc"]].rename(columns={"desc": "desc_c"}),
             how="cross",
@@ -783,34 +789,36 @@ def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list
     return out
 
 def _flush_lote(
-    df_lote:    pd.DataFrame,
-    num:        int,
-    saida_buf:  io.StringIO,
-    resumo:     list,
-    erros:      list,
+    df_lote:   pd.DataFrame,
+    num:       int,
+    saida_buf: io.StringIO,
+    resumo:    list,
+    erros:     list,
 ) -> None:
     """
-    Processa um único lote completo:
-    - Valida débito == crédito
-    - Se OK: grava 6000 + 6100 no saida_buf imediatamente
-    - Se ERRO: registra diagnóstico
+    Processa um único lote completo.
+    Sem gc.collect() — chamado externamente só ao final do processamento.
+    Sem .copy() desnecessário nos grupos.
     """
     if df_lote is None or len(df_lote) == 0:
         return
 
-    v_float  = limpar_valor_vec(df_lote["Valor"])
-    cd_arr   = limpar_contas_vec(df_lote["Cód. Conta Debito"])
-    cc_arr   = limpar_contas_vec(df_lote["Cód. Conta Credito"])
-    td_arr   = cd_arr != ""
-    tc_arr   = cc_arr != ""
-    vd_arr   = np.where(td_arr, v_float, 0.0)
-    vc_arr   = np.where(tc_arr, v_float, 0.0)
-    dt_arr   = df_lote["Data"].fillna("").astype(str).to_numpy()
-    desc_arr = np.array(
-        [_norm_hist(v) for v in
-         df_lote["Complemento Histórico"].fillna("").astype(str).tolist()],
-        dtype=object,
-    )
+    v_float = limpar_valor_vec(df_lote["Valor"])
+    cd_arr  = limpar_contas_vec(df_lote["Cód. Conta Debito"])
+    cc_arr  = limpar_contas_vec(df_lote["Cód. Conta Credito"])
+    td_arr  = cd_arr != ""
+    tc_arr  = cc_arr != ""
+    vd_arr  = np.where(td_arr, v_float, 0.0)
+    vc_arr  = np.where(tc_arr, v_float, 0.0)
+    dt_arr  = df_lote["Data"].fillna("").astype(str).to_numpy()
+
+    # _norm_hist apenas nas linhas que realmente precisam (contêm não-ASCII ou pipe)
+    col_desc = df_lote["Complemento Histórico"].fillna("").astype(str)
+    desc_arr = col_desc.to_numpy(dtype=object)
+    mask_esp = col_desc.str.contains(r'[^\x20-\x7E]|\|', regex=True, na=False).to_numpy()
+    for i in np.where(mask_esp)[0]:
+        desc_arr[i] = _norm_hist(desc_arr[i])
+
     lo_arr = df_lote["_linha_origem"].fillna(0).astype(int).to_numpy(dtype=np.int32)
 
     W = pd.DataFrame({
@@ -860,51 +868,50 @@ def _flush_lote(
 
     resumo.append(entrada)
     del W
-    gc.collect()
+    # sem gc.collect() aqui — Python 3.14 gerencia bem objetos de curta duração
 
 def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
     """
-    Processa o arquivo TXT em streaming real:
-    - Nunca faz pd.concat de todo o arquivo
-    - Resolve lotes que cruzam fronteiras de chunk via buffer pendente
-    - Grava saída conforme processa (sem acumular linhas em memória)
-    Retorna: (bytes_saida, resumo, erros, total_lins, ignoradas, enc)
+    Processa o arquivo TXT em streaming real.
+    Correções aplicadas:
+    - BytesIO direto (sem decode antecipado)
+    - engine="c" no read_csv
+    - CHUNK_SIZE=100_000
+    - gc.collect() removido dos loops quentes
+    - .copy() removido dos groupby
     """
     saida_buf  = io.StringIO()
     saida_buf.write(fmt_reg_0000(ni) + "\n")
 
-    pendente      = None    # DataFrame com linhas do lote ainda aberto
-    num_lote_g    = 0       # contador global de lotes já fechados
-    usa_inicia    = None    # detectado no primeiro chunk
+    pendente      = None
+    num_lote_g    = 0
+    usa_inicia    = None
     resumo: list  = []
     erros:  list  = []
     total_lins    = 0
     ignoradas     = 0
     enc_final     = "utf-8"
+    chunk_count   = 0
 
     for chunk_df, enc in ler_txt_streaming(conteudo):
         enc_final   = enc
         total_lins += len(chunk_df)
+        chunk_count += 1
 
-        # detectar modo de agrupamento no primeiro chunk
         if usa_inicia is None:
             usa_inicia = bool(
                 (chunk_df["Inicia Lote"].str.strip() != "").any()
             )
 
-        # colar pendente do chunk anterior no início deste
         if pendente is not None and len(pendente) > 0:
             chunk_df = pd.concat([pendente, chunk_df], ignore_index=True)
             pendente = None
-            gc.collect()
 
-        # ── numerar lotes dentro do chunk ─────────────────────────────────
+        # numerar lotes dentro do chunk
         if usa_inicia:
             inicia   = chunk_df["Inicia Lote"].fillna("").astype(str).str.strip()
             marcador = (inicia != "").to_numpy(dtype=bool)
-            # se o chunk começa sem marcador, pertence ao lote pendente
-            # que já foi colado — a numeração continua de num_lote_g
-            nums = np.cumsum(marcador, dtype=np.int32) + num_lote_g
+            nums     = np.cumsum(marcador, dtype=np.int32) + num_lote_g
             chunk_df["_num_lote"] = nums
         else:
             desc  = (
@@ -919,32 +926,32 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
             muda       = np.empty(len(chave), dtype=bool)
             muda[0]    = True
             muda[1:]   = chave[1:] != chave[:-1]
-            nums = np.cumsum(muda, dtype=np.int32) + num_lote_g
+            nums       = np.cumsum(muda, dtype=np.int32) + num_lote_g
             chunk_df["_num_lote"] = nums
 
-        # o último lote do chunk pode estar incompleto — guardar como pendente
         ultimo_lote = int(chunk_df["_num_lote"].max())
         mask_ultimo = chunk_df["_num_lote"] == ultimo_lote
         pendente    = chunk_df[mask_ultimo].copy()
-        chunk_proc  = chunk_df[~mask_ultimo].copy()
+        chunk_proc  = chunk_df[~mask_ultimo]   # sem .copy() desnecessário
         del chunk_df
-        gc.collect()
 
-        # processar todos os lotes completos
         for nl, grupo in chunk_proc.groupby("_num_lote", sort=True):
-            _flush_lote(grupo.copy(), int(nl), saida_buf, resumo, erros)
+            _flush_lote(grupo, int(nl), saida_buf, resumo, erros)  # sem .copy()
 
-        # atualizar contador global (o último lote ainda está pendente)
         num_lote_g = ultimo_lote - 1
         del chunk_proc
-        gc.collect()
 
-    # processar o último lote pendente (o real último do arquivo)
+        # gc.collect() a cada 5 chunks — não a cada iteração
+        if chunk_count % 5 == 0:
+            gc.collect()
+
+    # último lote pendente
     if pendente is not None and len(pendente) > 0:
         num_lote_g += 1
-        _flush_lote(pendente.copy(), num_lote_g, saida_buf, resumo, erros)
+        _flush_lote(pendente, num_lote_g, saida_buf, resumo, erros)  # sem .copy()
         del pendente
-        gc.collect()
+
+    gc.collect()  # único gc.collect() garantido — ao final
 
     log.append(f"  Linhas lidas       : {total_lins:,}")
     log.append(f"  Ignoradas          : {ignoradas:,}")
@@ -954,7 +961,6 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
 
     saida_bytes = saida_buf.getvalue().encode("utf-8-sig")
     del saida_buf
-    gc.collect()
     return saida_bytes, resumo, erros, total_lins, ignoradas, enc_final
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1011,7 +1017,6 @@ def ler_excel_lote(conteudo: bytes, sheet: str, linha_h: int) -> tuple:
     return df, pasta
 
 def montar_lotes_excel(df: pd.DataFrame) -> tuple:
-    """Monta numeração de lotes para Excel (fluxo não-streaming)."""
     R = df.copy()
     for col in COLS_PADRAO + ["_linha_origem"]:
         if col not in R.columns:
@@ -1038,14 +1043,16 @@ def montar_lotes_excel(df: pd.DataFrame) -> tuple:
     return R, "Inicia Lote" if tem_ini else "Data + Descrição"
 
 def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
-    """Processa Excel via _flush_lote (reutiliza a mesma lógica do streaming)."""
+    """Processa Excel via _flush_lote. Sem .copy() por grupo, sem gc.collect() no loop."""
     saida_buf = io.StringIO()
     saida_buf.write(fmt_reg_0000(ni) + "\n")
     resumo: list = []
     erros:  list = []
 
     for nl, grupo in df.groupby("_num_lote", sort=True):
-        _flush_lote(grupo.copy(), int(nl), saida_buf, resumo, erros)
+        _flush_lote(grupo, int(nl), saida_buf, resumo, erros)  # sem .copy()
+
+    gc.collect()  # único gc.collect() ao final
 
     log.append(f"  Lotes processados  : {len(resumo):,}")
     log.append(f"  Lotes OK           : {len(resumo) - len(erros):,}")
@@ -1053,7 +1060,6 @@ def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
 
     saida_bytes = saida_buf.getvalue().encode("utf-8-sig")
     del saida_buf
-    gc.collect()
     return saida_bytes, resumo, erros
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1178,7 +1184,368 @@ def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
     return ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTERFACE STREAMLIT
+# PAINEL DE RESULTADOS — LOTES
+# ═══════════════════════════════════════════════════════════════════════════════
+def _render_resultados_lote(exibir_log: bool):
+    """
+    Painel completo de resultados para TXT e Excel:
+    - Cartão de status geral (verde/vermelho)
+    - Barra de progresso de fechamento
+    - Totais D/C/diferença
+    - Tabela filtrada com cores
+    - Diagnóstico expandível por lote com erro
+    - Downloads (arquivo + erros dinâmico + log)
+    - Log inline
+    """
+    resumo   = st.session_state.resumo     or []
+    erros    = st.session_state.erros_lote or []
+    metricas = st.session_state.metricas   or {}
+
+    st.markdown("---")
+    st.markdown("## 📊 Resultado da Conversão")
+
+    # ── 1. MÉTRICAS GERAIS ────────────────────────────────────────────────────
+    if metricas:
+        cols = st.columns(len(metricas))
+        for i, (k, v) in enumerate(metricas.items()):
+            cols[i].metric(k, v)
+
+    # ── 2. PAINEL DE FECHAMENTO ───────────────────────────────────────────────
+    if resumo:
+        total    = len(resumo)
+        n_ok     = sum(1 for v in resumo if v["balanceado"])
+        n_err    = total - n_ok
+        pct_ok   = n_ok / total if total > 0 else 0.0
+
+        td_total  = sum(v["total_debito"]  for v in resumo)
+        tc_total  = sum(v["total_credito"] for v in resumo)
+        dif_geral = round(abs(td_total - tc_total), 2)
+        tudo_ok   = dif_geral < TOL_VALOR and n_err == 0
+
+        # cartão de status
+        if tudo_ok:
+            st.markdown(
+                "<div class='card-ok'>"
+                "<span style='font-size:22px;'>✅</span> "
+                "<b style='color:#00C896;font-size:18px;'>"
+                "Todos os lotes estão fechados e balanceados.</b>"
+                "<br><span style='color:#6B7A8D;font-size:13px;'>"
+                "Débito total == Crédito total — arquivo pronto para importação."
+                "</span></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div class='card-err'>"
+                f"<span style='font-size:22px;'>⚠️</span> "
+                f"<b style='color:#FF4444;font-size:18px;'>"
+                f"{n_err} lote(s) desbalanceado(s) de {total}.</b>"
+                f"<br><span style='color:#6B7A8D;font-size:13px;'>"
+                f"Diferença acumulada: R$ {dif_geral:,.2f} — "
+                f"verifique o diagnóstico abaixo."
+                f"</span></div>",
+                unsafe_allow_html=True,
+            )
+
+        # barra de fechamento
+        st.markdown("#### 🔒 Fechamento dos Lotes")
+        col_barra, col_nums = st.columns([3, 1])
+        with col_barra:
+            st.progress(pct_ok)
+            st.caption(
+                f"{n_ok:,} de {total:,} lotes balanceados "
+                f"({pct_ok * 100:.1f}%)"
+            )
+        with col_nums:
+            st.metric("✅ Balanceados", f"{n_ok:,}")
+            st.metric("❌ Com erro",    f"{n_err:,}")
+
+        # totais D / C / diferença
+        col_d, col_c, col_dif = st.columns(3)
+        col_d.metric("Total Débito",   f"R$ {td_total:,.2f}")
+        col_c.metric("Total Crédito",  f"R$ {tc_total:,.2f}")
+        col_dif.metric(
+            "Diferença Geral",
+            f"R$ {dif_geral:,.2f}",
+            delta="OK" if tudo_ok else f"R$ {dif_geral:,.2f} descoberto",
+            delta_color="normal" if tudo_ok else "inverse",
+        )
+
+    # ── 3. TABELA DE LOTES ────────────────────────────────────────────────────
+    if resumo:
+        st.markdown("#### 📋 Detalhe por Lote")
+
+        filtro = st.radio(
+            "Exibir lotes:",
+            ["Todos", "✅ Somente OK", "❌ Somente com erro"],
+            horizontal=True,
+            key="filtro_lotes_radio",
+        )
+
+        rows = []
+        for v in resumo:
+            if filtro == "✅ Somente OK"      and not v["balanceado"]: continue
+            if filtro == "❌ Somente com erro" and     v["balanceado"]: continue
+            rows.append({
+                "Lote":      v["num_lote"],
+                "Linhas":    v["faixa_linhas"],
+                "Data":      v["data"],
+                "Qtd":       v["qtd_linhas"],
+                "Débito":    v["total_debito"],
+                "Crédito":   v["total_credito"],
+                "Diferença": v["diferenca"],
+                "Status":    "✔ OK" if v["balanceado"] else "✖ ERRO",
+            })
+
+        if rows:
+            df_res = pd.DataFrame(rows)
+
+            def _cor_status(val):
+                return (
+                    "color:#00C896;font-weight:700" if val == "✔ OK"
+                    else "color:#FF4444;font-weight:700"
+                )
+
+            def _cor_dif(val):
+                return "color:#FF4444" if val > TOL_VALOR else "color:#00C896"
+
+            styled = (
+                df_res.style
+                .map(_cor_status, subset=["Status"])
+                .map(_cor_dif,    subset=["Diferença"])
+                .format({
+                    "Débito":    "R$ {:,.2f}",
+                    "Crédito":   "R$ {:,.2f}",
+                    "Diferença": "R$ {:,.2f}",
+                })
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum lote encontrado para o filtro selecionado.")
+
+    # ── 4. DIAGNÓSTICO DOS LOTES COM ERRO ────────────────────────────────────
+    if erros:
+        st.markdown("#### 🔍 Diagnóstico dos Lotes Desbalanceados")
+
+        total_dif_erros = sum(e["diferenca"] for e in erros)
+        st.markdown(
+            f"<div class='card-warn'>"
+            f"<b style='color:#FFD166;'>⚡ {len(erros)} lote(s) com diferença</b> "
+            f"— Soma das diferenças: "
+            f"<b style='color:#FF4444;'>R$ {total_dif_erros:,.2f}</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        for e in erros:
+            diag  = e.get("diagnostico", {})
+            label = (
+                f"Lote {e['num_lote']}  │  "
+                f"Linhas {e['faixa_linhas']}  │  "
+                f"Data {e['data']}  │  "
+                f"Dif. R$ {e['diferenca']:,.2f}"
+            )
+            with st.expander(label, expanded=(len(erros) == 1)):
+                sugestao = diag.get("sugestao", "")
+                if sugestao:
+                    st.markdown(
+                        f"<div class='card-warn'>"
+                        f"💡 <b style='color:#FFD166;'>Sugestão:</b> {sugestao}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Débito",    f"R$ {diag.get('total_debito',  0):,.2f}")
+                c2.metric("Crédito",   f"R$ {diag.get('total_credito', 0):,.2f}")
+                c3.metric("Diferença", f"R$ {diag.get('diferenca',     0):,.2f}")
+                c4.metric(
+                    "Partidas",
+                    f"D:{diag.get('qtd_debitos',0)} / C:{diag.get('qtd_creditos',0)}"
+                )
+
+                suspeitas = diag.get("suspeitas", [])
+                if suspeitas:
+                    st.markdown("**⚡ Linhas suspeitas:**")
+                    for s in suspeitas:
+                        tp  = "DÉBITO" if s["tipo"] == "D" else "CRÉDITO"
+                        cta = s["conta_debito"] or s["conta_credito"]
+                        st.markdown(
+                            f"- Linha `{s['linha_origem']}` — **{tp}** "
+                            f"Conta `{cta}` — "
+                            f"R$ `{s['valor']:,.2f}` — {s['motivo']}"
+                        )
+
+                linhas_det = diag.get("linhas", [])
+                if linhas_det:
+                    df_det = pd.DataFrame(linhas_det)
+                    cols_show = [
+                        c for c in [
+                            "linha_origem", "tipo", "conta_debito",
+                            "conta_credito", "valor", "descricao",
+                        ] if c in df_det.columns
+                    ]
+
+                    def _cor_tipo(val):
+                        return (
+                            "color:#6EC6FF;font-weight:700" if val == "D"
+                            else "color:#FF9EBC;font-weight:700"
+                        )
+
+                    styled_det = (
+                        df_det[cols_show].style
+                        .map(_cor_tipo, subset=["tipo"])
+                        .format({"valor": "R$ {:,.2f}"})
+                    )
+                    st.dataframe(
+                        styled_det,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+    # ── 5. DOWNLOADS ──────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### ⬇ Downloads")
+    dl1, dl2, dl3 = st.columns(3)
+
+    with dl1:
+        if st.session_state.resultado_bytes:
+            if n_err == 0:
+                st.success(f"✅ {n_ok:,} lotes — arquivo pronto!")
+            else:
+                st.warning(f"⚠ {n_ok:,} OK / {n_err:,} com erro — arquivo parcial.")
+            st.download_button(
+                "⬇ Baixar arquivo convertido",
+                data=st.session_state.resultado_bytes,
+                file_name=st.session_state.resultado_nome,
+                mime="text/plain",
+                use_container_width=True,
+                type="primary",
+            )
+
+    with dl2:
+        # gerar relatório de erros on-the-fly se houver erros de lote
+        if erros:
+            linhas_err = [
+                "RELATÓRIO DE LOTES DESBALANCEADOS",
+                "=" * 60, "",
+                f"Data/Hora : {ts_log()}",
+                f"Total erros: {len(erros)}",
+                f"Soma dif.  : R$ {sum(e['diferenca'] for e in erros):,.2f}",
+                "", "=" * 60, "",
+            ]
+            for e in erros:
+                linhas_err += [
+                    f"Lote      : {e['num_lote']}",
+                    f"Linhas    : {e['faixa_linhas']}",
+                    f"Data      : {e['data']}",
+                    f"Débito    : R$ {e['total_debito']:,.2f}",
+                    f"Crédito   : R$ {e['total_credito']:,.2f}",
+                    f"Diferença : R$ {e['diferenca']:,.2f}",
+                ]
+                diag = e.get("diagnostico", {})
+                if diag.get("sugestao"):
+                    linhas_err.append(f"Sugestão  : {diag['sugestao']}")
+                for s in diag.get("suspeitas", []):
+                    tp  = "DÉBITO" if s["tipo"] == "D" else "CRÉDITO"
+                    cta = s["conta_debito"] or s["conta_credito"]
+                    linhas_err.append(
+                        f"  ⚡ Ln {s['linha_origem']} {tp} "
+                        f"Cta {cta} R$ {s['valor']:,.2f} — {s['motivo']}"
+                    )
+                linhas_err.append("")
+            erros_bytes_dyn = "\n".join(linhas_err).encode("utf-8-sig")
+            st.error(f"❌ {len(erros):,} lote(s) com erro.")
+            st.download_button(
+                "⬇ Baixar relatório de erros",
+                data=erros_bytes_dyn,
+                file_name="erros_lotes.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        elif st.session_state.erros_bytes:
+            st.download_button(
+                "⬇ Baixar relatório de erros",
+                data=st.session_state.erros_bytes,
+                file_name=st.session_state.erros_nome,
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    with dl3:
+        if st.session_state.log_bytes:
+            st.download_button(
+                "⬇ Baixar log completo",
+                data=st.session_state.log_bytes,
+                file_name=st.session_state.log_nome,
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    # ── 6. LOG INLINE ─────────────────────────────────────────────────────────
+    if exibir_log and st.session_state.log_linhas:
+        st.markdown("#### 🖥 Log de Processamento")
+        log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
+        tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
+        cor      = "#FF4444" if tem_erro else "#1A3050"
+        st.markdown(
+            f"<div class='bloco-log' style='border-color:{cor};'>"
+            f"{log_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_resultados_ecd(exibir_log: bool):
+    """Painel de resultados para SPED ECD (sem resumo de lotes)."""
+    metricas = st.session_state.metricas or {}
+
+    st.markdown("---")
+    st.markdown("## 📊 Resultado da Conversão — SPED ECD")
+
+    if metricas:
+        cols = st.columns(len(metricas))
+        for i, (k, v) in enumerate(metricas.items()):
+            cols[i].metric(k, v)
+
+    st.markdown("#### ⬇ Downloads")
+    dl1, dl2 = st.columns(2)
+
+    with dl1:
+        if st.session_state.resultado_bytes:
+            st.success("Arquivo gerado com sucesso!")
+            st.download_button(
+                "⬇ Baixar arquivo convertido",
+                data=st.session_state.resultado_bytes,
+                file_name=st.session_state.resultado_nome,
+                mime="text/plain",
+                use_container_width=True,
+                type="primary",
+            )
+
+    with dl2:
+        if st.session_state.erros_bytes:
+            st.warning("Arquivo de erros disponível.")
+            st.download_button(
+                "⬇ Baixar relatório de erros",
+                data=st.session_state.erros_bytes,
+                file_name=st.session_state.erros_nome,
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    if exibir_log and st.session_state.log_linhas:
+        st.markdown("#### 🖥 Log de Processamento")
+        log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
+        tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
+        cor      = "#FF4444" if tem_erro else "#1A3050"
+        st.markdown(
+            f"<div class='bloco-log' style='border-color:{cor};'>"
+            f"{log_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERFACE STREAMLIT — MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     st.set_page_config(
@@ -1497,10 +1864,10 @@ def main():
                 status_txt.text("Lendo Excel...")
                 prog_bar.progress(8)
 
-                sh     = st.session_state.sheet_sel
+                sh        = st.session_state.sheet_sel
                 lh_det, _ = detectar_cabecalho_excel(conteudo, sh)
-                lh     = lh_det if auto_head else linha_h
-                df, _  = ler_excel_lote(conteudo, sh, lh)
+                lh        = lh_det if auto_head else linha_h
+                df, _     = ler_excel_lote(conteudo, sh, lh)
                 log.append(f"Excel — Aba: {sh} | Cabeçalho: linha {lh+1}")
                 log.append(f"Linhas carregadas: {len(df):,}")
                 prog_bar.progress(30)
@@ -1542,11 +1909,11 @@ def main():
                     log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
 
                 st.session_state.metricas = {
-                    "Lotes total":  f"{len(resumo):,}",
-                    "Lotes OK":     f"{len(resumo)-len(erros):,}",
-                    "Lotes erro":   f"{len(erros):,}",
-                    "Reg. gerados": f"{n_gravados:,}",
-                    "Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB",
+                    "Lotes total":   f"{len(resumo):,}",
+                    "Lotes OK":      f"{len(resumo)-len(erros):,}",
+                    "Lotes erro":    f"{len(erros):,}",
+                    "Reg. gerados":  f"{n_gravados:,}",
+                    "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
                 }
                 st.session_state.log_linhas = log
                 st.session_state.processado = True
@@ -1610,106 +1977,11 @@ def main():
 
     # ── Resultados ────────────────────────────────────────────────────────────
     if st.session_state.processado:
-        st.markdown("---")
-        st.markdown("#### 📊 Resultado")
-
-        if st.session_state.metricas:
-            cols = st.columns(len(st.session_state.metricas))
-            for i, (k, v) in enumerate(st.session_state.metricas.items()):
-                cols[i].metric(k, v)
-
-        if st.session_state.resumo:
-            st.markdown("#### ✅ Validação dos Lotes")
-            rows = []
-            for v in st.session_state.resumo:
-                rows.append({
-                    "Lote":      v["num_lote"],
-                    "Linhas":    v["faixa_linhas"],
-                    "Data":      v["data"],
-                    "Débito":    f"R$ {v['total_debito']:.2f}",
-                    "Crédito":   f"R$ {v['total_credito']:.2f}",
-                    "Diferença": f"R$ {v['diferenca']:.2f}",
-                    "Status":    "✔ OK" if v["balanceado"] else "✖ ERRO",
-                })
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            erros = st.session_state.erros_lote
-            if erros:
-                st.markdown("#### ⚠ Diagnóstico dos Lotes com Erro")
-                for e in erros:
-                    with st.expander(
-                        f"Lote {e['num_lote']} — Linhas {e['faixa_linhas']} "
-                        f"— Diferença R$ {e['diferenca']:.2f}",
-                        expanded=False,
-                    ):
-                        diag = e.get("diagnostico", {})
-                        st.markdown(f"**Sugestão:** {diag.get('sugestao', '')}")
-                        suspeitas = diag.get("suspeitas", [])
-                        if suspeitas:
-                            st.markdown("**⚡ Linhas suspeitas:**")
-                            for s in suspeitas:
-                                tp  = "DÉBITO" if s["tipo"] == "D" else "CRÉDITO"
-                                cta = s["conta_debito"] or s["conta_credito"]
-                                st.markdown(
-                                    f"- Ln `{s['linha_origem']}` {tp} "
-                                    f"Conta `{cta}` R$ `{s['valor']:.2f}` — {s['motivo']}"
-                                )
-                        linhas_det = diag.get("linhas", [])
-                        if linhas_det:
-                            df_det = pd.DataFrame(linhas_det)[[
-                                "linha_origem", "tipo", "conta_debito",
-                                "conta_credito", "valor", "descricao",
-                            ]]
-                            st.dataframe(df_det, use_container_width=True, hide_index=True)
-
-        st.markdown("#### ⬇ Downloads")
-        dl1, dl2, dl3 = st.columns(3)
-        with dl1:
-            if st.session_state.resultado_bytes:
-                st.success("Arquivo gerado com sucesso!")
-                st.download_button(
-                    "⬇ Baixar arquivo convertido",
-                    data=st.session_state.resultado_bytes,
-                    file_name=st.session_state.resultado_nome,
-                    mime="text/plain",
-                    use_container_width=True,
-                    type="primary",
-                )
-        with dl2:
-            if st.session_state.erros_bytes:
-                n_err = len(st.session_state.erros_lote or [])
-                st.warning(f"{n_err} lote(s) com erro.")
-                st.download_button(
-                    "⬇ Baixar relatório de erros",
-                    data=st.session_state.erros_bytes,
-                    file_name=st.session_state.erros_nome,
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-        with dl3:
-            if st.session_state.log_bytes:
-                st.download_button(
-                    "⬇ Baixar log completo",
-                    data=st.session_state.log_bytes,
-                    file_name=st.session_state.log_nome,
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-
-        if exibir_log and st.session_state.log_linhas:
-            st.markdown("#### 🖥 Log de Processamento")
-            log_txt = "\n".join(str(l) for l in st.session_state.log_linhas)
-            tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
-            cor = "#FF4444" if tem_erro else "#1A3050"
-            st.markdown(
-                f"<div class='bloco-log' style='border-color:{cor};'>"
-                f"{log_txt}</div>",
-                unsafe_allow_html=True,
-            )
+        tipo_proc = st.session_state.tipo_detectado
+        if tipo_proc == "ecd":
+            _render_resultados_ecd(exibir_log)
+        else:
+            _render_resultados_lote(exibir_log)
 
 
 if __name__ == "__main__":
