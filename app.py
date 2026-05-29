@@ -24,8 +24,8 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════════
-VERSAO        = "V1.3"
-CHUNK_SIZE    = 100_000   # era 20_000 — menos overhead de setup por chunk
+VERSAO        = "V1.4"
+CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
 MAX_UPLOAD_MB = 200
@@ -559,12 +559,27 @@ def _agrupar(partidas):
             ag[chave]["descr_hist"] = p["descr_hist"]
     return list(ag.values())
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLASSIFICAÇÃO DO TIPO DE LANÇAMENTO
+# D = 1 débito  → vários créditos  (débito vem primeiro)
+# C = 1 crédito → vários débitos   (crédito vem primeiro)
+# X = 1 débito  → 1 crédito
+# V = vários débitos → vários créditos
+# ─────────────────────────────────────────────────────────────────────────────
 def _classif(nd, nc):
     if nd == 1 and nc == 1: return "X"
-    if nd == 1 and nc  > 1: return "D"
-    if nc == 1 and nd  > 1: return "C"
+    if nd == 1 and nc  > 1: return "D"   # 1 débito → N créditos
+    if nd  > 1 and nc == 1: return "C"   # N débitos → 1 crédito
     return "V"
 
+def tipo_lancamento(nd, nc):
+    return _classif(nd, nc)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GERAÇÃO DAS LINHAS 6100 — ECD
+# Tipo D: 1ª linha só débito (crédito vazio), demais só créditos (débito vazio)
+# Tipo C: 1ª linha só crédito (débito vazio), demais só débitos (crédito vazio)
+# ─────────────────────────────────────────────────────────────────────────────
 def _linhas_ecd(lanc):
     partidas = _agrupar(lanc["partidas"])
     debs  = [p for p in partidas if p["dc"] == "D"]
@@ -580,21 +595,36 @@ def _linhas_ecd(lanc):
         return fmt_reg_6100(data, db_conta, cr_conta, valor, "", descr)
 
     if tipo == "X":
+        # 1 débito × 1 crédito — uma linha com ambos
         h = _montar_hist_ecd(debs[0]) or hist
         out.append(linha(debs[0]["conta"], creds[0]["conta"], debs[0]["valor"], h))
+
     elif tipo == "D":
+        # 1 débito → N créditos
+        # 1ª linha: só o débito (crédito vazio)
+        h = _montar_hist_ecd(debs[0]) or hist
+        out.append(linha(debs[0]["conta"], "", debs[0]["valor"], h))
+        # demais linhas: só os créditos (débito vazio)
         for cr in creds:
             h = _montar_hist_ecd(cr) or _montar_hist_ecd(debs[0]) or hist
-            out.append(linha(debs[0]["conta"], cr["conta"], cr["valor"], h))
+            out.append(linha("", cr["conta"], cr["valor"], h))
+
     elif tipo == "C":
+        # N débitos → 1 crédito
+        # 1ª linha: só o crédito (débito vazio)
+        h = _montar_hist_ecd(creds[0]) or hist
+        out.append(linha("", creds[0]["conta"], creds[0]["valor"], h))
+        # demais linhas: só os débitos (crédito vazio)
         for db in debs:
             h = _montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
-            out.append(linha(db["conta"], creds[0]["conta"], db["valor"], h))
-    else:
+            out.append(linha(db["conta"], "", db["valor"], h))
+
+    else:  # V — vários × vários
         for db in debs:
             for cr in creds:
                 h = _montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
                 out.append(linha(db["conta"], cr["conta"], cr["valor"], h))
+
     return out
 
 def _gerar_ecd(ecd, log, prog_bar, status):
@@ -663,14 +693,8 @@ def _filtrar_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     return chunk[m_dv & m_conta & m_valor].copy()
 
 def ler_txt_streaming(conteudo: bytes):
-    """
-    Gerador: yield (chunk_filtrado, encoding) um chunk por vez.
-    Usa BytesIO direto — sem decode antecipado do arquivo inteiro.
-    Engine C (3-5x mais rápido que engine python).
-    Sem gc.collect() no loop quente.
-    """
     enc = _detectar_encoding_bytes(conteudo)
-    buf = io.BytesIO(conteudo)   # zero cópia extra — pandas decodifica por chunk
+    buf = io.BytesIO(conteudo)
 
     reader = pd.read_csv(
         buf,
@@ -680,7 +704,7 @@ def ler_txt_streaming(conteudo: bytes):
         dtype=str,
         encoding=enc,
         on_bad_lines="skip",
-        engine="c",              # era "python" — 3-5x mais rápido
+        engine="c",
         usecols=range(len(COLS_PADRAO)),
         chunksize=CHUNK_SIZE,
     )
@@ -696,13 +720,6 @@ def ler_txt_streaming(conteudo: bytes):
         if len(filtrado) > 0:
             yield filtrado, enc
         del filtrado
-        # sem gc.collect() no loop — reduz overhead em 200k+ linhas
-
-def tipo_lancamento(nd, nc):
-    if nd == 1 and nc == 1: return "X"
-    if nd == 1 and nc  > 1: return "D"
-    if nd  > 1 and nc == 1: return "C"
-    return "V"
 
 def diagnosticar_lote(W: pd.DataFrame, dif: float) -> dict:
     debs = W[W["td"]].copy()
@@ -749,9 +766,16 @@ def diagnosticar_lote(W: pd.DataFrame, dif: float) -> dict:
         "sugestao":      sugestao,
     }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GERAÇÃO DAS LINHAS 6100 — TXT / EXCEL
+# Tipo D: 1ª linha só débito (crédito vazio), demais só créditos (débito vazio)
+# Tipo C: 1ª linha só crédito (débito vazio), demais só débitos (crédito vazio)
+# ─────────────────────────────────────────────────────────────────────────────
 def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list:
     out = []
+
     if tp == "X":
+        # 1 débito × 1 crédito — uma linha com ambos
         rd   = debs.iloc[0]
         rc   = creds.iloc[0]
         desc = _norm_hist(str(rd["desc"]) or str(rc["desc"]))
@@ -759,23 +783,50 @@ def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list
             formatar_data(rd["dt"]), str(rd["cd"]), str(rc["cc"]),
             float(rd["vf"]), "", desc,
         ))
+
     elif tp == "D":
-        rd = debs.iloc[0]
+        # 1 débito → N créditos
+        # 1ª linha: só o débito (crédito vazio)
+        rd   = debs.iloc[0]
+        desc = _norm_hist(str(rd["desc"]))
+        out.append(fmt_reg_6100(
+            formatar_data(rd["dt"]),
+            str(rd["cd"]),  # débito preenchido
+            "",             # crédito VAZIO
+            float(rd["vf"]), "", desc,
+        ))
+        # demais linhas: só os créditos (débito vazio)
         for _, rc in creds.iterrows():
-            desc = _norm_hist(str(rd["desc"]) or str(rc["desc"]))
+            desc = _norm_hist(str(rc["desc"]) or str(rd["desc"]))
             out.append(fmt_reg_6100(
-                formatar_data(rd["dt"]), str(rd["cd"]), str(rc["cc"]),
+                formatar_data(rd["dt"]),
+                "",             # débito VAZIO
+                str(rc["cc"]),  # crédito preenchido
                 float(rc["vf"]), "", desc,
             ))
+
     elif tp == "C":
-        rc = creds.iloc[0]
+        # N débitos → 1 crédito
+        # 1ª linha: só o crédito (débito vazio)
+        rc   = creds.iloc[0]
+        desc = _norm_hist(str(rc["desc"]))
+        out.append(fmt_reg_6100(
+            formatar_data(debs.iloc[0]["dt"]),
+            "",             # débito VAZIO
+            str(rc["cc"]),  # crédito preenchido
+            float(rc["vf"]), "", desc,
+        ))
+        # demais linhas: só os débitos (crédito vazio)
         for _, rd in debs.iterrows():
             desc = _norm_hist(str(rd["desc"]) or str(rc["desc"]))
             out.append(fmt_reg_6100(
-                formatar_data(rd["dt"]), str(rd["cd"]), str(rc["cc"]),
+                formatar_data(rd["dt"]),
+                str(rd["cd"]),  # débito preenchido
+                "",             # crédito VAZIO
                 float(rd["vf"]), "", desc,
             ))
-    else:
+
+    else:  # V — vários × vários
         cross = debs[["cd", "vf", "desc", "dt"]].merge(
             creds[["cc", "desc"]].rename(columns={"desc": "desc_c"}),
             how="cross",
@@ -786,6 +837,7 @@ def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list
                 formatar_data(row["dt"]), str(row["cd"]), str(row["cc"]),
                 float(row["vf"]), "", desc,
             ))
+
     return out
 
 def _flush_lote(
@@ -795,11 +847,6 @@ def _flush_lote(
     resumo:    list,
     erros:     list,
 ) -> None:
-    """
-    Processa um único lote completo.
-    Sem gc.collect() — chamado externamente só ao final do processamento.
-    Sem .copy() desnecessário nos grupos.
-    """
     if df_lote is None or len(df_lote) == 0:
         return
 
@@ -812,7 +859,6 @@ def _flush_lote(
     vc_arr  = np.where(tc_arr, v_float, 0.0)
     dt_arr  = df_lote["Data"].fillna("").astype(str).to_numpy()
 
-    # _norm_hist apenas nas linhas que realmente precisam (contêm não-ASCII ou pipe)
     col_desc = df_lote["Complemento Histórico"].fillna("").astype(str)
     desc_arr = col_desc.to_numpy(dtype=object)
     mask_esp = col_desc.str.contains(r'[^\x20-\x7E]|\|', regex=True, na=False).to_numpy()
@@ -868,18 +914,8 @@ def _flush_lote(
 
     resumo.append(entrada)
     del W
-    # sem gc.collect() aqui — Python 3.14 gerencia bem objetos de curta duração
 
 def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
-    """
-    Processa o arquivo TXT em streaming real.
-    Correções aplicadas:
-    - BytesIO direto (sem decode antecipado)
-    - engine="c" no read_csv
-    - CHUNK_SIZE=100_000
-    - gc.collect() removido dos loops quentes
-    - .copy() removido dos groupby
-    """
     saida_buf  = io.StringIO()
     saida_buf.write(fmt_reg_0000(ni) + "\n")
 
@@ -907,7 +943,6 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
             chunk_df = pd.concat([pendente, chunk_df], ignore_index=True)
             pendente = None
 
-        # numerar lotes dentro do chunk
         if usa_inicia:
             inicia   = chunk_df["Inicia Lote"].fillna("").astype(str).str.strip()
             marcador = (inicia != "").to_numpy(dtype=bool)
@@ -932,26 +967,24 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
         ultimo_lote = int(chunk_df["_num_lote"].max())
         mask_ultimo = chunk_df["_num_lote"] == ultimo_lote
         pendente    = chunk_df[mask_ultimo].copy()
-        chunk_proc  = chunk_df[~mask_ultimo]   # sem .copy() desnecessário
+        chunk_proc  = chunk_df[~mask_ultimo]
         del chunk_df
 
         for nl, grupo in chunk_proc.groupby("_num_lote", sort=True):
-            _flush_lote(grupo, int(nl), saida_buf, resumo, erros)  # sem .copy()
+            _flush_lote(grupo, int(nl), saida_buf, resumo, erros)
 
         num_lote_g = ultimo_lote - 1
         del chunk_proc
 
-        # gc.collect() a cada 5 chunks — não a cada iteração
         if chunk_count % 5 == 0:
             gc.collect()
 
-    # último lote pendente
     if pendente is not None and len(pendente) > 0:
         num_lote_g += 1
-        _flush_lote(pendente, num_lote_g, saida_buf, resumo, erros)  # sem .copy()
+        _flush_lote(pendente, num_lote_g, saida_buf, resumo, erros)
         del pendente
 
-    gc.collect()  # único gc.collect() garantido — ao final
+    gc.collect()
 
     log.append(f"  Linhas lidas       : {total_lins:,}")
     log.append(f"  Ignoradas          : {ignoradas:,}")
@@ -1043,16 +1076,15 @@ def montar_lotes_excel(df: pd.DataFrame) -> tuple:
     return R, "Inicia Lote" if tem_ini else "Data + Descrição"
 
 def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
-    """Processa Excel via _flush_lote. Sem .copy() por grupo, sem gc.collect() no loop."""
     saida_buf = io.StringIO()
     saida_buf.write(fmt_reg_0000(ni) + "\n")
     resumo: list = []
     erros:  list = []
 
     for nl, grupo in df.groupby("_num_lote", sort=True):
-        _flush_lote(grupo, int(nl), saida_buf, resumo, erros)  # sem .copy()
+        _flush_lote(grupo, int(nl), saida_buf, resumo, erros)
 
-    gc.collect()  # único gc.collect() ao final
+    gc.collect()
 
     log.append(f"  Lotes processados  : {len(resumo):,}")
     log.append(f"  Lotes OK           : {len(resumo) - len(erros):,}")
@@ -1187,16 +1219,6 @@ def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
 # PAINEL DE RESULTADOS — LOTES
 # ═══════════════════════════════════════════════════════════════════════════════
 def _render_resultados_lote(exibir_log: bool):
-    """
-    Painel completo de resultados para TXT e Excel:
-    - Cartão de status geral (verde/vermelho)
-    - Barra de progresso de fechamento
-    - Totais D/C/diferença
-    - Tabela filtrada com cores
-    - Diagnóstico expandível por lote com erro
-    - Downloads (arquivo + erros dinâmico + log)
-    - Log inline
-    """
     resumo   = st.session_state.resumo     or []
     erros    = st.session_state.erros_lote or []
     metricas = st.session_state.metricas   or {}
@@ -1204,13 +1226,11 @@ def _render_resultados_lote(exibir_log: bool):
     st.markdown("---")
     st.markdown("## 📊 Resultado da Conversão")
 
-    # ── 1. MÉTRICAS GERAIS ────────────────────────────────────────────────────
     if metricas:
         cols = st.columns(len(metricas))
         for i, (k, v) in enumerate(metricas.items()):
             cols[i].metric(k, v)
 
-    # ── 2. PAINEL DE FECHAMENTO ───────────────────────────────────────────────
     if resumo:
         total    = len(resumo)
         n_ok     = sum(1 for v in resumo if v["balanceado"])
@@ -1222,7 +1242,6 @@ def _render_resultados_lote(exibir_log: bool):
         dif_geral = round(abs(td_total - tc_total), 2)
         tudo_ok   = dif_geral < TOL_VALOR and n_err == 0
 
-        # cartão de status
         if tudo_ok:
             st.markdown(
                 "<div class='card-ok'>"
@@ -1247,7 +1266,6 @@ def _render_resultados_lote(exibir_log: bool):
                 unsafe_allow_html=True,
             )
 
-        # barra de fechamento
         st.markdown("#### 🔒 Fechamento dos Lotes")
         col_barra, col_nums = st.columns([3, 1])
         with col_barra:
@@ -1260,7 +1278,6 @@ def _render_resultados_lote(exibir_log: bool):
             st.metric("✅ Balanceados", f"{n_ok:,}")
             st.metric("❌ Com erro",    f"{n_err:,}")
 
-        # totais D / C / diferença
         col_d, col_c, col_dif = st.columns(3)
         col_d.metric("Total Débito",   f"R$ {td_total:,.2f}")
         col_c.metric("Total Crédito",  f"R$ {tc_total:,.2f}")
@@ -1271,7 +1288,6 @@ def _render_resultados_lote(exibir_log: bool):
             delta_color="normal" if tudo_ok else "inverse",
         )
 
-    # ── 3. TABELA DE LOTES ────────────────────────────────────────────────────
     if resumo:
         st.markdown("#### 📋 Detalhe por Lote")
 
@@ -1323,7 +1339,6 @@ def _render_resultados_lote(exibir_log: bool):
         else:
             st.info("Nenhum lote encontrado para o filtro selecionado.")
 
-    # ── 4. DIAGNÓSTICO DOS LOTES COM ERRO ────────────────────────────────────
     if erros:
         st.markdown("#### 🔍 Diagnóstico dos Lotes Desbalanceados")
 
@@ -1403,10 +1418,12 @@ def _render_resultados_lote(exibir_log: bool):
                         hide_index=True,
                     )
 
-    # ── 5. DOWNLOADS ──────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### ⬇ Downloads")
     dl1, dl2, dl3 = st.columns(3)
+
+    n_err = len(erros)
+    n_ok  = len(resumo) - n_err
 
     with dl1:
         if st.session_state.resultado_bytes:
@@ -1424,7 +1441,6 @@ def _render_resultados_lote(exibir_log: bool):
             )
 
     with dl2:
-        # gerar relatório de erros on-the-fly se houver erros de lote
         if erros:
             linhas_err = [
                 "RELATÓRIO DE LOTES DESBALANCEADOS",
@@ -1482,7 +1498,6 @@ def _render_resultados_lote(exibir_log: bool):
                 use_container_width=True,
             )
 
-    # ── 6. LOG INLINE ─────────────────────────────────────────────────────────
     if exibir_log and st.session_state.log_linhas:
         st.markdown("#### 🖥 Log de Processamento")
         log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
@@ -1496,7 +1511,6 @@ def _render_resultados_lote(exibir_log: bool):
 
 
 def _render_resultados_ecd(exibir_log: bool):
-    """Painel de resultados para SPED ECD (sem resumo de lotes)."""
     metricas = st.session_state.metricas or {}
 
     st.markdown("---")
@@ -1568,7 +1582,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚙ Configurações")
         st.markdown("---")
@@ -1592,7 +1605,6 @@ def main():
         st.markdown(f"**Limite de upload:** {MAX_UPLOAD_MB} MB")
         st.markdown(f"**Chunk de leitura:** {CHUNK_SIZE:,} linhas")
 
-    # ── Upload ────────────────────────────────────────────────────────────────
     st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
     uploaded = st.file_uploader(
         f"Arraste ou clique para selecionar (Excel, TXT ou SPED ECD — máx. {MAX_UPLOAD_MB} MB)",
@@ -1657,7 +1669,6 @@ def main():
     )
     st.markdown("")
 
-    # ── Configuração Excel ────────────────────────────────────────────────────
     sheet_sel = ""
     linha_h   = 3
     auto_head = True
@@ -1682,7 +1693,6 @@ def main():
                     "Linha do cabeçalho", min_value=1, max_value=50, value=4
                 ) - 1
 
-    # ── CNPJ ─────────────────────────────────────────────────────────────────
     ni = ""; ok_insc = False; ti = ""; inf = ""
 
     if tipo == "ecd":
@@ -1740,7 +1750,6 @@ def main():
             else:
                 st.error("✖ CNPJ/CPF inválido — verifique os dígitos.")
 
-    # ── Botões ────────────────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
 
@@ -1768,7 +1777,6 @@ def main():
         _reset()
         st.rerun()
 
-    # ── Processamento ─────────────────────────────────────────────────────────
     if btn_converter and ok_insc:
         conteudo   = st.session_state.arquivo_bytes
         log        = []
@@ -1778,7 +1786,6 @@ def main():
         prog_bar   = st.progress(0)
 
         try:
-            # ══ SPED ECD ══════════════════════════════════════════════════════
             if tipo == "ecd":
                 status_txt.text("Lendo SPED ECD...")
                 log.append("── LEITURA SPED ECD ──")
@@ -1858,7 +1865,6 @@ def main():
                     prog_bar.progress(100)
                     status_txt.text("Concluído!")
 
-            # ══ EXCEL ═════════════════════════════════════════════════════════
             elif tipo == "excel":
                 crono.etapa("Leitura Excel")
                 status_txt.text("Lendo Excel...")
@@ -1920,7 +1926,6 @@ def main():
                 prog_bar.progress(100)
                 status_txt.text("Concluído!")
 
-            # ══ TXT — STREAMING ═══════════════════════════════════════════════
             else:
                 crono.etapa("Processamento streaming")
                 mb_txt = len(conteudo) / (1024 * 1024)
@@ -1975,7 +1980,6 @@ def main():
 
         st.rerun()
 
-    # ── Resultados ────────────────────────────────────────────────────────────
     if st.session_state.processado:
         tipo_proc = st.session_state.tipo_detectado
         if tipo_proc == "ecd":
