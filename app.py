@@ -23,7 +23,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════════
-VERSAO      = "V1.0"
+VERSAO      = "V1.1"
 CHUNK_SIZE  = 50_000
 BUFFER_IO   = 8 * 1024 * 1024
 WRITE_CHUNK = 10_000
@@ -160,9 +160,52 @@ class Cronometro:
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITÁRIOS GERAIS
 # ═══════════════════════════════════════════════════════════════════════════════
-def sanitizar_texto(t):
-    if not t: return ""
-    return re.sub(r" {2,}", " ", t.replace("|", " ")).strip()
+
+# ── Mapa de caracteres especiais (compartilhado ECD + TXT) ───────────────────
+_MAPA_ESPECIAIS = {
+    "\u2018":"'","\u2019":"'","\u201C":'"',"\u201D":'"',
+    "\u2013":"-","\u2014":"-","\u2026":"...","\u00A0":" ",
+    "\u00D7":"x","\u00F7":"/","\u20AC":"EUR","\u00A7":"S/",
+    "\u00AE":"(R)","\u00A9":"(C)","\u2122":"(TM)",
+}
+
+def _norm_hist(texto: str) -> str:
+    """
+    Normalização canônica de histórico — usada por AMBOS os fluxos.
+    • Substitui caracteres especiais unicode
+    • Remove caracteres de controle
+    • Garante compatibilidade latin-1
+    • Remove pipes (conflito com separador do layout)
+    • Colapsa espaços duplos
+    • Limita a 250 caracteres
+    """
+    if not texto:
+        return ""
+    for o, d in _MAPA_ESPECIAIS.items():
+        texto = texto.replace(o, d)
+    texto = unicodedata.normalize("NFC", texto)
+    res = []
+    for ch in texto:
+        if ord(ch) < 0x20 and ord(ch) not in (9, 10, 13):
+            continue
+        if ch == "|":          # pipe conflita com separador do layout
+            res.append(" ")
+            continue
+        try:
+            ch.encode("latin-1")
+            res.append(ch)
+        except UnicodeEncodeError:
+            base = unicodedata.normalize("NFD", ch)[0]
+            try:
+                base.encode("latin-1")
+                res.append(base)
+            except UnicodeEncodeError:
+                pass
+    return re.sub(r" {2,}", " ", "".join(res)).strip()[:250]
+
+def sanitizar_texto(t: str) -> str:
+    """Wrapper mantido para compatibilidade — delega para _norm_hist."""
+    return _norm_hist(str(t) if t else "")
 
 def limpar_int(v):
     try:    return str(int(float(str(v).strip())))
@@ -242,15 +285,71 @@ def fmt_cpf(n):
     return f"{c[:3]}.{c[3:6]}.{c[6:9]}-{c[9:]}" if len(c)==11 else n
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FORMATAÇÃO DE REGISTROS
+# FORMATAÇÃO DE REGISTROS — LAYOUT UNIFICADO
 # ═══════════════════════════════════════════════════════════════════════════════
-def fmt_reg_0000(ni): return f"|0000|{ni}|"
-def fmt_reg_6000(tp): return f"|6000|{tp}||||"
+def fmt_reg_0000(ni: str) -> str:
+    return f"|0000|{ni}|"
 
-def fmt_reg_6100(data, deb, cred, valor, cod_hist, desc, usuario, filial, scp):
-    valor_fmt = f"{valor:.2f}".replace(".", ",")
-    return (f"|6100|{data}|{deb}|{cred}|{valor_fmt}"
-            f"|{cod_hist}|{sanitizar_texto(desc)}|{usuario}|{filial}|{scp}|")
+def fmt_reg_6000(tp: str) -> str:
+    return f"|6000|{tp}||||"
+
+def _fmt_valor_layout(valor) -> str:
+    """
+    Formata valor numérico para o layout:  1234,56
+    Aceita float, int ou string.
+    """
+    if isinstance(valor, (int, float)):
+        return f"{float(valor):.2f}".replace(".", ",")
+    v = str(valor).strip()
+    # normaliza separadores
+    if "." in v and "," in v:
+        if v.index(".") < v.index(","):          # 1.234,56
+            v = v.replace(".", "").replace(",", ".")
+        else:                                     # 1,234.56
+            v = v.replace(",", "")
+    elif "," in v:
+        v = v.replace(",", ".")
+    try:
+        return f"{float(v):.2f}".replace(".", ",")
+    except ValueError:
+        return "0,00"
+
+def fmt_reg_6100(
+    data:     str,
+    deb:      str,
+    cred:     str,
+    valor,
+    cod_hist: str,
+    desc:     str,
+    # os três parâmetros abaixo existiam na versão anterior mas
+    # não fazem parte do layout padrão do Domínio — mantidos como
+    # parâmetros opcionais para não quebrar chamadas existentes,
+    # porém IGNORADOS na montagem da linha.
+    _usuario: str = "",
+    _filial:  str = "",
+    _scp:     str = "",
+) -> str:
+    """
+    Gera registro |6100| no formato IDÊNTICO ao produzido pelo fluxo ECD:
+
+        |6100|DATA|DEB|CRED|VALOR||HIST|||||||
+
+    Campos fixos (13 posições entre pipes):
+      [1] 6100
+      [2] data
+      [3] conta débito
+      [4] conta crédito
+      [5] valor          → vírgula como separador decimal
+      [6] vazio          → reservado (cod_hist não é gravado aqui)
+      [7] histórico/desc → normalizado via _norm_hist
+      [8..13] vazios     → seis campos extras exigidos pelo layout
+    """
+    valor_fmt = _fmt_valor_layout(valor)
+    hist_fmt  = _norm_hist(desc)          # normalização canônica
+    return (
+        f"|6100|{data}|{deb}|{cred}|{valor_fmt}"
+        f"||{hist_fmt}|||||||"
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DETECÇÃO DE ENCODING
@@ -275,7 +374,6 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
 # IDENTIFICAÇÃO AUTOMÁTICA DO TIPO DE ARQUIVO
 # ═══════════════════════════════════════════════════════════════════════════════
 def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
-    """Retorna 'ecd', 'excel' ou 'lote'."""
     ext = os.path.splitext(nome_arquivo)[1].lower()
     if ext in (".xlsx", ".xls", ".xlsm"):
         return "excel"
@@ -305,27 +403,6 @@ def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 # ▌▌▌ MÓDULO SPED ECD ▌▌▌
 # ═══════════════════════════════════════════════════════════════════════════════
-_MAPA_ESPECIAIS = {
-    "\u2018":"'","\u2019":"'","\u201C":'"',"\u201D":'"',
-    "\u2013":"-","\u2014":"-","\u2026":"...","\u00A0":" ",
-    "\u00D7":"x","\u00F7":"/","\u20AC":"EUR","\u00A7":"S/",
-    "\u00AE":"(R)","\u00A9":"(C)","\u2122":"(TM)",
-}
-
-def _norm_hist(texto):
-    if not texto: return ""
-    for o, d in _MAPA_ESPECIAIS.items(): texto = texto.replace(o, d)
-    texto = unicodedata.normalize("NFC", texto)
-    res = []
-    for ch in texto:
-        if ord(ch) < 0x20 and ord(ch) not in (9,10,13): continue
-        try:    ch.encode("latin-1"); res.append(ch)
-        except:
-            base = unicodedata.normalize("NFD", ch)[0]
-            try:    base.encode("latin-1"); res.append(base)
-            except: pass
-    return re.sub(r" {2,}", " ", "".join(res)).strip()[:250]
-
 def _split_pipe(linha):
     c = linha.strip().split("|")
     if c and c[0]  == "": c = c[1:]
@@ -339,11 +416,6 @@ class SpedECD:
         self.cnpj=""; self.contas={}; self.historicos={}; self.lancamentos=[]
 
 def _parse_ecd(conteudo: bytes, log: list) -> tuple:
-    """
-    Faz o parse do SPED ECD.
-    Retorna (SpedECD, registros_erro).
-    O CNPJ é extraído automaticamente do registro 0000.
-    """
     ecd = SpedECD(); lote_atual=None; erros_parse=0
     registros_erro=[]; contas_invalidas=0
 
@@ -429,19 +501,6 @@ def _fmt_data_ecd(d):
     if len(d)==8 and d.isdigit(): return f"{d[:2]}/{d[2:4]}/{d[4:]}"
     return d
 
-def _fmt_valor_ecd(v):
-    if isinstance(v, float): return f"{v:.2f}".replace(".",",")
-    v = str(v).strip()
-    if "." in v and "," not in v: v = v.replace(".",",")
-    elif "." in v and "," in v:
-        if v.index(".")<v.index(","): v=v.replace(".","").replace(",",".").replace(".",",")
-    if "," not in v: v += ",00"
-    else:
-        p=v.split(",")
-        if len(p[1])<2: p[1]=p[1].ljust(2,"0")
-        v=",".join(p)
-    return v
-
 def _str2float(v):
     if isinstance(v,(int,float)): return float(v)
     v=str(v).strip()
@@ -452,11 +511,11 @@ def _str2float(v):
     try:    return float(v)
     except: return 0.0
 
-def _montar_hist(p): return p.get("descr_hist","").strip()
+def _montar_hist_ecd(p): return p.get("descr_hist","").strip()
 
 def _primeiro_hist(partidas):
     for p in partidas:
-        h=_montar_hist(p)
+        h=_montar_hist_ecd(p)
         if h: return h
     return ""
 
@@ -479,27 +538,39 @@ def _classif(nd,nc):
     return "V"
 
 def _linhas_ecd(lanc):
-    partidas=_agrupar(lanc["partidas"])
-    debs=[p for p in partidas if p["dc"]=="D"]
-    creds=[p for p in partidas if p["dc"]=="C"]
-    if not debs or not creds: return []
-    data=_fmt_data_ecd(lanc["data"])
-    tipo=_classif(len(debs),len(creds))
-    hist=_primeiro_hist(lanc["partidas"])
-    out=[fmt_reg_6000(tipo)]
-    def hd(db):
-        val=_fmt_valor_ecd(db["valor"]); h=_montar_hist(db) or hist
-        return f"|6100|{data}|{db['conta']}||{val}||{h}|||||||"
-    def hc(cr):
-        val=_fmt_valor_ecd(cr["valor"]); h=_montar_hist(cr) or hist
-        return f"|6100|{data}||{cr['conta']}|{val}||{h}|||||||"
-    def hx(db,cr):
-        val=_fmt_valor_ecd(db["valor"]); h=_montar_hist(db) or hist
-        return f"|6100|{data}|{db['conta']}|{cr['conta']}|{val}||{h}|||||||"
-    if   tipo=="X": out.append(hx(debs[0],creds[0]))
-    elif tipo=="D": [out.append(hd(db)) for db in debs]; [out.append(hc(cr)) for cr in creds]
-    elif tipo=="C": [out.append(hc(cr)) for cr in creds]; [out.append(hd(db)) for db in debs]
-    else:           [out.append(hd(db)) for db in debs]; [out.append(hc(cr)) for cr in creds]
+    """Gera linhas 6000+6100 para um lançamento ECD."""
+    partidas = _agrupar(lanc["partidas"])
+    debs  = [p for p in partidas if p["dc"]=="D"]
+    creds = [p for p in partidas if p["dc"]=="C"]
+    if not debs or not creds:
+        return []
+    data  = _fmt_data_ecd(lanc["data"])
+    tipo  = _classif(len(debs), len(creds))
+    hist  = _primeiro_hist(lanc["partidas"])
+    out   = [fmt_reg_6000(tipo)]
+
+    def linha(db_conta, cr_conta, valor, descr):
+        return fmt_reg_6100(data, db_conta, cr_conta, valor, "", descr)
+
+    if tipo == "X":
+        h = _montar_hist_ecd(debs[0]) or hist
+        out.append(linha(debs[0]["conta"], creds[0]["conta"], debs[0]["valor"], h))
+    elif tipo == "D":
+        # 1 débito, N créditos: uma linha por crédito
+        for cr in creds:
+            h = _montar_hist_ecd(cr) or _montar_hist_ecd(debs[0]) or hist
+            out.append(linha(debs[0]["conta"], cr["conta"], cr["valor"], h))
+    elif tipo == "C":
+        # N débitos, 1 crédito: uma linha por débito
+        for db in debs:
+            h = _montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
+            out.append(linha(db["conta"], creds[0]["conta"], db["valor"], h))
+    else:
+        # N débitos × N créditos: produto cartesiano
+        for db in debs:
+            for cr in creds:
+                h = _montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
+                out.append(linha(db["conta"], cr["conta"], cr["valor"], h))
     return out
 
 def _gerar_ecd(ecd, log, prog_bar, status):
@@ -644,7 +715,7 @@ def diagnosticar_lote(g2, dif):
         linhas_det.append({"linha_origem":int(r["lo"]),"data":formatar_data(r["dt"]),
             "conta_debito":str(r["cd"]) if r["td"] else "",
             "conta_credito":str(r["cc"]) if r["tc"] else "",
-            "valor":float(r["vf"]),"descricao":sanitizar_texto(str(r["desc"]))[:70],
+            "valor":float(r["vf"]),"descricao":_norm_hist(str(r["desc"]))[:70],
             "tipo":"D" if r["td"] else "C"})
     suspeitas=[]; dif_abs=abs(dif)
     for r in linhas_det:
@@ -666,54 +737,70 @@ def diagnosticar_lote(g2, dif):
             "linhas":linhas_det,"suspeitas":suspeitas,"sugestao":sugestao}
 
 def _gerar_registros_lote(W_ok, cnt):
-    mask_x=(cnt["nd"]==1)&(cnt["nc"]==1)
-    lotes_x=cnt[mask_x].index; lotes_c=cnt[~mask_x].index
-    if len(lotes_x)>0:
-        Wd=(W_ok[W_ok["td"]&W_ok["nl"].isin(lotes_x)]
-            [["nl","cd","vf","hist","desc","dt","fil"]].copy())
-        Wc=(W_ok[W_ok["tc"]&W_ok["nl"].isin(lotes_x)][["nl","cc"]].copy())
-        M=Wd.merge(Wc,on="nl",how="inner")
-        for _,row in M.iterrows():
-            data=formatar_data(row["dt"]); deb=str(row["cd"]); cred=str(row["cc"])
-            valor=float(row["vf"])
-            hist=limpar_int(row["hist"]) if str(row["hist"]).strip() not in ("","nan") else ""
-            desc=str(row["desc"]).strip()
-            fil=str(row["fil"]).strip() if str(row["fil"]).strip() not in ("","nan") else ""
+    """
+    Gerador de linhas 6000+6100 para lançamentos TXT/Excel.
+    Usa fmt_reg_6100 unificado — saída idêntica ao fluxo ECD.
+    """
+    mask_x = (cnt["nd"]==1) & (cnt["nc"]==1)
+    lotes_x = cnt[mask_x].index
+    lotes_c = cnt[~mask_x].index
+
+    # ── Tipo X: merge vetorizado ──────────────────────────────────────────────
+    if len(lotes_x) > 0:
+        Wd = (W_ok[W_ok["td"] & W_ok["nl"].isin(lotes_x)]
+              [["nl","cd","vf","desc","dt"]].copy())
+        Wc = (W_ok[W_ok["tc"] & W_ok["nl"].isin(lotes_x)]
+              [["nl","cc"]].copy())
+        M  = Wd.merge(Wc, on="nl", how="inner")
+        for _, row in M.iterrows():
+            data  = formatar_data(row["dt"])
+            desc  = _norm_hist(str(row["desc"]).strip())
             yield fmt_reg_6000("X")
-            yield fmt_reg_6100(data,deb,cred,valor,hist,desc,"",fil,"")
-        del Wd,Wc,M; gc.collect()
-    if len(lotes_c)>0:
-        Wcomp=W_ok[W_ok["nl"].isin(lotes_c)]
-        for nl_c,g2 in Wcomp.groupby("nl",sort=False):
-            nd=int(cnt.loc[nl_c,"nd"]) if nl_c in cnt.index else 0
-            nc2=int(cnt.loc[nl_c,"nc"]) if nl_c in cnt.index else 0
-            tp=tipo_lancamento(nd,nc2)
+            yield fmt_reg_6100(data, str(row["cd"]), str(row["cc"]),
+                               float(row["vf"]), "", desc)
+        del Wd, Wc, M; gc.collect()
+
+    # ── Tipos D / C / V ───────────────────────────────────────────────────────
+    if len(lotes_c) > 0:
+        Wcomp = W_ok[W_ok["nl"].isin(lotes_c)]
+        for nl_c, g2 in Wcomp.groupby("nl", sort=False):
+            nd  = int(cnt.loc[nl_c, "nd"]) if nl_c in cnt.index else 0
+            nc2 = int(cnt.loc[nl_c, "nc"]) if nl_c in cnt.index else 0
+            tp  = tipo_lancamento(nd, nc2)
             yield fmt_reg_6000(tp)
-            debs=g2[g2["td"]].reset_index(drop=True)
-            creds=g2[g2["tc"]].reset_index(drop=True)
-            if tp=="D":
-                rd=debs.iloc[0]; data=formatar_data(rd["dt"])
-                hist=limpar_int(rd["hist"]) if str(rd["hist"]).strip() not in ("","nan") else ""
-                fil=str(rd["fil"]).strip() if str(rd["fil"]).strip() not in ("","nan") else ""
-                for _,rc in creds.iterrows():
-                    desc=str(rd["desc"]).strip() or str(rc["desc"]).strip()
-                    yield fmt_reg_6100(data,str(rd["cd"]),str(rc["cc"]),float(rc["vf"]),hist,desc,"",fil,"")
-            elif tp=="C":
-                rc=creds.iloc[0]
-                for _,rd in debs.iterrows():
-                    data=formatar_data(rd["dt"])
-                    hist=limpar_int(rd["hist"]) if str(rd["hist"]).strip() not in ("","nan") else ""
-                    fil=str(rd["fil"]).strip() if str(rd["fil"]).strip() not in ("","nan") else ""
-                    desc=str(rd["desc"]).strip() or str(rc["desc"]).strip()
-                    yield fmt_reg_6100(data,str(rd["cd"]),str(rc["cc"]),float(rd["vf"]),hist,desc,"",fil,"")
+
+            debs  = g2[g2["td"]].reset_index(drop=True)
+            creds = g2[g2["tc"]].reset_index(drop=True)
+
+            if tp == "D":
+                # 1 débito, N créditos
+                rd = debs.iloc[0]
+                data = formatar_data(rd["dt"])
+                for _, rc in creds.iterrows():
+                    desc = _norm_hist(str(rd["desc"]).strip()
+                                     or str(rc["desc"]).strip())
+                    yield fmt_reg_6100(data, str(rd["cd"]), str(rc["cc"]),
+                                      float(rc["vf"]), "", desc)
+
+            elif tp == "C":
+                # N débitos, 1 crédito
+                rc = creds.iloc[0]
+                for _, rd in debs.iterrows():
+                    data = formatar_data(rd["dt"])
+                    desc = _norm_hist(str(rd["desc"]).strip()
+                                     or str(rc["desc"]).strip())
+                    yield fmt_reg_6100(data, str(rd["cd"]), str(rc["cc"]),
+                                      float(rd["vf"]), "", desc)
+
             else:
-                for _,rd in debs.iterrows():
-                    data=formatar_data(rd["dt"])
-                    hist=limpar_int(rd["hist"]) if str(rd["hist"]).strip() not in ("","nan") else ""
-                    fil=str(rd["fil"]).strip() if str(rd["fil"]).strip() not in ("","nan") else ""
-                    for _,rc in creds.iterrows():
-                        desc=str(rd["desc"]).strip() or str(rc["desc"]).strip()
-                        yield fmt_reg_6100(data,str(rd["cd"]),str(rc["cc"]),float(rc["vf"]),hist,desc,"",fil,"")
+                # N débitos × N créditos
+                for _, rd in debs.iterrows():
+                    data = formatar_data(rd["dt"])
+                    for _, rc in creds.iterrows():
+                        desc = _norm_hist(str(rd["desc"]).strip()
+                                         or str(rc["desc"]).strip())
+                        yield fmt_reg_6100(data, str(rd["cd"]), str(rc["cc"]),
+                                          float(rc["vf"]), "", desc)
 
 def processar_lote(df):
     v_float=limpar_valor_vec(df["Valor"])
@@ -724,14 +811,14 @@ def processar_lote(df):
     nl_arr=df["_num_lote"].to_numpy(dtype=np.int32)
     lo_arr=df["_linha_origem"].fillna(0).astype(int).to_numpy(dtype=np.int32)
     dt_arr=df["Data"].fillna("").astype(str).to_numpy()
-    desc_arr=np.array([sanitizar_texto(v) for v in
-                       df["Complemento Histórico"].fillna("").astype(str).tolist()],dtype=object)
+    # _norm_hist aplicado já na carga — consistente com ECD
+    desc_arr=np.array([_norm_hist(v) for v in
+                       df["Complemento Histórico"].fillna("").astype(str).tolist()],
+                      dtype=object)
     hist_arr=df["Cód. Histórico"].fillna("").astype(str).to_numpy()
-    fil_arr=(df["Código Matriz/Filial"].fillna("").astype(str).to_numpy()
-             if "Código Matriz/Filial" in df.columns else np.full(len(df),"",dtype=object))
     W=pd.DataFrame({"nl":nl_arr,"lo":lo_arr,"vd":vd_arr,"vc":vc_arr,"vf":v_float,
                     "cd":cd_arr,"cc":cc_arr,"td":td_arr,"tc":tc_arr,"dt":dt_arr,
-                    "desc":desc_arr,"hist":hist_arr,"fil":fil_arr})
+                    "desc":desc_arr,"hist":hist_arr})
     g=W.groupby("nl",sort=False)
     agg=g.agg(td=("vd","sum"),tc=("vc","sum"),qt=("nl","size"),
               dt=("dt","first"),ds=("desc","first"),
@@ -765,7 +852,7 @@ def processar_lote(df):
 def _montar_bytes_saida(ni, gerador) -> bytes:
     buf=io.StringIO()
     buf.write(fmt_reg_0000(ni)+"\n")
-    bloco=[]; 
+    bloco=[]
     for linha in gerador:
         bloco.append(linha)
         if len(bloco)>=WRITE_CHUNK:
@@ -844,9 +931,8 @@ def _init_state():
         "arquivo_bytes":    None,
         "arquivo_nome":     "",
         "processado":       False,
-        # CNPJ automático do ECD
-        "cnpj_ecd":         "",       # CNPJ extraído do arquivo ECD
-        "cnpj_ecd_fmt":     "",       # CNPJ formatado para exibição
+        "cnpj_ecd":         "",
+        "cnpj_ecd_fmt":     "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -866,10 +952,6 @@ def _reset():
                                 else "")
 
 def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
-    """
-    Lê apenas as primeiras linhas do ECD para extrair o CNPJ do registro 0000.
-    Retorna o CNPJ numérico ou string vazia.
-    """
     enc = _detectar_encoding_bytes(conteudo)
     try:
         amostra = conteudo[:4096].decode(enc, errors="replace")
@@ -895,7 +977,6 @@ def main():
     apply_theme()
     _init_state()
 
-    # ── Header ────────────────────────────────────────────────────────────────
     st.markdown(
         "<div class='header-box'>"
         "<h2 style='color:#FF6B00;margin:0;'>Domínio Sistemas — Conversor Unificado</h2>"
@@ -905,7 +986,6 @@ def main():
         "<b style='color:#FF6B00;'>Thomson Reuters</b></p>"
         "</div>", unsafe_allow_html=True)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### ⚙ Configurações")
         st.markdown("---")
@@ -920,13 +1000,10 @@ def main():
         st.markdown("- 📄 TXT separado por `;`")
         st.markdown("- 📋 SPED ECD (.txt)")
         st.markdown("---")
-        st.markdown("**Saída gerada:**")
+        st.markdown("**Saída gerada (layout unificado):**")
         st.code("|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST|||||||",
                 language=None)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PASSO 1 — UPLOAD DO ARQUIVO
-    # ══════════════════════════════════════════════════════════════════════════
     st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
     uploaded = st.file_uploader(
         "Arraste ou clique para selecionar (Excel, TXT ou SPED ECD)",
@@ -934,7 +1011,6 @@ def main():
         label_visibility="visible",
     )
 
-    # Detecta tipo ao fazer upload
     if uploaded is not None:
         conteudo = uploaded.read()
         if (conteudo != st.session_state.arquivo_bytes or
@@ -942,10 +1018,8 @@ def main():
             _reset()
             st.session_state.arquivo_bytes = conteudo
             st.session_state.arquivo_nome  = uploaded.name
-
             tipo = identificar_tipo(uploaded.name, conteudo)
             st.session_state.tipo_detectado = tipo
-
             if tipo == "excel":
                 try:
                     xl = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
@@ -954,28 +1028,20 @@ def main():
                         "Plan1" if "Plan1" in xl.sheet_names else xl.sheet_names[0])
                 except Exception:
                     st.session_state.sheets = []
-
             elif tipo == "ecd":
-                # Extrai CNPJ automaticamente
                 cnpj_num = _pre_scan_cnpj_ecd(conteudo)
                 st.session_state.cnpj_ecd = cnpj_num
                 st.session_state.cnpj_ecd_fmt = fmt_cnpj(cnpj_num) if cnpj_num else ""
 
-    # ── Nenhum arquivo ainda ──────────────────────────────────────────────────
     if st.session_state.arquivo_bytes is None:
         st.markdown(
             "<div class='info-box'>"
             "⬆ Selecione um arquivo para começar.<br>"
             "O tipo será identificado automaticamente após o upload."
             "</div>", unsafe_allow_html=True)
-        return  # Para aqui — não exibe nada mais até ter arquivo
+        return
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PASSO 2 — TIPO DETECTADO + CNPJ (condicional)
-    # ══════════════════════════════════════════════════════════════════════════
     tipo = st.session_state.tipo_detectado
-
-    # Badge do tipo
     badges = {
         "ecd":   "<span class='badge-ecd'>📋 SPED ECD detectado</span>",
         "excel": "<span class='badge-excel'>📊 Excel — Lançamentos em Lote</span>",
@@ -984,7 +1050,6 @@ def main():
     st.markdown(badges.get(tipo,""), unsafe_allow_html=True)
     st.markdown("")
 
-    # ── Opções Excel ──────────────────────────────────────────────────────────
     sheet_sel = ""; linha_h = 3; auto_head = True
     if tipo == "excel" and st.session_state.sheets:
         st.markdown("#### 📋 Passo 2 — Configurar Excel")
@@ -1002,15 +1067,12 @@ def main():
                 linha_h = st.number_input("Linha do cabeçalho",
                                           min_value=1, max_value=50, value=4) - 1
 
-    # ── CNPJ — comportamento condicional ─────────────────────────────────────
     ni = ""; ok_insc = False; ti = ""; inf = ""
 
     if tipo == "ecd":
-        # ── ECD: CNPJ preenchido automaticamente ─────────────────────────────
         st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
         cnpj_ecd = st.session_state.cnpj_ecd
         cnpj_fmt = st.session_state.cnpj_ecd_fmt
-
         if cnpj_ecd and validar_cnpj(cnpj_ecd):
             st.markdown(
                 f"<div class='cnpj-auto'>"
@@ -1021,7 +1083,6 @@ def main():
             st.code(fmt_reg_0000(cnpj_ecd), language=None)
             ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd; inf = cnpj_fmt
         else:
-            # Fallback: solicita manualmente se não encontrou
             st.warning("⚠ CNPJ não encontrado no arquivo. Informe manualmente.")
             cnpj_raw = st.text_input("CNPJ / CPF",
                                       placeholder="00.000.000/0001-00",
@@ -1034,15 +1095,12 @@ def main():
                     st.code(fmt_reg_0000(ni), language=None)
                 else:
                     st.error("✖ CNPJ/CPF inválido")
-
     else:
-        # ── TXT / Excel: solicita CNPJ após identificação ─────────────────────
         st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
         st.markdown(
             "<div class='cnpj-box'>"
             "Informe o CNPJ ou CPF do titular dos lançamentos."
             "</div>", unsafe_allow_html=True)
-
         cnpj_raw = st.text_input(
             "CNPJ / CPF",
             placeholder="00.000.000/0001-00  ou  000.000.000-00",
@@ -1061,13 +1119,10 @@ def main():
             else:
                 st.error("✖ CNPJ/CPF inválido — verifique os dígitos.")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # PASSO 3 — OPÇÕES E BOTÃO CONVERTER
-    # ══════════════════════════════════════════════════════════════════════════
     st.markdown("---")
     st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
 
-    col_op1, col_op2 = st.columns(2)
+    col_op1, _ = st.columns(2)
     with col_op1:
         gerar_6110 = st.checkbox(
             "Gerar registro 6110 (apenas SPED ECD)",
@@ -1089,44 +1144,30 @@ def main():
     if btn_limpar:
         _reset(); st.rerun()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # CONVERSÃO
-    # ══════════════════════════════════════════════════════════════════════════
     if btn_converter and ok_insc:
         conteudo = st.session_state.arquivo_bytes
         log      = []
         crono    = Cronometro(); crono.iniciar()
-
-        status_txt  = st.empty()
-        prog_bar    = st.progress(0)
+        status_txt = st.empty()
+        prog_bar   = st.progress(0)
 
         try:
-            # ══════════════════════════════════════════════════════════════════
-            # FLUXO SPED ECD
-            # ══════════════════════════════════════════════════════════════════
             if tipo == "ecd":
                 status_txt.text("Lendo SPED ECD...")
                 log.append("── LEITURA SPED ECD ──")
                 crono.etapa("Leitura SPED ECD")
                 prog_bar.progress(10)
-
                 ecd, registros_erro = _parse_ecd(conteudo, log)
-
                 if ecd is None:
                     st.error("Falha na leitura do SPED ECD. Ative o log para detalhes.")
                     st.session_state.log_linhas = log
                 else:
-                    # Usa o CNPJ do próprio arquivo (já preenchido em ni)
                     cnpj_final = ni
-
                     prog_bar.progress(50)
                     status_txt.text("Gerando registros...")
                     crono.etapa("Geração dos registros")
                     log.append("\n── GERAÇÃO ──")
-
                     linhas_ecd = _gerar_ecd(ecd, log, prog_bar, status_txt)
-
-                    # Opcional: 6110
                     if gerar_6110:
                         linhas_com_6110 = []
                         for l in linhas_ecd:
@@ -1146,14 +1187,11 @@ def main():
                                         linhas_com_6110.append(
                                             f"|6110|{data_l}|{cred_l}|{valor_l}|C||{hist_l}|||||||")
                         linhas_ecd = linhas_com_6110
-
                     crono.etapa("Geração do arquivo")
                     prog_bar.progress(90)
                     status_txt.text("Montando arquivo...")
-
                     resultado_bytes = _montar_bytes_ecd(linhas_ecd)
                     nome_saida = f"ECD_{cnpj_final}_dominio.txt"
-
                     st.session_state.resultado_bytes = resultado_bytes
                     st.session_state.resultado_nome  = nome_saida
                     st.session_state.metricas = {
@@ -1163,12 +1201,10 @@ def main():
                         "Registros 6100":     sum(1 for l in linhas_ecd if l.startswith("|6100|")),
                         "Total linhas":       len(linhas_ecd),
                     }
-
                     if registros_erro:
                         erros_txt = _txt_erros_ecd(registros_erro, ecd.cnpj)
                         st.session_state.erros_bytes = erros_txt.encode("utf-8-sig")
                         st.session_state.erros_nome  = f"ECD_{cnpj_final}_erros.txt"
-
                     total_seg = crono.encerrar()
                     log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
                     for e in crono.etapas:
@@ -1178,13 +1214,9 @@ def main():
                     prog_bar.progress(100)
                     status_txt.text("Concluído!")
 
-            # ══════════════════════════════════════════════════════════════════
-            # FLUXO LANÇAMENTOS EM LOTE (TXT / EXCEL)
-            # ══════════════════════════════════════════════════════════════════
             else:
                 crono.etapa("Leitura do arquivo")
                 ignoradas = 0; enc_usado = ""
-
                 if tipo == "excel":
                     status_txt.text("Lendo Excel...")
                     prog_bar.progress(8)
@@ -1199,28 +1231,23 @@ def main():
                     prog_bar.progress(5)
                     df, ignoradas, enc_usado = ler_txt_lote(conteudo)
                     log.append(f"TXT | Encoding: {enc_usado} | Ignoradas: {ignoradas:,}")
-
                 prog_bar.progress(30)
                 log.append(f"Linhas carregadas: {len(df):,}")
-
                 crono.etapa("Montagem de lotes")
                 status_txt.text("Montando lotes...")
                 df, modo = montar_lotes(df)
                 n_lotes = int(df["_num_lote"].max()) if len(df)>0 else 0
                 log.append(f"Lotes: {n_lotes:,} [modo: {modo}]")
                 prog_bar.progress(42)
-
                 crono.etapa("Processamento / validação")
                 status_txt.text("Validando lotes...")
                 gerador, erros, resumo = processar_lote(df)
                 del df; gc.collect()
                 prog_bar.progress(70)
-
                 st.session_state.resumo     = resumo
                 st.session_state.erros_lote = erros
                 n_ok = len(resumo)-len(erros)
                 log.append(f"Lotes OK: {n_ok:,} | Erros: {len(erros):,}")
-
                 crono.etapa("Geração do arquivo")
                 n_gravados = 0
                 if any(v["balanceado"] for v in resumo):
@@ -1231,7 +1258,6 @@ def main():
                     st.session_state.resultado_nome  = "lancamentos.txt"
                     log.append(f"Registros gravados: {n_gravados:,}")
                 prog_bar.progress(90)
-
                 crono.etapa("Geração do log")
                 total_seg = crono.encerrar()
                 log_txt = _montar_log_lote(resumo, erros, ni, ti, inf,
@@ -1241,7 +1267,6 @@ def main():
                 log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
                 for e in crono.etapas:
                     log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-
                 st.session_state.metricas = {
                     "Lotes total":  f"{len(resumo):,}",
                     "Lotes OK":     f"{n_ok:,}",
@@ -1264,21 +1289,14 @@ def main():
 
         st.rerun()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # RESULTADOS
-    # ══════════════════════════════════════════════════════════════════════════
     if st.session_state.processado:
-
         st.markdown("---")
         st.markdown("#### 📊 Resultado")
-
-        # Métricas
         if st.session_state.metricas:
             cols = st.columns(len(st.session_state.metricas))
             for i,(k,v) in enumerate(st.session_state.metricas.items()):
                 cols[i].metric(k, v)
 
-        # Tabela de validação (lote)
         if st.session_state.resumo:
             st.markdown("#### ✅ Validação dos Lotes")
             rows = []
@@ -1319,10 +1337,8 @@ def main():
                                  "conta_credito","valor","descricao"]]
                             st.dataframe(df_det, use_container_width=True, hide_index=True)
 
-        # Downloads
         st.markdown("#### ⬇ Downloads")
         dl1, dl2, dl3 = st.columns(3)
-
         with dl1:
             if st.session_state.resultado_bytes:
                 st.success("Arquivo gerado com sucesso!")
@@ -1333,7 +1349,6 @@ def main():
                     mime="text/plain",
                     use_container_width=True,
                     type="primary")
-
         with dl2:
             if st.session_state.erros_bytes:
                 st.warning(f"{len(st.session_state.erros_lote or [])} linha(s) com erro.")
@@ -1343,7 +1358,6 @@ def main():
                     file_name=st.session_state.erros_nome,
                     mime="text/plain",
                     use_container_width=True)
-
         with dl3:
             if st.session_state.log_bytes:
                 st.download_button(
@@ -1353,7 +1367,6 @@ def main():
                     mime="text/plain",
                     use_container_width=True)
 
-        # Log no console
         if exibir_log and st.session_state.log_linhas:
             st.markdown("#### 🖥 Log de Processamento")
             log_txt = "\n".join(str(l) for l in st.session_state.log_linhas)
