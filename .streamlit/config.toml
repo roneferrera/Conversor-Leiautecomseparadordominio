@@ -1,9 +1,0 @@
-[server]
-maxUploadSize = 50
-headless = true
-
-[runner]
-fastReruns = false
-
-[browser]
-gatherUsageStats = false
