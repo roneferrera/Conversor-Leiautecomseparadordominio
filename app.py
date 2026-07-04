@@ -443,7 +443,7 @@ def _parse_ecd(conteudo: bytes, log: list) -> tuple:
                 if len(campos) > 2:
                     ecd.historicos[campos[1].strip()] = _norm_hist(campos[2])
             elif reg == "I200":
-                # ── Cada I200 é sempre um lançamento novo e independente ──
+                # ── Cada I200 é sempre um lançamento novo e independente ──────
                 lote_atual = {
                     "num":      campos[1].strip() if len(campos) > 1 else "",
                     "data":     campos[2].strip() if len(campos) > 2 else "",
@@ -562,15 +562,26 @@ def tipo_lancamento(nd, nc):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GERAÇÃO DAS LINHAS 6100 — ECD
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORREÇÃO V1.6 — REMOÇÃO DO _agrupar
+# ───────────────────────────────────────────────────────────────────────────────
+# O _agrupar mesclava partidas de I200 DIFERENTES que tinham a mesma conta,
+# transformando múltiplos lançamentos independentes (X ou D) em um único
+# lançamento V com produto cartesiano. Exemplo:
+#
+#   I200-A: débito 671 → créditos 672,560,191,640,331,187  (tipo D correto)
+#   I200-B: débito 194 → créditos 672,560,191,640,331,187  (tipo D correto)
+#   I200-C: débito 331 → créditos 672,560,191,640,331,187  (tipo D correto)
+#
+# Com _agrupar: juntava todos os débitos (671,194,331,...) e todos os créditos
+# (672,560,191,...) → tipo V → produto cartesiano de 6×6 = 36 linhas ERRADAS.
+#
+# Sem _agrupar: cada I200 usa apenas suas próprias partidas → tipo D correto
+# com 1+6 = 7 linhas por lançamento.
+# ═══════════════════════════════════════════════════════════════════════════════
 def _linhas_ecd(lanc):
-    # ══════════════════════════════════════════════════════════════════════════
-    # CORREÇÃO V1.6: NÃO usar _agrupar — preservar cada partida individual
-    # do lançamento I200. O _agrupar mesclava partidas de contas iguais de
-    # I200 diferentes, gerando produto cartesiano indevido (tipo V).
-    # Cada I200 já chegou aqui com suas próprias partidas isoladas.
-    # ══════════════════════════════════════════════════════════════════════════
-    partidas = lanc["partidas"]          # ← era: _agrupar(lanc["partidas"])
+    # ── USA DIRETAMENTE as partidas do I200, SEM agrupar com outros I200 ─────
+    partidas = lanc["partidas"]          # ← CORREÇÃO: era _agrupar(lanc["partidas"])
     debs  = [p for p in partidas if p["dc"] == "D"]
     creds = [p for p in partidas if p["dc"] == "C"]
     if not debs or not creds:
@@ -585,6 +596,7 @@ def _linhas_ecd(lanc):
         return fmt_reg_6100(data, db_conta, cr_conta, valor, "", descr)
 
     if tipo == "X":
+        # 1 débito → 1 crédito
         h = _montar_hist_ecd(debs[0]) or hist
         out.append(linha(
             debs[0]["conta"],
@@ -609,7 +621,8 @@ def _linhas_ecd(lanc):
             h = _montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
             out.append(linha(db["conta"], "", _str2float(db["valor"]), h))
 
-    else:  # V — produto cartesiano apenas quando o I200 realmente tem V×V
+    else:
+        # V — produto cartesiano apenas quando o I200 realmente tem V×V
         for db in debs:
             for cr in creds:
                 h = _montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
@@ -685,7 +698,6 @@ def _filtrar_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
 def ler_txt_streaming(conteudo: bytes):
     enc = _detectar_encoding_bytes(conteudo)
     buf = io.BytesIO(conteudo)
-
     reader = pd.read_csv(
         buf,
         sep=";",
