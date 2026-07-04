@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # -*- coding: utf-8 -*-
 """
-Domínio Sistemas — Conversor Unificado (Streamlit) V1.8
+Domínio Sistemas — Conversor Unificado (Streamlit) V2.0
 """
 import os
 import re
@@ -15,7 +15,7 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 
-VERSAO        = "V1.8"
+VERSAO        = "V2.0"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -222,9 +222,8 @@ def identificar_tipo(nome_arquivo:str,conteudo:bytes)->str:
     return "lote"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO SPED ECD — V1.8
+# MÓDULO SPED ECD — V2.0
 # ═══════════════════════════════════════════════════════════════════════════════
-
 def _split_pipe(linha:str)->list:
     c=linha.strip().split("|")
     if c and c[0]=="": c=c[1:]
@@ -246,15 +245,12 @@ def _parse_ecd(conteudo:bytes,log:list)->tuple:
     lote_atual=None
     erros_parse=0; registros_erro=[]; contas_invalidas=0
     i200_count=0; i250_count=0
-
     enc=_detectar_encoding_bytes(conteudo)
     log.append(f"  Encoding detectado : {enc}")
     try: texto=conteudo.decode(enc,errors="replace")
     except: texto=conteudo.decode("utf-8",errors="replace")
-
     linhas=texto.splitlines()
     log.append(f"  Total de linhas    : {len(linhas):,}")
-
     for num,linha in enumerate(linhas,1):
         linha_orig=linha; linha=linha.strip()
         if not linha: continue
@@ -271,12 +267,9 @@ def _parse_ecd(conteudo:bytes,log:list)->tuple:
                 cod=_campo(campos,1); desc=_campo(campos,2)
                 if cod: ecd.historicos[cod]=_norm_hist(desc)
             elif reg=="I200":
-                # ── CADA I200 = lançamento 100% independente ──────────────────
                 lote_atual={
-                    "num":   _campo(campos,1),
-                    "data":  _campo(campos,2),
-                    "valor": _campo(campos,3),
-                    "partidas": [],   # lista EXCLUSIVA deste I200
+                    "num":_campo(campos,1),"data":_campo(campos,2),
+                    "valor":_campo(campos,3),"partidas":[],
                 }
                 ecd.lancamentos.append(lote_atual)
                 i200_count+=1
@@ -284,14 +277,12 @@ def _parse_ecd(conteudo:bytes,log:list)->tuple:
                     log.append(f"  [DBG I200 #{i200_count}] num={lote_atual['num']} data={lote_atual['data']} valor={lote_atual['valor']}")
             elif reg=="I250":
                 if lote_atual is None:
-                    registros_erro.append({"linha":num,"motivo":"I250 sem I200","conteudo":linha_orig.strip()})
-                    continue
+                    registros_erro.append({"linha":num,"motivo":"I250 sem I200","conteudo":linha_orig.strip()}); continue
                 conta=_campo(campos,1); valor_str=_campo(campos,3)
                 dc=_campo(campos,4).upper()
                 descr_hist=_norm_hist(_campo(campos,7))
                 if dc not in ("D","C"):
-                    registros_erro.append({"linha":num,"motivo":f"IND_DC='{dc}' inválido | {campos}","conteudo":linha_orig.strip()})
-                    continue
+                    registros_erro.append({"linha":num,"motivo":f"IND_DC='{dc}' inválido","conteudo":linha_orig.strip()}); continue
                 if not _conta_valida(conta):
                     registros_erro.append({"linha":num,"motivo":f"Conta '{conta}' inválida","conteudo":linha_orig.strip()})
                     contas_invalidas+=1; continue
@@ -304,21 +295,14 @@ def _parse_ecd(conteudo:bytes,log:list)->tuple:
         except Exception as ex:
             registros_erro.append({"linha":num,"motivo":f"Exceção: {ex}","conteudo":linha_orig.strip()})
             erros_parse+=1
-            if erros_parse>50:
-                log.append("ERRO: muitos erros — abortando.")
-                return None,registros_erro
-
+            if erros_parse>50: log.append("ERRO: muitos erros — abortando."); return None,registros_erro
     if not ecd.cnpj:
-        log.append("ERRO: CNPJ não encontrado no registro 0000.")
-        return None,registros_erro
-
-    # Estatísticas
+        log.append("ERRO: CNPJ não encontrado no registro 0000."); return None,registros_erro
     sem=sum(1 for l in ecd.lancamentos if not l["partidas"])
     cx=sum(1 for l in ecd.lancamentos if sum(1 for p in l["partidas"] if p["dc"]=="D")==1 and sum(1 for p in l["partidas"] if p["dc"]=="C")==1)
     cd=sum(1 for l in ecd.lancamentos if sum(1 for p in l["partidas"] if p["dc"]=="D")==1 and sum(1 for p in l["partidas"] if p["dc"]=="C")>1)
     cc=sum(1 for l in ecd.lancamentos if sum(1 for p in l["partidas"] if p["dc"]=="D")>1 and sum(1 for p in l["partidas"] if p["dc"]=="C")==1)
     cv=sum(1 for l in ecd.lancamentos if sum(1 for p in l["partidas"] if p["dc"]=="D")>1 and sum(1 for p in l["partidas"] if p["dc"]=="C")>1)
-
     log.append(f"  CNPJ               : {ecd.cnpj}")
     log.append(f"  Lançamentos (I200) : {i200_count:,}")
     log.append(f"  Partidas (I250)    : {i250_count:,}")
@@ -363,27 +347,38 @@ def _classif(nd:int,nc:int)->str:
 def tipo_lancamento(nd,nc): return _classif(nd,nc)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GERAÇÃO DAS LINHAS ECD — V1.8
+# GERAÇÃO DAS LINHAS ECD — V2.0
 # ───────────────────────────────────────────────────────────────────────────────
-# CORREÇÃO PRINCIPAL V1.8:
-# O sistema Domínio NÃO aceita tipo V com débito e crédito preenchidos
-# simultaneamente na mesma linha 6100 (erro: "não é permitido ter débito e
-# crédito no mesmo lançamento se o tipo for diferente de 'um para um'").
+# REGRA DEFINITIVA:
 #
-# REGRA:
-#   • 1D × 1C → tipo X  → 1 linha com débito E crédito preenchidos ✓
-#   • 1D × nC → tipo D  → 1ª linha só débito, demais só crédito ✓
-#   • nD × 1C → tipo C  → 1ª linha só crédito, demais só débito ✓
-#   • nD × nC → tipo V  → DECOMPOR em lançamentos X individuais
-#                          (1 linha por par débito×crédito com valor proporcional)
+#   X (1D × 1C):
+#     |6000|X|
+#     |6100|data|deb|cred|valor||hist|        ← débito E crédito na mesma linha
+#
+#   D (1D × nC):
+#     |6000|D|
+#     |6100|data|deb||total||hist|            ← só débito
+#     |6100|data||cr1|val1||hist|             ← só crédito (repetir para cada cr)
+#
+#   C (nD × 1C):
+#     |6000|C|
+#     |6100|data||cred|total||hist|           ← só crédito
+#     |6100|data|db1||val1||hist|             ← só débito (repetir para cada db)
+#
+#   V (nD × nC):
+#     |6000|V|
+#     |6100|data||cr1|val1||hist|             ← todos créditos (só crédito)
+#     |6100|data||cr2|val2||hist|
+#     ...
+#     |6100|data|db1||val1||hist|             ← todos débitos (só débito)
+#     |6100|data|db2||val2||hist|
+#     ...
+#
+#     NUNCA débito e crédito na mesma linha 6100 no tipo V.
+#     Isso resolve "Conta Débito não pode ser igual a Conta Crédito".
+#     NENHUMA partida é ignorada — 100% fiel ao ECD.
 # ═══════════════════════════════════════════════════════════════════════════════
 def _linhas_ecd(lanc:dict)->list:
-    """
-    Gera 6000 + 6100 para um único I200.
-    
-    REGRA V1.8 — tipo V é DECOMPOSTO em múltiplos lançamentos X,
-    pois o Domínio rejeita linhas 6100 com débito+crédito em lançamento V.
-    """
     partidas=lanc["partidas"]
     debs =[p for p in partidas if p["dc"]=="D"]
     creds=[p for p in partidas if p["dc"]=="C"]
@@ -394,46 +389,55 @@ def _linhas_ecd(lanc:dict)->list:
     hist=_primeiro_hist(partidas)
     out=[]
 
-    def ln(db,cr,val,h):
-        return fmt_reg_6100(data,db,cr,val,"",h)
+    def so_deb(conta,val,h):
+        return fmt_reg_6100(data,conta,"",val,"",h)
+
+    def so_cred(conta,val,h):
+        return fmt_reg_6100(data,"",conta,val,"",h)
+
+    def deb_e_cred(conta_d,conta_c,val,h):
+        return fmt_reg_6100(data,conta_d,conta_c,val,"",h)
 
     if nd==1 and nc==1:
-        # ── TIPO X: 1 débito → 1 crédito ─────────────────────────────────────
-        h=_montar_hist_ecd(debs[0]) or hist
+        # ── TIPO X ───────────────────────────────────────────────────────────
+        db=debs[0]; cr=creds[0]
+        h=_montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
         out.append(fmt_reg_6000("X"))
-        out.append(ln(debs[0]["conta"],creds[0]["conta"],_str2float(debs[0]["valor"]),h))
+        out.append(deb_e_cred(db["conta"],cr["conta"],_str2float(db["valor"]),h))
 
     elif nd==1 and nc>1:
-        # ── TIPO D: 1 débito → N créditos ────────────────────────────────────
-        h=_montar_hist_ecd(debs[0]) or hist
+        # ── TIPO D ───────────────────────────────────────────────────────────
+        db=debs[0]
+        h=_montar_hist_ecd(db) or hist
         out.append(fmt_reg_6000("D"))
-        out.append(ln(debs[0]["conta"],"",_str2float(debs[0]["valor"]),h))
+        out.append(so_deb(db["conta"],_str2float(db["valor"]),h))
         for cr in creds:
-            h=_montar_hist_ecd(cr) or _montar_hist_ecd(debs[0]) or hist
-            out.append(ln("",cr["conta"],_str2float(cr["valor"]),h))
+            h=_montar_hist_ecd(cr) or _montar_hist_ecd(db) or hist
+            out.append(so_cred(cr["conta"],_str2float(cr["valor"]),h))
 
     elif nd>1 and nc==1:
-        # ── TIPO C: N débitos → 1 crédito ────────────────────────────────────
-        h=_montar_hist_ecd(creds[0]) or hist
+        # ── TIPO C ───────────────────────────────────────────────────────────
+        cr=creds[0]
+        h=_montar_hist_ecd(cr) or hist
         out.append(fmt_reg_6000("C"))
-        out.append(ln("",creds[0]["conta"],_str2float(creds[0]["valor"]),h))
+        out.append(so_cred(cr["conta"],_str2float(cr["valor"]),h))
         for db in debs:
-            h=_montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
-            out.append(ln(db["conta"],"",_str2float(db["valor"]),h))
+            h=_montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
+            out.append(so_deb(db["conta"],_str2float(db["valor"]),h))
 
     else:
-        # ── TIPO V → DECOMPOR EM LANÇAMENTOS X INDIVIDUAIS ───────────────────
-        # O Domínio rejeita tipo V com débito+crédito na mesma linha.
-        # Solução: cada par (débito_i × crédito_j) vira um lançamento X
-        # independente. O valor usado é o do crédito (partida analítica).
-        #
-        # Exemplo: 2 débitos × 3 créditos → 6 lançamentos X separados
+        # ── TIPO V ───────────────────────────────────────────────────────────
+        # 1 único bloco V com créditos primeiro, depois débitos.
+        # NUNCA débito e crédito na mesma linha 6100.
+        # Resolve o erro "Conta Débito não pode ser igual a Conta Crédito"
+        # porque débito 331 e crédito 331 ficam em linhas SEPARADAS.
+        out.append(fmt_reg_6000("V"))
+        for cr in creds:
+            h=_montar_hist_ecd(cr) or hist
+            out.append(so_cred(cr["conta"],_str2float(cr["valor"]),h))
         for db in debs:
-            for cr in creds:
-                h=_montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
-                val=_str2float(cr["valor"])
-                out.append(fmt_reg_6000("X"))
-                out.append(ln(db["conta"],cr["conta"],val,h))
+            h=_montar_hist_ecd(db) or hist
+            out.append(so_deb(db["conta"],_str2float(db["valor"]),h))
 
     return out
 
@@ -442,28 +446,23 @@ def _gerar_ecd(ecd:SpedECD,log:list,prog_bar,status)->list:
     t6000=t6100=ignorados=0
     debug={"X":0,"D":0,"C":0,"V":0}
     total=len(ecd.lancamentos)
-
     for idx,lanc in enumerate(ecd.lancamentos):
         if idx%500==0 or idx==total-1:
             prog_bar.progress(min(55+int(((idx+1)/total)*35),99))
             status.text(f"Gerando lançamento {idx+1:,}/{total:,}...")
-        if not lanc.get("partidas"):
-            ignorados+=1; continue
+        if not lanc.get("partidas"): ignorados+=1; continue
         novas=_linhas_ecd(lanc)
-        if not novas:
-            ignorados+=1; continue
+        if not novas: ignorados+=1; continue
         for l in novas:
             if l.startswith("|6000|"):
                 t=l.split("|")[2] if len(l.split("|"))>2 else "?"
                 debug[t]=debug.get(t,0)+1; t6000+=1
-            elif l.startswith("|6100|"):
-                t6100+=1
+            elif l.startswith("|6100|"): t6100+=1
         linhas.extend(novas)
-
     log.append(f"  Reg. 6000 gerados  : {t6000:,}")
     log.append(f"  Reg. 6100 gerados  : {t6100:,}")
     log.append(f"  Ignorados          : {ignorados:,}")
-    log.append(f"  Tipos — X:{debug['X']} D:{debug['D']} C:{debug['C']} V_decomp:{debug.get('V',0)}")
+    log.append(f"  Tipos — X:{debug.get('X',0)} D:{debug.get('D',0)} C:{debug.get('C',0)} V:{debug.get('V',0)}")
     log.append(f"  Total linhas saída : {len(linhas):,}")
     return linhas
 
@@ -555,11 +554,13 @@ def _gerar_linhas_6100(debs:pd.DataFrame,creds:pd.DataFrame,tp:str)->list:
             out.append(fmt_reg_6100(formatar_data(rd["dt"]),str(rd["cd"]),"",
                                     float(rd["vf"]),"",_norm_hist(str(rd["desc"]) or str(rc["desc"]))))
     else:
-        cross=debs[["cd","vf","desc","dt"]].merge(
-            creds[["cc","desc"]].rename(columns={"desc":"desc_c"}),how="cross")
-        for _,row in cross.iterrows():
-            out.append(fmt_reg_6100(formatar_data(row["dt"]),str(row["cd"]),str(row["cc"]),
-                                    float(row["vf"]),"",_norm_hist(str(row["desc"]) or str(row["desc_c"]))))
+        # V: créditos primeiro, depois débitos — nunca D+C na mesma linha
+        for _,rc in creds.iterrows():
+            out.append(fmt_reg_6100(formatar_data(rc["dt"]),"",str(rc["cc"]),
+                                    float(rc["vf"]),"",_norm_hist(str(rc["desc"]))))
+        for _,rd in debs.iterrows():
+            out.append(fmt_reg_6100(formatar_data(rd["dt"]),str(rd["cd"]),"",
+                                    float(rd["vf"]),"",_norm_hist(str(rd["desc"]))))
     return out
 
 def _flush_lote(df_lote,num,saida_buf,resumo,erros):
