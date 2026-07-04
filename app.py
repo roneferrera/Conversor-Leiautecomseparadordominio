@@ -24,7 +24,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════════
-VERSAO        = "V1.6"
+VERSAO        = "V1.7"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -261,7 +261,6 @@ def limpar_valor_vec(serie):
         ).fillna(0.0).round(2).to_numpy(dtype=np.float64)
     )
 
-# ── CNPJ / CPF ────────────────────────────────────────────────────────────────
 def validar_cnpj(cnpj):
     c = so_nums(cnpj)
     if len(c) != 14 or len(set(c)) == 1:
@@ -298,7 +297,7 @@ def fmt_cpf(n):
     return f"{c[:3]}.{c[3:6]}.{c[6:9]}-{c[9:]}" if len(c) == 11 else n
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FORMATAÇÃO DE REGISTROS — LAYOUT UNIFICADO
+# FORMATAÇÃO DE REGISTROS
 # ═══════════════════════════════════════════════════════════════════════════════
 def fmt_reg_0000(ni: str) -> str:
     return f"|0000|{ni}|"
@@ -322,23 +321,8 @@ def _fmt_valor_layout(valor) -> str:
     except ValueError:
         return "0,00"
 
-def fmt_reg_6100(
-    data:     str,
-    deb:      str,
-    cred:     str,
-    valor,
-    cod_hist: str = "",
-    desc:     str = "",
-    _usuario: str = "",
-    _filial:  str = "",
-    _scp:     str = "",
-) -> str:
-    valor_fmt = _fmt_valor_layout(valor)
-    hist_fmt  = _norm_hist(desc)
-    return (
-        f"|6100|{data}|{deb}|{cred}|{valor_fmt}"
-        f"||{hist_fmt}|||||||"
-    )
+def fmt_reg_6100(data, deb, cred, valor, cod_hist="", desc="", _u="", _f="", _s=""):
+    return f"|6100|{data}|{deb}|{cred}|{_fmt_valor_layout(valor)}||{_norm_hist(desc)}|||||||"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DETECÇÃO DE ENCODING
@@ -352,15 +336,14 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             texto = conteudo.decode(enc, errors="strict")
-            if (sum(1 for c in texto[:4096] if c in _CHARS_PT) > 0
-                    or enc in ("utf-8-sig", "utf-8")):
+            if sum(1 for c in texto[:4096] if c in _CHARS_PT) > 0 or enc in ("utf-8-sig","utf-8"):
                 return enc
         except (UnicodeDecodeError, LookupError):
             continue
     return "latin-1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# IDENTIFICAÇÃO AUTOMÁTICA DO TIPO DE ARQUIVO
+# IDENTIFICAÇÃO DO TIPO DE ARQUIVO
 # ═══════════════════════════════════════════════════════════════════════════════
 def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
     ext = os.path.splitext(nome_arquivo)[1].lower()
@@ -387,15 +370,24 @@ def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
     return "lote"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ▌▌▌ MÓDULO SPED ECD ▌▌▌
+# ▌▌▌ MÓDULO SPED ECD — V1.7 ▌▌▌
 # ═══════════════════════════════════════════════════════════════════════════════
-def _split_pipe(linha):
+
+def _split_pipe(linha: str) -> list:
+    """
+    Divide linha pelo pipe e remove campos vazios nas extremidades.
+    Ex: |I200|425144|31012024|... → ['I200','425144','31012024',...]
+    """
     c = linha.strip().split("|")
     if c and c[0]  == "": c = c[1:]
     if c and c[-1] == "": c = c[:-1]
     return c
 
-def _conta_valida(conta):
+def _campo(campos: list, idx: int, default: str = "") -> str:
+    """Retorna campo[idx] com segurança, sem lançar IndexError."""
+    return campos[idx].strip() if idx < len(campos) else default
+
+def _conta_valida(conta: str) -> bool:
     return bool(conta) and conta.isdigit()
 
 class SpedECD:
@@ -403,23 +395,53 @@ class SpedECD:
         self.cnpj        = ""
         self.contas      = {}
         self.historicos  = {}
-        self.lancamentos = []
+        self.lancamentos = []  # lista de dicts {num, data, valor, partidas:[]}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# LAYOUT DO REGISTRO I250 (SPED ECD)
+# ───────────────────────────────────────────────────────────────────────────────
+# Posição (0-based após remover pipes externos):
+#   0  = REG        → "I250"
+#   1  = COD_CTA    → código da conta
+#   2  = COD_CCUS   → centro de custo (pode ser vazio)
+#   3  = VL_DC      → valor
+#   4  = IND_DC     → indicador D/C
+#   5  = NUM_ARQ    → número do arquivo (pode ser vazio)
+#   6  = COD_HIST   → código do histórico (pode ser vazio)
+#   7  = DESCR_HIST → descrição do histórico (pode ser vazio)
+# ───────────────────────────────────────────────────────────────────────────────
+_I250_COD_CTA    = 1
+_I250_VL_DC      = 3
+_I250_IND_DC     = 4
+_I250_DESCR_HIST = 7
 
 def _parse_ecd(conteudo: bytes, log: list) -> tuple:
-    ecd = SpedECD()
+    """
+    Lê o arquivo SPED ECD e retorna (SpedECD, lista_de_erros).
+    
+    CORREÇÃO V1.7:
+    - Cada I200 cria um lote_atual NOVO e independente.
+    - I250 usa _campo() para acesso seguro — nunca lança IndexError.
+    - Log de debug mostra as primeiras partidas para diagnóstico.
+    """
+    ecd              = SpedECD()
     lote_atual       = None
     erros_parse      = 0
     registros_erro   = []
     contas_invalidas = 0
+    i200_count       = 0
+    i250_count       = 0
 
     enc = _detectar_encoding_bytes(conteudo)
-    log.append(f"  Encoding detectado: {enc}")
+    log.append(f"  Encoding detectado : {enc}")
     try:
         texto = conteudo.decode(enc, errors="replace")
     except Exception:
         texto = conteudo.decode("utf-8", errors="replace")
 
     linhas = texto.splitlines()
+    log.append(f"  Total de linhas    : {len(linhas):,}")
+
     for num, linha in enumerate(linhas, 1):
         linha_orig = linha
         linha = linha.strip()
@@ -429,88 +451,154 @@ def _parse_ecd(conteudo: bytes, log: list) -> tuple:
         if not campos:
             continue
         reg = campos[0]
+
         try:
+            # ── 0000 ──────────────────────────────────────────────────────────
             if reg == "0000":
                 if len(campos) > 5:
-                    ecd.cnpj = campos[5].strip()
+                    ecd.cnpj = _campo(campos, 5)
+
+            # ── I050 — Plano de contas ────────────────────────────────────────
             elif reg == "I050":
-                if len(campos) > 7:
-                    cod  = campos[5].strip()
-                    nome = campos[7].strip()
-                    if cod:
-                        ecd.contas[cod] = nome
+                cod  = _campo(campos, 5)
+                nome = _campo(campos, 7)
+                if cod:
+                    ecd.contas[cod] = nome
+
+            # ── I075 — Históricos padrão ──────────────────────────────────────
             elif reg == "I075":
-                if len(campos) > 2:
-                    ecd.historicos[campos[1].strip()] = _norm_hist(campos[2])
+                cod  = _campo(campos, 1)
+                desc = _campo(campos, 2)
+                if cod:
+                    ecd.historicos[cod] = _norm_hist(desc)
+
+            # ── I200 — Novo lançamento ────────────────────────────────────────
             elif reg == "I200":
-                # ── Cada I200 é sempre um lançamento novo e independente ──────
+                # CADA I200 = lançamento independente com suas próprias partidas
                 lote_atual = {
-                    "num":      campos[1].strip() if len(campos) > 1 else "",
-                    "data":     campos[2].strip() if len(campos) > 2 else "",
-                    "valor":    campos[3].strip() if len(campos) > 3 else "",
-                    "partidas": [],
+                    "num":      _campo(campos, 1),
+                    "data":     _campo(campos, 2),
+                    "valor":    _campo(campos, 3),
+                    "partidas": [],          # ← lista EXCLUSIVA deste I200
                 }
                 ecd.lancamentos.append(lote_atual)
+                i200_count += 1
+
+                # Debug: loga os primeiros 5 I200 para verificação
+                if i200_count <= 5:
+                    log.append(
+                        f"  [DEBUG I200 #{i200_count}] "
+                        f"num={lote_atual['num']} "
+                        f"data={lote_atual['data']} "
+                        f"valor={lote_atual['valor']}"
+                    )
+
+            # ── I250 — Partida do lançamento ──────────────────────────────────
             elif reg == "I250":
                 if lote_atual is None:
-                    continue
-                if len(campos) <= 4:
                     registros_erro.append({
-                        "linha": num,
-                        "motivo": "I250 campos insuficientes",
+                        "linha":    num,
+                        "motivo":   "I250 sem I200 anterior",
                         "conteudo": linha_orig.strip(),
                     })
                     continue
-                dc = campos[4].strip().upper()
+
+                # Acesso seguro a todos os campos
+                conta      = _campo(campos, _I250_COD_CTA)
+                valor_str  = _campo(campos, _I250_VL_DC)
+                dc         = _campo(campos, _I250_IND_DC).upper()
+                descr_hist = _norm_hist(_campo(campos, _I250_DESCR_HIST))
+
+                # Validações
                 if dc not in ("D", "C"):
                     registros_erro.append({
-                        "linha": num,
-                        "motivo": f"dc='{dc}' inválido",
+                        "linha":    num,
+                        "motivo":   f"IND_DC='{dc}' inválido (esperado D ou C) | campos={campos}",
                         "conteudo": linha_orig.strip(),
                     })
                     continue
-                conta = campos[1].strip()
+
                 if not _conta_valida(conta):
                     registros_erro.append({
-                        "linha": num,
-                        "motivo": f"Conta '{conta}' não numérica",
+                        "linha":    num,
+                        "motivo":   f"Conta '{conta}' não numérica",
                         "conteudo": linha_orig.strip(),
                     })
                     contas_invalidas += 1
                     continue
+
+                # Adiciona a partida ao lote_atual CORRENTE (este I200)
                 lote_atual["partidas"].append({
                     "conta":      conta,
-                    "valor":      campos[3].strip(),
+                    "valor":      valor_str,
                     "dc":         dc,
-                    "descr_hist": _norm_hist(campos[7] if len(campos) > 7 else ""),
+                    "descr_hist": descr_hist,
                 })
+                i250_count += 1
+
+                # Debug: loga as primeiras 20 I250
+                if i250_count <= 20:
+                    log.append(
+                        f"  [DEBUG I250 #{i250_count}] "
+                        f"I200_num={lote_atual['num']} "
+                        f"conta={conta} dc={dc} valor={valor_str} "
+                        f"hist={descr_hist[:40]!r}"
+                    )
+
+            # ── I299 / I300 — Fim de bloco ────────────────────────────────────
             elif reg in ("I299", "I300"):
                 lote_atual = None
+
         except Exception as ex:
             registros_erro.append({
-                "linha": num,
-                "motivo": f"Exceção: {ex}",
+                "linha":    num,
+                "motivo":   f"Exceção: {ex}",
                 "conteudo": linha_orig.strip(),
             })
             erros_parse += 1
             if erros_parse > 50:
-                log.append("ERRO: muitos erros — abortando.")
+                log.append("ERRO: muitos erros de parse — abortando leitura.")
                 return None, registros_erro
 
+    # ── Validações pós-leitura ────────────────────────────────────────────────
     if not ecd.cnpj:
         log.append("ERRO: CNPJ não encontrado no registro 0000.")
         return None, registros_erro
 
-    log.append(f"  CNPJ extraído do arquivo: {ecd.cnpj}")
-    log.append(f"  Contas: {len(ecd.contas):,} | Históricos: {len(ecd.historicos):,}")
-    log.append(f"  Lançamentos (I200): {len(ecd.lancamentos):,}")
+    # Estatísticas de partidas por lançamento
+    lancs_sem_partida = sum(1 for l in ecd.lancamentos if not l["partidas"])
+    lancs_x = sum(1 for l in ecd.lancamentos
+                  if len([p for p in l["partidas"] if p["dc"]=="D"]) == 1
+                  and len([p for p in l["partidas"] if p["dc"]=="C"]) == 1)
+    lancs_d = sum(1 for l in ecd.lancamentos
+                  if len([p for p in l["partidas"] if p["dc"]=="D"]) == 1
+                  and len([p for p in l["partidas"] if p["dc"]=="C"]) > 1)
+    lancs_c = sum(1 for l in ecd.lancamentos
+                  if len([p for p in l["partidas"] if p["dc"]=="D"]) > 1
+                  and len([p for p in l["partidas"] if p["dc"]=="C"]) == 1)
+    lancs_v = sum(1 for l in ecd.lancamentos
+                  if len([p for p in l["partidas"] if p["dc"]=="D"]) > 1
+                  and len([p for p in l["partidas"] if p["dc"]=="C"]) > 1)
+
+    log.append(f"  CNPJ               : {ecd.cnpj}")
+    log.append(f"  Contas (I050)      : {len(ecd.contas):,}")
+    log.append(f"  Históricos (I075)  : {len(ecd.historicos):,}")
+    log.append(f"  Lançamentos (I200) : {i200_count:,}")
+    log.append(f"  Partidas (I250)    : {i250_count:,}")
+    log.append(f"  Sem partida        : {lancs_sem_partida:,}")
+    log.append(f"  Tipo X (1D→1C)     : {lancs_x:,}")
+    log.append(f"  Tipo D (1D→nC)     : {lancs_d:,}")
+    log.append(f"  Tipo C (nD→1C)     : {lancs_c:,}")
+    log.append(f"  Tipo V (nD→nC)     : {lancs_v:,}")
     if contas_invalidas:
-        log.append(f"  Contas inválidas ignoradas: {contas_invalidas:,}")
+        log.append(f"  Contas inválidas   : {contas_invalidas:,}")
     if registros_erro:
-        log.append(f"  Linhas com aviso/erro: {len(registros_erro):,}")
+        log.append(f"  Erros/avisos       : {len(registros_erro):,}")
+
     return ecd, registros_erro
 
-def _fmt_data_ecd(d):
+
+def _fmt_data_ecd(d: str) -> str:
     d = d.strip()
     if "/" in d:
         return d
@@ -518,7 +606,7 @@ def _fmt_data_ecd(d):
         return f"{d[:2]}/{d[2:4]}/{d[4:]}"
     return d
 
-def _str2float(v):
+def _str2float(v) -> float:
     if isinstance(v, (int, float)):
         return float(v)
     v = str(v).strip()
@@ -534,10 +622,10 @@ def _str2float(v):
     except Exception:
         return 0.0
 
-def _montar_hist_ecd(p):
+def _montar_hist_ecd(p: dict) -> str:
     return p.get("descr_hist", "").strip()
 
-def _primeiro_hist(partidas):
+def _primeiro_hist(partidas: list) -> str:
     for p in partidas:
         h = _montar_hist_ecd(p)
         if h:
@@ -546,12 +634,8 @@ def _primeiro_hist(partidas):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLASSIFICAÇÃO DO TIPO DE LANÇAMENTO
-# X = 1 débito  → 1 crédito
-# D = 1 débito  → vários créditos
-# C = vários débitos → 1 crédito
-# V = vários débitos → vários créditos
 # ─────────────────────────────────────────────────────────────────────────────
-def _classif(nd, nc):
+def _classif(nd: int, nc: int) -> str:
     if nd == 1 and nc == 1: return "X"
     if nd == 1 and nc  > 1: return "D"
     if nd  > 1 and nc == 1: return "C"
@@ -562,90 +646,77 @@ def tipo_lancamento(nd, nc):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GERAÇÃO DAS LINHAS 6100 — ECD
-# ═══════════════════════════════════════════════════════════════════════════════
-# CORREÇÃO V1.6 — REMOÇÃO DO _agrupar
-# ───────────────────────────────────────────────────────────────────────────────
-# O _agrupar mesclava partidas de I200 DIFERENTES que tinham a mesma conta,
-# transformando múltiplos lançamentos independentes (X ou D) em um único
-# lançamento V com produto cartesiano. Exemplo:
-#
-#   I200-A: débito 671 → créditos 672,560,191,640,331,187  (tipo D correto)
-#   I200-B: débito 194 → créditos 672,560,191,640,331,187  (tipo D correto)
-#   I200-C: débito 331 → créditos 672,560,191,640,331,187  (tipo D correto)
-#
-# Com _agrupar: juntava todos os débitos (671,194,331,...) e todos os créditos
-# (672,560,191,...) → tipo V → produto cartesiano de 6×6 = 36 linhas ERRADAS.
-#
-# Sem _agrupar: cada I200 usa apenas suas próprias partidas → tipo D correto
-# com 1+6 = 7 linhas por lançamento.
-# ═══════════════════════════════════════════════════════════════════════════════
-def _linhas_ecd(lanc):
-    # ── USA DIRETAMENTE as partidas do I200, SEM agrupar com outros I200 ─────
-    partidas = lanc["partidas"]          # ← CORREÇÃO: era _agrupar(lanc["partidas"])
+# ─────────────────────────────────────────────────────────────────────────────
+def _linhas_ecd(lanc: dict) -> list:
+    """
+    Gera as linhas 6000 + 6100 para um único lançamento I200.
+    USA DIRETAMENTE lanc["partidas"] — sem nenhum agrupamento externo.
+    """
+    partidas = lanc["partidas"]
     debs  = [p for p in partidas if p["dc"] == "D"]
     creds = [p for p in partidas if p["dc"] == "C"]
+
     if not debs or not creds:
         return []
 
     data = _fmt_data_ecd(lanc["data"])
     tipo = _classif(len(debs), len(creds))
-    hist = _primeiro_hist(lanc["partidas"])
+    hist = _primeiro_hist(partidas)
     out  = [fmt_reg_6000(tipo)]
 
-    def linha(db_conta, cr_conta, valor, descr):
-        return fmt_reg_6100(data, db_conta, cr_conta, valor, "", descr)
+    def ln(db, cr, val, h):
+        return fmt_reg_6100(data, db, cr, val, "", h)
 
     if tipo == "X":
-        # 1 débito → 1 crédito
         h = _montar_hist_ecd(debs[0]) or hist
-        out.append(linha(
-            debs[0]["conta"],
-            creds[0]["conta"],
-            _str2float(debs[0]["valor"]),
-            h,
-        ))
+        out.append(ln(debs[0]["conta"], creds[0]["conta"],
+                      _str2float(debs[0]["valor"]), h))
 
     elif tipo == "D":
-        # 1 débito → vários créditos
+        # 1 débito → N créditos
         h = _montar_hist_ecd(debs[0]) or hist
-        out.append(linha(debs[0]["conta"], "", _str2float(debs[0]["valor"]), h))
+        out.append(ln(debs[0]["conta"], "", _str2float(debs[0]["valor"]), h))
         for cr in creds:
             h = _montar_hist_ecd(cr) or _montar_hist_ecd(debs[0]) or hist
-            out.append(linha("", cr["conta"], _str2float(cr["valor"]), h))
+            out.append(ln("", cr["conta"], _str2float(cr["valor"]), h))
 
     elif tipo == "C":
-        # vários débitos → 1 crédito
+        # N débitos → 1 crédito
         h = _montar_hist_ecd(creds[0]) or hist
-        out.append(linha("", creds[0]["conta"], _str2float(creds[0]["valor"]), h))
+        out.append(ln("", creds[0]["conta"], _str2float(creds[0]["valor"]), h))
         for db in debs:
             h = _montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
-            out.append(linha(db["conta"], "", _str2float(db["valor"]), h))
+            out.append(ln(db["conta"], "", _str2float(db["valor"]), h))
 
     else:
-        # V — produto cartesiano apenas quando o I200 realmente tem V×V
+        # V — produto cartesiano real (o I200 realmente tem N×N)
         for db in debs:
             for cr in creds:
                 h = _montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
-                out.append(linha(db["conta"], cr["conta"], _str2float(cr["valor"]), h))
-
+                out.append(ln(db["conta"], cr["conta"],
+                              _str2float(cr["valor"]), h))
     return out
 
-def _gerar_ecd(ecd, log, prog_bar, status):
-    linhas  = [fmt_reg_0000(re.sub(r"\D", "", ecd.cnpj))]
-    t6000   = t6100 = ignorados = 0
-    debug   = {"X": 0, "D": 0, "C": 0, "V": 0}
-    total   = len(ecd.lancamentos)
+def _gerar_ecd(ecd: SpedECD, log: list, prog_bar, status) -> list:
+    linhas   = [fmt_reg_0000(re.sub(r"\D", "", ecd.cnpj))]
+    t6000    = t6100 = ignorados = 0
+    debug    = {"X": 0, "D": 0, "C": 0, "V": 0}
+    total    = len(ecd.lancamentos)
+
     for idx, lanc in enumerate(ecd.lancamentos):
         if idx % 500 == 0 or idx == total - 1:
             prog_bar.progress(min(55 + int(((idx + 1) / total) * 35), 99))
             status.text(f"Gerando lançamento {idx+1:,}/{total:,}...")
+
         if not lanc.get("partidas"):
             ignorados += 1
             continue
+
         novas = _linhas_ecd(lanc)
         if not novas:
             ignorados += 1
             continue
+
         for l in novas:
             if l.startswith("|6000|"):
                 t = l.split("|")[2] if len(l.split("|")) > 2 else "?"
@@ -654,16 +725,19 @@ def _gerar_ecd(ecd, log, prog_bar, status):
             elif l.startswith("|6100|"):
                 t6100 += 1
         linhas.extend(novas)
-    log.append(f"  Registros 6000: {t6000:,} | 6100: {t6100:,} | Ignorados: {ignorados:,}")
+
+    log.append(f"  Reg. 6000 gerados  : {t6000:,}")
+    log.append(f"  Reg. 6100 gerados  : {t6100:,}")
+    log.append(f"  Ignorados          : {ignorados:,}")
     log.append(f"  Tipos — X:{debug['X']} D:{debug['D']} C:{debug['C']} V:{debug['V']}")
-    log.append(f"  Total linhas  : {len(linhas):,}")
+    log.append(f"  Total linhas saída : {len(linhas):,}")
     return linhas
 
-def _txt_erros_ecd(registros_erro, cnpj):
+def _txt_erros_ecd(registros_erro: list, cnpj: str) -> str:
     linhas = [
         "=" * 70,
         "RELATÓRIO DE ERROS — SPED ECD",
-        f"CNPJ: {cnpj}",
+        f"CNPJ : {cnpj}",
         f"Total: {len(registros_erro)}",
         "=" * 70, "",
     ]
@@ -699,23 +773,14 @@ def ler_txt_streaming(conteudo: bytes):
     enc = _detectar_encoding_bytes(conteudo)
     buf = io.BytesIO(conteudo)
     reader = pd.read_csv(
-        buf,
-        sep=";",
-        header=None,
-        names=COLS_PADRAO,
-        dtype=str,
-        encoding=enc,
-        on_bad_lines="skip",
-        engine="c",
-        usecols=range(len(COLS_PADRAO)),
-        chunksize=CHUNK_SIZE,
+        buf, sep=";", header=None, names=COLS_PADRAO, dtype=str,
+        encoding=enc, on_bad_lines="skip", engine="c",
+        usecols=range(len(COLS_PADRAO)), chunksize=CHUNK_SIZE,
     )
     linha_at = 0
     for chunk in reader:
         n = len(chunk)
-        chunk["_linha_origem"] = np.arange(
-            linha_at + 1, linha_at + n + 1, dtype=np.int32
-        )
+        chunk["_linha_origem"] = np.arange(linha_at + 1, linha_at + n + 1, dtype=np.int32)
         linha_at += n
         filtrado = _filtrar_chunk(chunk)
         del chunk
@@ -724,7 +789,7 @@ def ler_txt_streaming(conteudo: bytes):
         del filtrado
 
 def diagnosticar_lote(W: pd.DataFrame, dif: float) -> dict:
-    debs = W[W["td"]].copy()
+    debs  = W[W["td"]].copy()
     creds = W[W["tc"]].copy()
     td = round(float(debs["vf"].sum()), 2)
     tc = round(float(creds["vf"].sum()), 2)
@@ -768,206 +833,114 @@ def diagnosticar_lote(W: pd.DataFrame, dif: float) -> dict:
         "sugestao":      sugestao,
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GERAÇÃO DAS LINHAS 6100 — TXT / EXCEL
-# ─────────────────────────────────────────────────────────────────────────────
 def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list:
     out = []
-
     if tp == "X":
-        rd   = debs.iloc[0]
-        rc   = creds.iloc[0]
-        desc = _norm_hist(str(rd["desc"]) or str(rc["desc"]))
-        out.append(fmt_reg_6100(
-            formatar_data(rd["dt"]), str(rd["cd"]), str(rc["cc"]),
-            float(rd["vf"]), "", desc,
-        ))
-
+        rd = debs.iloc[0]; rc = creds.iloc[0]
+        out.append(fmt_reg_6100(formatar_data(rd["dt"]), str(rd["cd"]), str(rc["cc"]),
+                                float(rd["vf"]), "", _norm_hist(str(rd["desc"]) or str(rc["desc"]))))
     elif tp == "D":
-        rd   = debs.iloc[0]
-        desc = _norm_hist(str(rd["desc"]))
-        out.append(fmt_reg_6100(
-            formatar_data(rd["dt"]), str(rd["cd"]), "",
-            float(rd["vf"]), "", desc,
-        ))
+        rd = debs.iloc[0]
+        out.append(fmt_reg_6100(formatar_data(rd["dt"]), str(rd["cd"]), "",
+                                float(rd["vf"]), "", _norm_hist(str(rd["desc"]))))
         for _, rc in creds.iterrows():
-            desc = _norm_hist(str(rc["desc"]) or str(rd["desc"]))
-            out.append(fmt_reg_6100(
-                formatar_data(rd["dt"]), "", str(rc["cc"]),
-                float(rc["vf"]), "", desc,
-            ))
-
+            out.append(fmt_reg_6100(formatar_data(rd["dt"]), "", str(rc["cc"]),
+                                    float(rc["vf"]), "", _norm_hist(str(rc["desc"]) or str(rd["desc"]))))
     elif tp == "C":
-        rc   = creds.iloc[0]
-        desc = _norm_hist(str(rc["desc"]))
-        out.append(fmt_reg_6100(
-            formatar_data(debs.iloc[0]["dt"]), "", str(rc["cc"]),
-            float(rc["vf"]), "", desc,
-        ))
+        rc = creds.iloc[0]
+        out.append(fmt_reg_6100(formatar_data(debs.iloc[0]["dt"]), "", str(rc["cc"]),
+                                float(rc["vf"]), "", _norm_hist(str(rc["desc"]))))
         for _, rd in debs.iterrows():
-            desc = _norm_hist(str(rd["desc"]) or str(rc["desc"]))
-            out.append(fmt_reg_6100(
-                formatar_data(rd["dt"]), str(rd["cd"]), "",
-                float(rd["vf"]), "", desc,
-            ))
-
-    else:  # V
-        cross = debs[["cd", "vf", "desc", "dt"]].merge(
-            creds[["cc", "desc"]].rename(columns={"desc": "desc_c"}),
-            how="cross",
-        )
+            out.append(fmt_reg_6100(formatar_data(rd["dt"]), str(rd["cd"]), "",
+                                    float(rd["vf"]), "", _norm_hist(str(rd["desc"]) or str(rc["desc"]))))
+    else:
+        cross = debs[["cd","vf","desc","dt"]].merge(
+            creds[["cc","desc"]].rename(columns={"desc":"desc_c"}), how="cross")
         for _, row in cross.iterrows():
-            desc = _norm_hist(str(row["desc"]) or str(row["desc_c"]))
-            out.append(fmt_reg_6100(
-                formatar_data(row["dt"]), str(row["cd"]), str(row["cc"]),
-                float(row["vf"]), "", desc,
-            ))
-
+            out.append(fmt_reg_6100(formatar_data(row["dt"]), str(row["cd"]), str(row["cc"]),
+                                    float(row["vf"]), "", _norm_hist(str(row["desc"]) or str(row["desc_c"]))))
     return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ▌▌▌ NÚCLEO — _flush_lote ▌▌▌
+# NÚCLEO — _flush_lote
 # ═══════════════════════════════════════════════════════════════════════════════
-def _flush_lote(
-    df_lote:   pd.DataFrame,
-    num:       int,
-    saida_buf: io.StringIO,
-    resumo:    list,
-    erros:     list,
-) -> None:
+def _flush_lote(df_lote, num, saida_buf, resumo, erros):
     if df_lote is None or len(df_lote) == 0:
         return
-
-    v_float = limpar_valor_vec(df_lote["Valor"])
-    cd_arr  = limpar_contas_vec(df_lote["Cód. Conta Debito"])
-    cc_arr  = limpar_contas_vec(df_lote["Cód. Conta Credito"])
-    td_arr  = cd_arr != ""
-    tc_arr  = cc_arr != ""
+    v_float   = limpar_valor_vec(df_lote["Valor"])
+    cd_arr    = limpar_contas_vec(df_lote["Cód. Conta Debito"])
+    cc_arr    = limpar_contas_vec(df_lote["Cód. Conta Credito"])
+    td_arr    = cd_arr != ""
+    tc_arr    = cc_arr != ""
     ambos_arr = td_arr & tc_arr
-
-    vd_arr  = np.where(td_arr, v_float, 0.0)
-    vc_arr  = np.where(tc_arr, v_float, 0.0)
-    dt_arr  = df_lote["Data"].fillna("").astype(str).to_numpy()
-
-    col_desc = df_lote["Complemento Histórico"].fillna("").astype(str)
-    desc_arr = col_desc.to_numpy(dtype=object)
-    mask_esp = col_desc.str.contains(r'[^\x20-\x7E]|\|', regex=True, na=False).to_numpy()
+    vd_arr    = np.where(td_arr, v_float, 0.0)
+    vc_arr    = np.where(tc_arr, v_float, 0.0)
+    dt_arr    = df_lote["Data"].fillna("").astype(str).to_numpy()
+    col_desc  = df_lote["Complemento Histórico"].fillna("").astype(str)
+    desc_arr  = col_desc.to_numpy(dtype=object)
+    mask_esp  = col_desc.str.contains(r'[^\x20-\x7E]|\|', regex=True, na=False).to_numpy()
     for i in np.where(mask_esp)[0]:
         desc_arr[i] = _norm_hist(desc_arr[i])
-
     lo_arr = df_lote["_linha_origem"].fillna(0).astype(int).to_numpy(dtype=np.int32)
-
     W = pd.DataFrame({
-        "nl":    num,
-        "lo":    lo_arr,
-        "vd":    vd_arr,
-        "vc":    vc_arr,
-        "vf":    v_float,
-        "cd":    cd_arr,
-        "cc":    cc_arr,
-        "td":    td_arr,
-        "tc":    tc_arr,
-        "ambos": ambos_arr,
-        "dt":    dt_arr,
-        "desc":  desc_arr,
+        "nl": num, "lo": lo_arr, "vd": vd_arr, "vc": vc_arr, "vf": v_float,
+        "cd": cd_arr, "cc": cc_arr, "td": td_arr, "tc": tc_arr,
+        "ambos": ambos_arr, "dt": dt_arr, "desc": desc_arr,
     })
-
-    lm    = int(lo_arr.min()) if len(lo_arr) else 0
-    lx    = int(lo_arr.max()) if len(lo_arr) else 0
-    fx    = f"{lm}–{lx}" if lm != lx else str(lm)
+    lm = int(lo_arr.min()) if len(lo_arr) else 0
+    lx = int(lo_arr.max()) if len(lo_arr) else 0
+    fx = f"{lm}–{lx}" if lm != lx else str(lm)
     dt_fmt = formatar_data(dt_arr[0]) if len(dt_arr) else ""
 
     if ambos_arr.all():
         for _, row in W.iterrows():
-            desc      = _norm_hist(str(row["desc"]))
-            dt_linha  = formatar_data(str(row["dt"]))
-            linha_out = fmt_reg_6100(
-                dt_linha, str(row["cd"]), str(row["cc"]),
-                float(row["vf"]), "", desc,
-            )
+            desc = _norm_hist(str(row["desc"]))
+            dt_l = formatar_data(str(row["dt"]))
             saida_buf.write(fmt_reg_6000("X") + "\n")
-            saida_buf.write(linha_out + "\n")
-            resumo.append({
-                "num_lote":      num,
-                "data":          dt_linha,
-                "descricao":     desc,
-                "total_debito":  float(row["vf"]),
-                "total_credito": float(row["vf"]),
-                "diferenca":     0.0,
-                "balanceado":    True,
-                "qtd_linhas":    1,
-                "faixa_linhas":  str(int(row["lo"])),
-                "diagnostico":   {},
-            })
-        del W
-        return
+            saida_buf.write(fmt_reg_6100(dt_l, str(row["cd"]), str(row["cc"]),
+                                         float(row["vf"]), "", desc) + "\n")
+            resumo.append({"num_lote": num, "data": dt_l, "descricao": desc,
+                           "total_debito": float(row["vf"]), "total_credito": float(row["vf"]),
+                           "diferenca": 0.0, "balanceado": True, "qtd_linhas": 1,
+                           "faixa_linhas": str(int(row["lo"])), "diagnostico": {}})
+        del W; return
 
     if ambos_arr.any():
-        mask_ambos = W["ambos"]
-        for _, row in W[mask_ambos].iterrows():
-            desc      = _norm_hist(str(row["desc"]))
-            dt_linha  = formatar_data(str(row["dt"]))
-            linha_out = fmt_reg_6100(
-                dt_linha, str(row["cd"]), str(row["cc"]),
-                float(row["vf"]), "", desc,
-            )
+        for _, row in W[W["ambos"]].iterrows():
+            desc = _norm_hist(str(row["desc"]))
+            dt_l = formatar_data(str(row["dt"]))
             saida_buf.write(fmt_reg_6000("X") + "\n")
-            saida_buf.write(linha_out + "\n")
-            resumo.append({
-                "num_lote":      num,
-                "data":          dt_linha,
-                "descricao":     desc,
-                "total_debito":  float(row["vf"]),
-                "total_credito": float(row["vf"]),
-                "diferenca":     0.0,
-                "balanceado":    True,
-                "qtd_linhas":    1,
-                "faixa_linhas":  str(int(row["lo"])),
-                "diagnostico":   {},
-            })
-        W_resto = W[~mask_ambos].reset_index(drop=True)
+            saida_buf.write(fmt_reg_6100(dt_l, str(row["cd"]), str(row["cc"]),
+                                         float(row["vf"]), "", desc) + "\n")
+            resumo.append({"num_lote": num, "data": dt_l, "descricao": desc,
+                           "total_debito": float(row["vf"]), "total_credito": float(row["vf"]),
+                           "diferenca": 0.0, "balanceado": True, "qtd_linhas": 1,
+                           "faixa_linhas": str(int(row["lo"])), "diagnostico": {}})
+        W_resto = W[~W["ambos"]].reset_index(drop=True)
         if len(W_resto) > 0:
             _flush_lote_normal(W_resto, num, saida_buf, resumo, erros, fx, dt_fmt)
-        del W
-        return
+        del W; return
 
     _flush_lote_normal(W, num, saida_buf, resumo, erros, fx, dt_fmt)
     del W
 
-
-def _flush_lote_normal(
-    W:         pd.DataFrame,
-    num:       int,
-    saida_buf: io.StringIO,
-    resumo:    list,
-    erros:     list,
-    fx:        str,
-    dt_fmt:    str,
-) -> None:
-    td_arr = W["td"].to_numpy()
-    tc_arr = W["tc"].to_numpy()
-    vd_arr = W["vd"].to_numpy()
-    vc_arr = W["vc"].to_numpy()
+def _flush_lote_normal(W, num, saida_buf, resumo, erros, fx, dt_fmt):
+    td_arr   = W["td"].to_numpy()
+    tc_arr   = W["tc"].to_numpy()
+    vd_arr   = W["vd"].to_numpy()
+    vc_arr   = W["vc"].to_numpy()
     desc_arr = W["desc"].to_numpy()
-
-    td_sum = round(float(vd_arr[td_arr].sum()), 2)
-    tc_sum = round(float(vc_arr[tc_arr].sum()), 2)
-    dif    = round(abs(td_sum - tc_sum), 2)
-    ok     = dif < TOL_VALOR
-
-    entrada = {
-        "num_lote":      num,
-        "data":          dt_fmt,
-        "descricao":     str(desc_arr[0]) if len(desc_arr) else "",
-        "total_debito":  td_sum,
-        "total_credito": tc_sum,
-        "diferenca":     dif,
-        "balanceado":    ok,
-        "qtd_linhas":    len(W),
-        "faixa_linhas":  fx,
-        "diagnostico":   {},
+    td_sum   = round(float(vd_arr[td_arr].sum()), 2)
+    tc_sum   = round(float(vc_arr[tc_arr].sum()), 2)
+    dif      = round(abs(td_sum - tc_sum), 2)
+    ok       = dif < TOL_VALOR
+    entrada  = {
+        "num_lote": num, "data": dt_fmt,
+        "descricao": str(desc_arr[0]) if len(desc_arr) else "",
+        "total_debito": td_sum, "total_credito": tc_sum,
+        "diferenca": dif, "balanceado": ok,
+        "qtd_linhas": len(W), "faixa_linhas": fx, "diagnostico": {},
     }
-
     if not ok:
         entrada["diagnostico"] = diagnosticar_lote(W, dif)
         erros.append(entrada)
@@ -975,108 +948,69 @@ def _flush_lote_normal(
         debs  = W[W["td"]].reset_index(drop=True)
         creds = W[W["tc"]].reset_index(drop=True)
         if len(debs) > 0 and len(creds) > 0:
-            nd = len(debs)
-            nc = len(creds)
-            tp = tipo_lancamento(nd, nc)
-            linhas_out = [fmt_reg_6000(tp)]
-            linhas_out.extend(_gerar_linhas_6100(debs, creds, tp))
+            tp = tipo_lancamento(len(debs), len(creds))
+            linhas_out = [fmt_reg_6000(tp)] + _gerar_linhas_6100(debs, creds, tp)
             saida_buf.write("\n".join(linhas_out) + "\n")
-
     resumo.append(entrada)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROCESSAMENTO STREAMING — TXT
 # ═══════════════════════════════════════════════════════════════════════════════
 def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
-    saida_buf  = io.StringIO()
+    saida_buf   = io.StringIO()
     saida_buf.write(fmt_reg_0000(ni) + "\n")
-
-    pendente      = None
-    num_lote_g    = 0
-    usa_inicia    = None
-    resumo: list  = []
-    erros:  list  = []
-    total_lins    = 0
-    ignoradas     = 0
-    enc_final     = "utf-8"
-    chunk_count   = 0
+    pendente    = None
+    num_lote_g  = 0
+    usa_inicia  = None
+    resumo: list = []
+    erros:  list = []
+    total_lins  = 0
+    ignoradas   = 0
+    enc_final   = "utf-8"
+    chunk_count = 0
 
     for chunk_df, enc in ler_txt_streaming(conteudo):
         enc_final   = enc
         total_lins += len(chunk_df)
         chunk_count += 1
-
         if usa_inicia is None:
-            usa_inicia = bool(
-                (chunk_df["Inicia Lote"].str.strip() != "").any()
-            )
-
+            usa_inicia = bool((chunk_df["Inicia Lote"].str.strip() != "").any())
         if pendente is not None and len(pendente) > 0:
             chunk_df = pd.concat([pendente, chunk_df], ignore_index=True)
             pendente = None
-
         if usa_inicia:
             inicia   = chunk_df["Inicia Lote"].fillna("").astype(str).str.strip()
             marcador = (inicia != "").to_numpy(dtype=bool)
             nums     = np.cumsum(marcador, dtype=np.int32) + num_lote_g
             chunk_df["_num_lote"] = nums
         else:
-            cd_tmp = limpar_contas_vec(chunk_df["Cód. Conta Debito"])
-            cc_tmp = limpar_contas_vec(chunk_df["Cód. Conta Credito"])
+            cd_tmp    = limpar_contas_vec(chunk_df["Cód. Conta Debito"])
+            cc_tmp    = limpar_contas_vec(chunk_df["Cód. Conta Credito"])
             ambos_tmp = (cd_tmp != "") & (cc_tmp != "")
-
             if ambos_tmp.all():
-                nums = np.arange(
-                    num_lote_g + 1,
-                    num_lote_g + len(chunk_df) + 1,
-                    dtype=np.int32,
-                )
+                nums = np.arange(num_lote_g+1, num_lote_g+len(chunk_df)+1, dtype=np.int32)
                 chunk_df["_num_lote"] = nums
             elif ambos_tmp.any():
-                desc  = (
-                    chunk_df["Complemento Histórico"]
-                    .fillna("").astype(str).str.strip()
-                    .str.upper().str.replace(r"\s+", " ", regex=True)
-                )
-                chave = (
-                    chunk_df["Data"].fillna("").astype(str).str.strip()
-                    + "|||" + desc
-                ).to_numpy()
-                muda       = np.empty(len(chave), dtype=bool)
-                muda[0]    = True
-                muda[1:]   = chave[1:] != chave[:-1]
-                muda = muda | ambos_tmp
-                nums = np.cumsum(muda, dtype=np.int32) + num_lote_g
-                chunk_df["_num_lote"] = nums
+                desc  = chunk_df["Complemento Histórico"].fillna("").astype(str).str.strip().str.upper().str.replace(r"\s+"," ",regex=True)
+                chave = (chunk_df["Data"].fillna("").astype(str).str.strip()+"|||"+desc).to_numpy()
+                muda  = np.empty(len(chave), dtype=bool); muda[0]=True; muda[1:]=chave[1:]!=chave[:-1]
+                muda  = muda | ambos_tmp
+                chunk_df["_num_lote"] = np.cumsum(muda, dtype=np.int32) + num_lote_g
             else:
-                desc  = (
-                    chunk_df["Complemento Histórico"]
-                    .fillna("").astype(str).str.strip()
-                    .str.upper().str.replace(r"\s+", " ", regex=True)
-                )
-                chave = (
-                    chunk_df["Data"].fillna("").astype(str).str.strip()
-                    + "|||" + desc
-                ).to_numpy()
-                muda       = np.empty(len(chave), dtype=bool)
-                muda[0]    = True
-                muda[1:]   = chave[1:] != chave[:-1]
-                nums       = np.cumsum(muda, dtype=np.int32) + num_lote_g
-                chunk_df["_num_lote"] = nums
+                desc  = chunk_df["Complemento Histórico"].fillna("").astype(str).str.strip().str.upper().str.replace(r"\s+"," ",regex=True)
+                chave = (chunk_df["Data"].fillna("").astype(str).str.strip()+"|||"+desc).to_numpy()
+                muda  = np.empty(len(chave), dtype=bool); muda[0]=True; muda[1:]=chave[1:]!=chave[:-1]
+                chunk_df["_num_lote"] = np.cumsum(muda, dtype=np.int32) + num_lote_g
 
         ultimo_lote = int(chunk_df["_num_lote"].max())
         mask_ultimo = chunk_df["_num_lote"] == ultimo_lote
         pendente    = chunk_df[mask_ultimo].copy()
         chunk_proc  = chunk_df[~mask_ultimo]
         del chunk_df
-
         for nl, grupo in chunk_proc.groupby("_num_lote", sort=True):
             _flush_lote(grupo, int(nl), saida_buf, resumo, erros)
-
         num_lote_g = ultimo_lote - 1
         del chunk_proc
-
         if chunk_count % 5 == 0:
             gc.collect()
 
@@ -1086,19 +1020,17 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
         del pendente
 
     gc.collect()
-
-    log.append(f"  Linhas lidas       : {total_lins:,}")
-    log.append(f"  Ignoradas          : {ignoradas:,}")
-    log.append(f"  Lotes processados  : {len(resumo):,}")
-    log.append(f"  Lotes OK           : {len(resumo) - len(erros):,}")
-    log.append(f"  Lotes com erro     : {len(erros):,}")
-
+    log.append(f"  Linhas lidas      : {total_lins:,}")
+    log.append(f"  Ignoradas         : {ignoradas:,}")
+    log.append(f"  Lotes processados : {len(resumo):,}")
+    log.append(f"  Lotes OK          : {len(resumo)-len(erros):,}")
+    log.append(f"  Lotes com erro    : {len(erros):,}")
     saida_bytes = saida_buf.getvalue().encode("utf-8-sig")
     del saida_buf
     return saida_bytes, resumo, erros, total_lins, ignoradas, enc_final
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ▌▌▌ MÓDULO LANÇAMENTOS EM LOTE — EXCEL ▌▌▌
+# MÓDULO EXCEL
 # ═══════════════════════════════════════════════════════════════════════════════
 _COLS_ESP_LOW = [c.lower() for c in COLS_PADRAO[:8]]
 
@@ -1108,7 +1040,7 @@ def detectar_cabecalho_excel(conteudo: bytes, sheet: str) -> tuple:
     pasta = None
     try:
         v = str(raw.iloc[1, 6]).strip()
-        if v and v.lower() not in ("nan", "none", ""):
+        if v and v.lower() not in ("nan","none",""):
             pasta = v
     except Exception:
         pass
@@ -1124,28 +1056,23 @@ def ler_excel_lote(conteudo: bytes, sheet: str, linha_h: int) -> tuple:
     pasta = "C:\\Temp"
     try:
         v = str(raw.iloc[1, 6]).strip()
-        if v and v.lower() not in ("nan", "none", ""):
+        if v and v.lower() not in ("nan","none",""):
             pasta = v
     except Exception:
         pass
     while raw.shape[1] < len(COLS_PADRAO) + 2:
         raw[raw.shape[1]] = ""
     raw.columns = range(raw.shape[1])
-    df = raw.iloc[linha_h + 1:].reset_index(drop=True).copy()
-    del raw
-    gc.collect()
+    df = raw.iloc[linha_h+1:].reset_index(drop=True).copy()
+    del raw; gc.collect()
     df.columns = list(range(df.shape[1]))
     df = df.rename(columns={i: c for i, c in enumerate(COLS_PADRAO)})
-    _V = {"nan", "NaN", "None", "none", ""}
+    _V = {"nan","NaN","None","none",""}
     for c in COLS_PADRAO:
         if c in df.columns:
             df[c] = df[c].fillna("").astype(str).str.strip().replace(list(_V), "")
-    mask = ~(
-        (df["Data"] == "") &
-        (df["Cód. Conta Debito"] == "") &
-        (df["Cód. Conta Credito"] == "") &
-        (df["Valor"] == "")
-    )
+    mask = ~((df["Data"]=="")&(df["Cód. Conta Debito"]=="")&
+             (df["Cód. Conta Credito"]=="")&(df["Valor"]==""))
     df = df[mask].reset_index(drop=True).copy()
     df["_linha_origem"] = (df.index + linha_h + 2).astype(np.int32)
     return df, pasta
@@ -1155,46 +1082,28 @@ def montar_lotes_excel(df: pd.DataFrame) -> tuple:
     for col in COLS_PADRAO + ["_linha_origem"]:
         if col not in R.columns:
             R[col] = ""
-
     inicia  = R["Inicia Lote"].fillna("").astype(str).str.strip()
     tem_ini = bool((inicia != "").any())
-
     if tem_ini:
         marcador = (inicia != "").to_numpy(dtype=bool)
-        R["_num_lote"] = np.where(
-            np.cumsum(marcador) > 0,
-            np.cumsum(marcador, dtype=np.int32),
-            np.int32(1),
-        )
+        R["_num_lote"] = np.where(np.cumsum(marcador)>0,
+                                   np.cumsum(marcador,dtype=np.int32), np.int32(1))
     else:
         cd_tmp    = limpar_contas_vec(R["Cód. Conta Debito"])
         cc_tmp    = limpar_contas_vec(R["Cód. Conta Credito"])
         ambos_tmp = (cd_tmp != "") & (cc_tmp != "")
-
         if ambos_tmp.all():
-            R["_num_lote"] = np.arange(1, len(R) + 1, dtype=np.int32)
+            R["_num_lote"] = np.arange(1, len(R)+1, dtype=np.int32)
         elif ambos_tmp.any():
-            desc  = (
-                R["Complemento Histórico"].fillna("").astype(str).str.strip()
-                .str.upper().str.replace(r"\s+", " ", regex=True)
-            )
-            chave = (R["Data"].fillna("").astype(str).str.strip() + "|||" + desc).to_numpy()
-            muda  = np.empty(len(chave), dtype=bool)
-            muda[0]  = True
-            muda[1:] = chave[1:] != chave[:-1]
-            muda     = muda | ambos_tmp
-            R["_num_lote"] = np.cumsum(muda, dtype=np.int32)
+            desc  = R["Complemento Histórico"].fillna("").astype(str).str.strip().str.upper().str.replace(r"\s+"," ",regex=True)
+            chave = (R["Data"].fillna("").astype(str).str.strip()+"|||"+desc).to_numpy()
+            muda  = np.empty(len(chave), dtype=bool); muda[0]=True; muda[1:]=chave[1:]!=chave[:-1]
+            R["_num_lote"] = np.cumsum(muda|ambos_tmp, dtype=np.int32)
         else:
-            desc  = (
-                R["Complemento Histórico"].fillna("").astype(str).str.strip()
-                .str.upper().str.replace(r"\s+", " ", regex=True)
-            )
-            chave = (R["Data"].fillna("").astype(str).str.strip() + "|||" + desc).to_numpy()
-            muda  = np.empty(len(chave), dtype=bool)
-            muda[0]  = True
-            muda[1:] = chave[1:] != chave[:-1]
+            desc  = R["Complemento Histórico"].fillna("").astype(str).str.strip().str.upper().str.replace(r"\s+"," ",regex=True)
+            chave = (R["Data"].fillna("").astype(str).str.strip()+"|||"+desc).to_numpy()
+            muda  = np.empty(len(chave), dtype=bool); muda[0]=True; muda[1:]=chave[1:]!=chave[:-1]
             R["_num_lote"] = np.cumsum(muda, dtype=np.int32)
-
     return R, "Inicia Lote" if tem_ini else "Data + Descrição"
 
 def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
@@ -1202,16 +1111,12 @@ def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
     saida_buf.write(fmt_reg_0000(ni) + "\n")
     resumo: list = []
     erros:  list = []
-
     for nl, grupo in df.groupby("_num_lote", sort=True):
         _flush_lote(grupo, int(nl), saida_buf, resumo, erros)
-
     gc.collect()
-
-    log.append(f"  Lotes processados  : {len(resumo):,}")
-    log.append(f"  Lotes OK           : {len(resumo) - len(erros):,}")
-    log.append(f"  Lotes com erro     : {len(erros):,}")
-
+    log.append(f"  Lotes processados : {len(resumo):,}")
+    log.append(f"  Lotes OK          : {len(resumo)-len(erros):,}")
+    log.append(f"  Lotes com erro    : {len(erros):,}")
     saida_bytes = saida_buf.getvalue().encode("utf-8-sig")
     del saida_buf
     return saida_bytes, resumo, erros
@@ -1219,63 +1124,36 @@ def processar_excel(df: pd.DataFrame, ni: str, log: list) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOG LOTE
 # ═══════════════════════════════════════════════════════════════════════════════
-def _montar_log_lote(
-    resumo, erros, ni, ti, inf,
-    n_gravados, ignoradas, enc, crono: Cronometro,
-) -> str:
-    td  = sum(v["total_debito"]  for v in resumo)
-    tc  = sum(v["total_credito"] for v in resumo)
-    ok  = len(resumo) - len(erros)
+def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc, crono):
+    td   = sum(v["total_debito"]  for v in resumo)
+    tc   = sum(v["total_credito"] for v in resumo)
+    ok   = len(resumo) - len(erros)
     conc = "SUCESSO" if not erros else f"ATENÇÃO — {len(erros)} lote(s) desbalanceado(s)"
-    SEP  = "═" * 90
-    sep2 = "─" * 90
-    L = [
-        SEP,
-        "  DOMÍNIO SISTEMAS  |  Thomson Reuters",
-        "  LOG DE VALIDAÇÃO — LANÇAMENTOS CONTÁBEIS",
-        SEP,
-        f"  Data/Hora     : {ts_log()}",
-        f"  Encoding leit.: {enc or 'N/A'}",
-        f"  {ti:<6}         : {inf}",
-        SEP, "",
-        "  RESUMO GERAL", sep2,
-        f"  Lotes total   : {len(resumo):>10,}",
-        f"  Lotes OK      : {ok:>10,}",
-        f"  Lotes ERRO    : {len(erros):>10,}",
-        f"  Reg. 6000+6100: {n_gravados:>10,}",
-        f"  Ignoradas     : {ignoradas:>10,}",
-        f"  Total Déb.    : R$ {td:>14.2f}",
-        f"  Total Créd.   : R$ {tc:>14.2f}",
-        f"  Conclusão     : {conc}", "",
-    ]
+    SEP  = "═" * 90; sep2 = "─" * 90
+    L = [SEP, "  DOMÍNIO SISTEMAS  |  Thomson Reuters",
+         "  LOG DE VALIDAÇÃO — LANÇAMENTOS CONTÁBEIS", SEP,
+         f"  Data/Hora     : {ts_log()}", f"  Encoding leit.: {enc or 'N/A'}",
+         f"  {ti:<6}         : {inf}", SEP, "",
+         "  RESUMO GERAL", sep2,
+         f"  Lotes total   : {len(resumo):>10,}", f"  Lotes OK      : {ok:>10,}",
+         f"  Lotes ERRO    : {len(erros):>10,}", f"  Reg. 6000+6100: {n_gravados:>10,}",
+         f"  Ignoradas     : {ignoradas:>10,}", f"  Total Déb.    : R$ {td:>14.2f}",
+         f"  Total Créd.   : R$ {tc:>14.2f}", f"  Conclusão     : {conc}", ""]
     if crono and crono.etapas:
         total_seg = sum(e["segundos"] for e in crono.etapas)
         L += [sep2, "  RELATÓRIO DE TEMPO", sep2]
         for e in crono.etapas:
             L.append(f"  {'  '+e['nome']:<38} {Cronometro.fmt(e['segundos']):>8}")
-        L += ["  " + "─" * 46, f"  {'  TOTAL':<38} {Cronometro.fmt(total_seg):>8}", ""]
-    L += [
-        sep2,
-        f"  {'Lote':<8}{'Linhas':<16}{'Data':<13}{'Qtd':<6}"
-        f"{'Débito':>15}{'Crédito':>15}{'Diferença':>13}  Status",
-        "  " + "─" * 88,
-    ]
+        L += ["  "+"─"*46, f"  {'  TOTAL':<38} {Cronometro.fmt(total_seg):>8}", ""]
+    L += [sep2,
+          f"  {'Lote':<8}{'Linhas':<16}{'Data':<13}{'Qtd':<6}{'Débito':>15}{'Crédito':>15}{'Diferença':>13}  Status",
+          "  "+"─"*88]
     for v in resumo:
-        L.append(
-            f"  {str(v['num_lote']):<8}{v['faixa_linhas']:<16}"
-            f"{v['data']:<13}{str(v['qtd_linhas']):<6}"
-            f"R$ {v['total_debito']:>12.2f}  R$ {v['total_credito']:>12.2f}"
-            f"  R$ {v['diferenca']:>10.2f}   "
-            f"{'✔ OK' if v['balanceado'] else '✖ ERRO'}"
-        )
-    L += [
-        "  " + "─" * 88,
-        f"  {'TOTAIS':<37}R$ {td:>12.2f}  R$ {tc:>12.2f}", "",
-        SEP,
-        f"  Fim  │  {ts_log()}",
-        f"  Resultado │  {conc}",
-        SEP,
-    ]
+        L.append(f"  {str(v['num_lote']):<8}{v['faixa_linhas']:<16}{v['data']:<13}{str(v['qtd_linhas']):<6}"
+                 f"R$ {v['total_debito']:>12.2f}  R$ {v['total_credito']:>12.2f}  R$ {v['diferenca']:>10.2f}   "
+                 f"{'✔ OK' if v['balanceado'] else '✖ ERRO'}")
+    L += ["  "+"─"*88, f"  {'TOTAIS':<37}R$ {td:>12.2f}  R$ {tc:>12.2f}", "",
+          SEP, f"  Fim  │  {ts_log()}", f"  Resultado │  {conc}", SEP]
     return "\n".join(L)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1283,45 +1161,31 @@ def _montar_log_lote(
 # ═══════════════════════════════════════════════════════════════════════════════
 def _init_state():
     defaults = {
-        "resultado_bytes": None,
-        "resultado_nome":  "saida.txt",
-        "erros_bytes":     None,
-        "erros_nome":      "erros.txt",
-        "log_bytes":       None,
-        "log_nome":        "log.txt",
-        "log_linhas":      [],
-        "resumo":          [],
-        "erros_lote":      [],
-        "metricas":        {},
-        "tipo_detectado":  None,
-        "sheets":          [],
-        "sheet_sel":       "",
-        "arquivo_bytes":   None,
-        "arquivo_nome":    "",
-        "processado":      False,
-        "cnpj_ecd":        "",
-        "cnpj_ecd_fmt":    "",
+        "resultado_bytes": None, "resultado_nome": "saida.txt",
+        "erros_bytes": None,     "erros_nome": "erros.txt",
+        "log_bytes": None,       "log_nome": "log.txt",
+        "log_linhas": [],        "resumo": [],
+        "erros_lote": [],        "metricas": {},
+        "tipo_detectado": None,  "sheets": [],
+        "sheet_sel": "",         "arquivo_bytes": None,
+        "arquivo_nome": "",      "processado": False,
+        "cnpj_ecd": "",          "cnpj_ecd_fmt": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 def _reset():
-    keys = [
-        "resultado_bytes","resultado_nome","erros_bytes","erros_nome",
-        "log_bytes","log_nome","log_linhas","resumo","erros_lote",
-        "metricas","tipo_detectado","sheets","sheet_sel",
-        "arquivo_bytes","arquivo_nome","processado",
-        "cnpj_ecd","cnpj_ecd_fmt",
-    ]
+    keys = ["resultado_bytes","resultado_nome","erros_bytes","erros_nome",
+            "log_bytes","log_nome","log_linhas","resumo","erros_lote",
+            "metricas","tipo_detectado","sheets","sheet_sel",
+            "arquivo_bytes","arquivo_nome","processado","cnpj_ecd","cnpj_ecd_fmt"]
     for k in keys:
         st.session_state[k] = (
-            []    if k in ("log_linhas","resumo","erros_lote","sheets") else
-            {}    if k == "metricas" else
-            None  if k.endswith("_bytes") else
-            False if k == "processado" else
-            ""
-        )
+            [] if k in ("log_linhas","resumo","erros_lote","sheets") else
+            {} if k == "metricas" else
+            None if k.endswith("_bytes") else
+            False if k == "processado" else "")
 
 def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
     enc = _detectar_encoding_bytes(conteudo)
@@ -1338,358 +1202,174 @@ def _pre_scan_cnpj_ecd(conteudo: bytes) -> str:
     return ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAINEL DE RESULTADOS — LOTES
+# PAINÉIS DE RESULTADO
 # ═══════════════════════════════════════════════════════════════════════════════
 def _render_resultados_lote(exibir_log: bool):
     resumo   = st.session_state.resumo     or []
     erros    = st.session_state.erros_lote or []
     metricas = st.session_state.metricas   or {}
-
     st.markdown("---")
     st.markdown("## 📊 Resultado da Conversão")
-
     if metricas:
         cols = st.columns(len(metricas))
         for i, (k, v) in enumerate(metricas.items()):
             cols[i].metric(k, v)
-
     if resumo:
-        total    = len(resumo)
-        n_ok     = sum(1 for v in resumo if v["balanceado"])
-        n_err    = total - n_ok
-        pct_ok   = n_ok / total if total > 0 else 0.0
-
+        total   = len(resumo)
+        n_ok    = sum(1 for v in resumo if v["balanceado"])
+        n_err   = total - n_ok
+        pct_ok  = n_ok / total if total > 0 else 0.0
         td_total  = sum(v["total_debito"]  for v in resumo)
         tc_total  = sum(v["total_credito"] for v in resumo)
         dif_geral = round(abs(td_total - tc_total), 2)
         tudo_ok   = dif_geral < TOL_VALOR and n_err == 0
-
         if tudo_ok:
-            st.markdown(
-                "<div class='card-ok'>"
-                "<span style='font-size:22px;'>✅</span> "
-                "<b style='color:#00C896;font-size:18px;'>"
-                "Todos os lotes estão fechados e balanceados.</b>"
-                "<br><span style='color:#6B7A8D;font-size:13px;'>"
-                "Débito total == Crédito total — arquivo pronto para importação."
-                "</span></div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div class='card-ok'><span style='font-size:22px;'>✅</span> "
+                        "<b style='color:#00C896;font-size:18px;'>Todos os lotes balanceados.</b></div>",
+                        unsafe_allow_html=True)
         else:
-            st.markdown(
-                f"<div class='card-err'>"
-                f"<span style='font-size:22px;'>⚠️</span> "
-                f"<b style='color:#FF4444;font-size:18px;'>"
-                f"{n_err} lote(s) desbalanceado(s) de {total}.</b>"
-                f"<br><span style='color:#6B7A8D;font-size:13px;'>"
-                f"Diferença acumulada: R$ {dif_geral:,.2f} — "
-                f"verifique o diagnóstico abaixo."
-                f"</span></div>",
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("#### 🔒 Fechamento dos Lotes")
-        col_barra, col_nums = st.columns([3, 1])
+            st.markdown(f"<div class='card-err'><span style='font-size:22px;'>⚠️</span> "
+                        f"<b style='color:#FF4444;font-size:18px;'>{n_err} lote(s) desbalanceado(s).</b></div>",
+                        unsafe_allow_html=True)
+        col_barra, col_nums = st.columns([3,1])
         with col_barra:
             st.progress(pct_ok)
-            st.caption(
-                f"{n_ok:,} de {total:,} lotes balanceados "
-                f"({pct_ok * 100:.1f}%)"
-            )
+            st.caption(f"{n_ok:,} de {total:,} lotes balanceados ({pct_ok*100:.1f}%)")
         with col_nums:
             st.metric("✅ Balanceados", f"{n_ok:,}")
             st.metric("❌ Com erro",    f"{n_err:,}")
-
         col_d, col_c, col_dif = st.columns(3)
-        col_d.metric("Total Débito",   f"R$ {td_total:,.2f}")
-        col_c.metric("Total Crédito",  f"R$ {tc_total:,.2f}")
-        col_dif.metric(
-            "Diferença Geral",
-            f"R$ {dif_geral:,.2f}",
-            delta="OK" if tudo_ok else f"R$ {dif_geral:,.2f} descoberto",
-            delta_color="normal" if tudo_ok else "inverse",
-        )
+        col_d.metric("Total Débito",  f"R$ {td_total:,.2f}")
+        col_c.metric("Total Crédito", f"R$ {tc_total:,.2f}")
+        col_dif.metric("Diferença Geral", f"R$ {dif_geral:,.2f}",
+                       delta="OK" if tudo_ok else f"R$ {dif_geral:,.2f}",
+                       delta_color="normal" if tudo_ok else "inverse")
 
     if resumo:
         st.markdown("#### 📋 Detalhe por Lote")
-
-        filtro = st.radio(
-            "Exibir lotes:",
-            ["Todos", "✅ Somente OK", "❌ Somente com erro"],
-            horizontal=True,
-            key="filtro_lotes_radio",
-        )
-
+        filtro = st.radio("Exibir lotes:", ["Todos","✅ Somente OK","❌ Somente com erro"],
+                          horizontal=True, key="filtro_lotes_radio")
         rows = []
         for v in resumo:
             if filtro == "✅ Somente OK"      and not v["balanceado"]: continue
             if filtro == "❌ Somente com erro" and     v["balanceado"]: continue
-            rows.append({
-                "Lote":      v["num_lote"],
-                "Linhas":    v["faixa_linhas"],
-                "Data":      v["data"],
-                "Qtd":       v["qtd_linhas"],
-                "Débito":    v["total_debito"],
-                "Crédito":   v["total_credito"],
-                "Diferença": v["diferenca"],
-                "Status":    "✔ OK" if v["balanceado"] else "✖ ERRO",
-            })
-
+            rows.append({"Lote": v["num_lote"], "Linhas": v["faixa_linhas"],
+                         "Data": v["data"], "Qtd": v["qtd_linhas"],
+                         "Débito": v["total_debito"], "Crédito": v["total_credito"],
+                         "Diferença": v["diferenca"],
+                         "Status": "✔ OK" if v["balanceado"] else "✖ ERRO"})
         if rows:
             df_res = pd.DataFrame(rows)
-
-            def _cor_status(val):
-                return (
-                    "color:#00C896;font-weight:700" if val == "✔ OK"
-                    else "color:#FF4444;font-weight:700"
-                )
-
-            def _cor_dif(val):
-                return "color:#FF4444" if val > TOL_VALOR else "color:#00C896"
-
-            styled = (
-                df_res.style
-                .map(_cor_status, subset=["Status"])
-                .map(_cor_dif,    subset=["Diferença"])
-                .format({
-                    "Débito":    "R$ {:,.2f}",
-                    "Crédito":   "R$ {:,.2f}",
-                    "Diferença": "R$ {:,.2f}",
-                })
-            )
+            styled = (df_res.style
+                      .map(lambda v: "color:#00C896;font-weight:700" if v=="✔ OK" else "color:#FF4444;font-weight:700", subset=["Status"])
+                      .map(lambda v: "color:#FF4444" if v > TOL_VALOR else "color:#00C896", subset=["Diferença"])
+                      .format({"Débito":"R$ {:,.2f}","Crédito":"R$ {:,.2f}","Diferença":"R$ {:,.2f}"}))
             st.dataframe(styled, use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhum lote encontrado para o filtro selecionado.")
 
     if erros:
         st.markdown("#### 🔍 Diagnóstico dos Lotes Desbalanceados")
-
-        total_dif_erros = sum(e["diferenca"] for e in erros)
-        st.markdown(
-            f"<div class='card-warn'>"
-            f"<b style='color:#FFD166;'>⚡ {len(erros)} lote(s) com diferença</b> "
-            f"— Soma das diferenças: "
-            f"<b style='color:#FF4444;'>R$ {total_dif_erros:,.2f}</b>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
         for e in erros:
             diag  = e.get("diagnostico", {})
-            label = (
-                f"Lote {e['num_lote']}  │  "
-                f"Linhas {e['faixa_linhas']}  │  "
-                f"Data {e['data']}  │  "
-                f"Dif. R$ {e['diferenca']:,.2f}"
-            )
-            with st.expander(label, expanded=(len(erros) == 1)):
-                sugestao = diag.get("sugestao", "")
-                if sugestao:
-                    st.markdown(
-                        f"<div class='card-warn'>"
-                        f"💡 <b style='color:#FFD166;'>Sugestão:</b> {sugestao}"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Débito",    f"R$ {diag.get('total_debito',  0):,.2f}")
-                c2.metric("Crédito",   f"R$ {diag.get('total_credito', 0):,.2f}")
-                c3.metric("Diferença", f"R$ {diag.get('diferenca',     0):,.2f}")
-                c4.metric(
-                    "Partidas",
-                    f"D:{diag.get('qtd_debitos',0)} / C:{diag.get('qtd_creditos',0)}"
-                )
-
-                suspeitas = diag.get("suspeitas", [])
-                if suspeitas:
-                    st.markdown("**⚡ Linhas suspeitas:**")
-                    for s in suspeitas:
-                        tp  = "DÉBITO" if s["tipo"] == "D" else "CRÉDITO"
-                        cta = s["conta_debito"] or s["conta_credito"]
-                        st.markdown(
-                            f"- Linha `{s['linha_origem']}` — **{tp}** "
-                            f"Conta `{cta}` — "
-                            f"R$ `{s['valor']:,.2f}` — {s['motivo']}"
-                        )
-
-                linhas_det = diag.get("linhas", [])
-                if linhas_det:
-                    df_det = pd.DataFrame(linhas_det)
-                    cols_show = [
-                        c for c in [
-                            "linha_origem", "tipo", "conta_debito",
-                            "conta_credito", "valor", "descricao",
-                        ] if c in df_det.columns
-                    ]
-
-                    def _cor_tipo(val):
-                        return (
-                            "color:#6EC6FF;font-weight:700" if val == "D"
-                            else "color:#FF9EBC;font-weight:700"
-                        )
-
-                    styled_det = (
-                        df_det[cols_show].style
-                        .map(_cor_tipo, subset=["tipo"])
-                        .format({"valor": "R$ {:,.2f}"})
-                    )
-                    st.dataframe(
-                        styled_det,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+            label = (f"Lote {e['num_lote']}  │  Linhas {e['faixa_linhas']}  │  "
+                     f"Data {e['data']}  │  Dif. R$ {e['diferenca']:,.2f}")
+            with st.expander(label, expanded=(len(erros)==1)):
+                if diag.get("sugestao"):
+                    st.markdown(f"<div class='card-warn'>💡 <b style='color:#FFD166;'>Sugestão:</b> {diag['sugestao']}</div>",
+                                unsafe_allow_html=True)
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Débito",    f"R$ {diag.get('total_debito',0):,.2f}")
+                c2.metric("Crédito",   f"R$ {diag.get('total_credito',0):,.2f}")
+                c3.metric("Diferença", f"R$ {diag.get('diferenca',0):,.2f}")
+                c4.metric("Partidas",  f"D:{diag.get('qtd_debitos',0)} / C:{diag.get('qtd_creditos',0)}")
+                for s in diag.get("suspeitas",[]):
+                    tp  = "DÉBITO" if s["tipo"]=="D" else "CRÉDITO"
+                    cta = s["conta_debito"] or s["conta_credito"]
+                    st.markdown(f"- Linha `{s['linha_origem']}` — **{tp}** Cta `{cta}` — R$ `{s['valor']:,.2f}` — {s['motivo']}")
+                if diag.get("linhas"):
+                    df_det = pd.DataFrame(diag["linhas"])
+                    cols_show = [c for c in ["linha_origem","tipo","conta_debito","conta_credito","valor","descricao"] if c in df_det.columns]
+                    st.dataframe(df_det[cols_show].style
+                                 .map(lambda v: "color:#6EC6FF;font-weight:700" if v=="D" else "color:#FF9EBC;font-weight:700", subset=["tipo"])
+                                 .format({"valor":"R$ {:,.2f}"}),
+                                 use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("#### ⬇ Downloads")
     dl1, dl2, dl3 = st.columns(3)
-
-    n_err = len(erros)
-    n_ok  = len(resumo) - n_err
-
+    n_err = len(erros); n_ok = len(resumo) - n_err
     with dl1:
         if st.session_state.resultado_bytes:
-            if n_err == 0:
-                st.success(f"✅ {n_ok:,} lotes — arquivo pronto!")
-            else:
-                st.warning(f"⚠ {n_ok:,} OK / {n_err:,} com erro — arquivo parcial.")
-            st.download_button(
-                "⬇ Baixar arquivo convertido",
-                data=st.session_state.resultado_bytes,
-                file_name=st.session_state.resultado_nome,
-                mime="text/plain",
-                use_container_width=True,
-                type="primary",
-            )
-
+            if n_err == 0: st.success(f"✅ {n_ok:,} lotes — arquivo pronto!")
+            else:          st.warning(f"⚠ {n_ok:,} OK / {n_err:,} com erro")
+            st.download_button("⬇ Baixar arquivo convertido",
+                               data=st.session_state.resultado_bytes,
+                               file_name=st.session_state.resultado_nome,
+                               mime="text/plain", use_container_width=True, type="primary")
     with dl2:
         if erros:
-            linhas_err = [
-                "RELATÓRIO DE LOTES DESBALANCEADOS",
-                "=" * 60, "",
-                f"Data/Hora : {ts_log()}",
-                f"Total erros: {len(erros)}",
-                f"Soma dif.  : R$ {sum(e['diferenca'] for e in erros):,.2f}",
-                "", "=" * 60, "",
-            ]
+            linhas_err = ["RELATÓRIO DE LOTES DESBALANCEADOS","="*60,"",
+                          f"Data/Hora : {ts_log()}", f"Total erros: {len(erros)}","","="*60,""]
             for e in erros:
-                linhas_err += [
-                    f"Lote      : {e['num_lote']}",
-                    f"Linhas    : {e['faixa_linhas']}",
-                    f"Data      : {e['data']}",
-                    f"Débito    : R$ {e['total_debito']:,.2f}",
-                    f"Crédito   : R$ {e['total_credito']:,.2f}",
-                    f"Diferença : R$ {e['diferenca']:,.2f}",
-                ]
-                diag = e.get("diagnostico", {})
-                if diag.get("sugestao"):
-                    linhas_err.append(f"Sugestão  : {diag['sugestao']}")
-                for s in diag.get("suspeitas", []):
-                    tp  = "DÉBITO" if s["tipo"] == "D" else "CRÉDITO"
-                    cta = s["conta_debito"] or s["conta_credito"]
-                    linhas_err.append(
-                        f"  ⚡ Ln {s['linha_origem']} {tp} "
-                        f"Cta {cta} R$ {s['valor']:,.2f} — {s['motivo']}"
-                    )
-                linhas_err.append("")
-            erros_bytes_dyn = "\n".join(linhas_err).encode("utf-8-sig")
+                linhas_err += [f"Lote: {e['num_lote']} | Data: {e['data']} | Dif: R$ {e['diferenca']:,.2f}",""]
             st.error(f"❌ {len(erros):,} lote(s) com erro.")
-            st.download_button(
-                "⬇ Baixar relatório de erros",
-                data=erros_bytes_dyn,
-                file_name="erros_lotes.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            st.download_button("⬇ Baixar relatório de erros",
+                               data="\n".join(linhas_err).encode("utf-8-sig"),
+                               file_name="erros_lotes.txt", mime="text/plain", use_container_width=True)
         elif st.session_state.erros_bytes:
-            st.download_button(
-                "⬇ Baixar relatório de erros",
-                data=st.session_state.erros_bytes,
-                file_name=st.session_state.erros_nome,
-                mime="text/plain",
-                use_container_width=True,
-            )
-
+            st.download_button("⬇ Baixar relatório de erros",
+                               data=st.session_state.erros_bytes,
+                               file_name=st.session_state.erros_nome,
+                               mime="text/plain", use_container_width=True)
     with dl3:
         if st.session_state.log_bytes:
-            st.download_button(
-                "⬇ Baixar log completo",
-                data=st.session_state.log_bytes,
-                file_name=st.session_state.log_nome,
-                mime="text/plain",
-                use_container_width=True,
-            )
-
+            st.download_button("⬇ Baixar log completo",
+                               data=st.session_state.log_bytes,
+                               file_name=st.session_state.log_nome,
+                               mime="text/plain", use_container_width=True)
     if exibir_log and st.session_state.log_linhas:
         st.markdown("#### 🖥 Log de Processamento")
         log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
         tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
-        cor      = "#FF4444" if tem_erro else "#1A3050"
-        st.markdown(
-            f"<div class='bloco-log' style='border-color:{cor};'>"
-            f"{log_txt}</div>",
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(f"<div class='bloco-log' style='border-color:{'#FF4444' if tem_erro else '#1A3050'};'>{log_txt}</div>",
+                    unsafe_allow_html=True)
 
 def _render_resultados_ecd(exibir_log: bool):
     metricas = st.session_state.metricas or {}
-
     st.markdown("---")
     st.markdown("## 📊 Resultado da Conversão — SPED ECD")
-
     if metricas:
         cols = st.columns(len(metricas))
         for i, (k, v) in enumerate(metricas.items()):
             cols[i].metric(k, v)
-
     st.markdown("#### ⬇ Downloads")
     dl1, dl2 = st.columns(2)
-
     with dl1:
         if st.session_state.resultado_bytes:
             st.success("Arquivo gerado com sucesso!")
-            st.download_button(
-                "⬇ Baixar arquivo convertido",
-                data=st.session_state.resultado_bytes,
-                file_name=st.session_state.resultado_nome,
-                mime="text/plain",
-                use_container_width=True,
-                type="primary",
-            )
-
+            st.download_button("⬇ Baixar arquivo convertido",
+                               data=st.session_state.resultado_bytes,
+                               file_name=st.session_state.resultado_nome,
+                               mime="text/plain", use_container_width=True, type="primary")
     with dl2:
         if st.session_state.erros_bytes:
             st.warning("Arquivo de erros disponível.")
-            st.download_button(
-                "⬇ Baixar relatório de erros",
-                data=st.session_state.erros_bytes,
-                file_name=st.session_state.erros_nome,
-                mime="text/plain",
-                use_container_width=True,
-            )
-
+            st.download_button("⬇ Baixar relatório de erros",
+                               data=st.session_state.erros_bytes,
+                               file_name=st.session_state.erros_nome,
+                               mime="text/plain", use_container_width=True)
     if exibir_log and st.session_state.log_linhas:
         st.markdown("#### 🖥 Log de Processamento")
         log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
         tem_erro = any("ERRO" in str(l).upper() for l in st.session_state.log_linhas)
-        cor      = "#FF4444" if tem_erro else "#1A3050"
-        st.markdown(
-            f"<div class='bloco-log' style='border-color:{cor};'>"
-            f"{log_txt}</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"<div class='bloco-log' style='border-color:{'#FF4444' if tem_erro else '#1A3050'};'>{log_txt}</div>",
+                    unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTERFACE STREAMLIT — MAIN
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    st.set_page_config(
-        page_title="Domínio Sistemas | Thomson Reuters",
-        page_icon="🟠",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+    st.set_page_config(page_title="Domínio Sistemas | Thomson Reuters",
+                       page_icon="🟠", layout="wide", initial_sidebar_state="expanded")
     apply_theme()
     _init_state()
 
@@ -1698,67 +1378,46 @@ def main():
         "<h2 style='color:#FF6B00;margin:0;'>Domínio Sistemas — Conversor Unificado</h2>"
         "<p style='color:#6B7A8D;margin:6px 0 0;'>"
         "Lançamentos Contábeis (TXT/Excel) &nbsp;|&nbsp; SPED ECD &nbsp;→&nbsp; "
-        "0000 + 6000 + 6100 &nbsp;|&nbsp; "
-        "<b style='color:#FF6B00;'>Thomson Reuters</b></p>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+        "0000 + 6000 + 6100 &nbsp;|&nbsp; <b style='color:#FF6B00;'>Thomson Reuters</b>"
+        f"&nbsp;|&nbsp; <small>{VERSAO}</small></p></div>",
+        unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown("### ⚙ Configurações")
         st.markdown("---")
-        exibir_log = st.checkbox("Exibir log de processamento", value=False)
+        exibir_log = st.checkbox("Exibir log de processamento", value=True)
         st.markdown("---")
-        st.markdown("### ℹ Sobre")
         st.markdown(f"**Versão:** {VERSAO}")
         st.markdown("**Thomson Reuters — Domínio Sistemas**")
         st.markdown("---")
         st.markdown("**Formatos suportados:**")
-        st.markdown("- 📊 Excel (.xlsx / .xls)")
-        st.markdown("- 📄 TXT separado por `;`")
-        st.markdown("- 📋 SPED ECD (.txt)")
+        st.markdown("- 📊 Excel (.xlsx / .xls)\n- 📄 TXT separado por `;`\n- 📋 SPED ECD (.txt)")
         st.markdown("---")
-        st.markdown("**Saída gerada (layout unificado):**")
-        st.code(
-            "|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST|||||||",
-            language=None,
-        )
-        st.markdown("---")
-        st.markdown(f"**Limite de upload:** {MAX_UPLOAD_MB} MB")
-        st.markdown(f"**Chunk de leitura:** {CHUNK_SIZE:,} linhas")
+        st.code("|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST|||||||", language=None)
+        st.markdown(f"**Limite:** {MAX_UPLOAD_MB} MB")
 
     st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
     uploaded = st.file_uploader(
-        f"Arraste ou clique para selecionar (Excel, TXT ou SPED ECD — máx. {MAX_UPLOAD_MB} MB)",
-        type=["xlsx", "xls", "xlsm", "txt", "csv"],
-        label_visibility="visible",
-    )
+        f"Arraste ou clique (Excel, TXT ou SPED ECD — máx. {MAX_UPLOAD_MB} MB)",
+        type=["xlsx","xls","xlsm","txt","csv"])
 
     if uploaded is not None:
         conteudo = uploaded.read()
-        mb = len(conteudo) / (1024 * 1024)
-
+        mb = len(conteudo) / (1024*1024)
         if mb > MAX_UPLOAD_MB:
-            st.error(
-                f"⛔ Arquivo muito grande ({mb:.1f} MB). "
-                f"O limite é {MAX_UPLOAD_MB} MB para evitar timeout no Streamlit."
-            )
+            st.error(f"⛔ Arquivo muito grande ({mb:.1f} MB). Limite: {MAX_UPLOAD_MB} MB.")
             return
-
-        if (conteudo != st.session_state.arquivo_bytes or
-                uploaded.name != st.session_state.arquivo_nome):
+        if conteudo != st.session_state.arquivo_bytes or uploaded.name != st.session_state.arquivo_nome:
             _reset()
-            st.session_state.arquivo_bytes = conteudo
-            st.session_state.arquivo_nome  = uploaded.name
+            st.session_state.arquivo_bytes  = conteudo
+            st.session_state.arquivo_nome   = uploaded.name
             tipo = identificar_tipo(uploaded.name, conteudo)
             st.session_state.tipo_detectado = tipo
             if tipo == "excel":
                 try:
                     xl = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
                     st.session_state.sheets    = xl.sheet_names
-                    st.session_state.sheet_sel = (
-                        "Plan1" if "Plan1" in xl.sheet_names else xl.sheet_names[0]
-                    )
+                    st.session_state.sheet_sel = ("Plan1" if "Plan1" in xl.sheet_names else xl.sheet_names[0])
                 except Exception:
                     st.session_state.sheets = []
             elif tipo == "ecd":
@@ -1767,137 +1426,84 @@ def main():
                 st.session_state.cnpj_ecd_fmt = fmt_cnpj(cnpj_num) if cnpj_num else ""
 
     if st.session_state.arquivo_bytes is None:
-        st.markdown(
-            "<div class='info-box'>"
-            "⬆ Selecione um arquivo para começar.<br>"
-            "O tipo será identificado automaticamente após o upload."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='info-box'>⬆ Selecione um arquivo para começar.</div>",
+                    unsafe_allow_html=True)
         return
 
     tipo = st.session_state.tipo_detectado
-    badges = {
-        "ecd":   "<span class='badge-ecd'>📋 SPED ECD detectado</span>",
-        "excel": "<span class='badge-excel'>📊 Excel — Lançamentos em Lote</span>",
-        "lote":  "<span class='badge-lote'>📄 TXT — Lançamentos em Lote</span>",
-    }
-    mb_info = len(st.session_state.arquivo_bytes) / (1024 * 1024)
-    st.markdown(
-        f"{badges.get(tipo, '')} "
-        f"<span style='color:#6B7A8D;font-size:13px;margin-left:12px;'>"
-        f"{st.session_state.arquivo_nome} — {mb_info:.1f} MB</span>",
-        unsafe_allow_html=True,
-    )
+    badges = {"ecd":  "<span class='badge-ecd'>📋 SPED ECD</span>",
+              "excel":"<span class='badge-excel'>📊 Excel</span>",
+              "lote": "<span class='badge-lote'>📄 TXT Lote</span>"}
+    mb_info = len(st.session_state.arquivo_bytes) / (1024*1024)
+    st.markdown(f"{badges.get(tipo,'')} "
+                f"<span style='color:#6B7A8D;font-size:13px;margin-left:12px;'>"
+                f"{st.session_state.arquivo_nome} — {mb_info:.1f} MB</span>",
+                unsafe_allow_html=True)
     st.markdown("")
 
-    sheet_sel = ""
-    linha_h   = 3
-    auto_head = True
+    sheet_sel = ""; linha_h = 3; auto_head = True
     if tipo == "excel" and st.session_state.sheets:
         st.markdown("#### 📋 Passo 2 — Configurar Excel")
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2, col3 = st.columns([2,1,1])
         with col1:
-            sheet_sel = st.selectbox(
-                "Aba (Sheet)",
-                st.session_state.sheets,
-                index=(
-                    st.session_state.sheets.index(st.session_state.sheet_sel)
-                    if st.session_state.sheet_sel in st.session_state.sheets else 0
-                ),
-            )
+            sheet_sel = st.selectbox("Aba (Sheet)", st.session_state.sheets,
+                index=(st.session_state.sheets.index(st.session_state.sheet_sel)
+                       if st.session_state.sheet_sel in st.session_state.sheets else 0))
             st.session_state.sheet_sel = sheet_sel
         with col2:
             auto_head = st.checkbox("Detectar cabeçalho automaticamente", value=True)
         with col3:
             if not auto_head:
-                linha_h = st.number_input(
-                    "Linha do cabeçalho", min_value=1, max_value=50, value=4
-                ) - 1
+                linha_h = st.number_input("Linha do cabeçalho", min_value=1, max_value=50, value=4) - 1
 
     ni = ""; ok_insc = False; ti = ""; inf = ""
 
     if tipo == "ecd":
         st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
         cnpj_ecd = st.session_state.cnpj_ecd
-        cnpj_fmt = st.session_state.cnpj_ecd_fmt
         if cnpj_ecd and validar_cnpj(cnpj_ecd):
-            st.markdown(
-                f"<div class='cnpj-auto'>"
-                f"✔ CNPJ extraído do arquivo SPED ECD: "
-                f"<span>{cnpj_fmt}</span>"
-                f"<br><small style='color:#6B7A8D;'>Registro 0000 do arquivo</small>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<div class='cnpj-auto'>✔ CNPJ extraído: <span>{st.session_state.cnpj_ecd_fmt}</span></div>",
+                        unsafe_allow_html=True)
             st.code(fmt_reg_0000(cnpj_ecd), language=None)
-            ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd; inf = cnpj_fmt
+            ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd; inf = st.session_state.cnpj_ecd_fmt
         else:
-            st.warning("⚠ CNPJ não encontrado no arquivo. Informe manualmente.")
-            cnpj_raw = st.text_input(
-                "CNPJ / CPF", placeholder="00.000.000/0001-00",
-                key="cnpj_manual_ecd",
-            )
+            st.warning("⚠ CNPJ não encontrado. Informe manualmente.")
+            cnpj_raw = st.text_input("CNPJ / CPF", placeholder="00.000.000/0001-00", key="cnpj_manual_ecd")
             ok_insc, ti, ni = validar_inscricao(cnpj_raw)
             if cnpj_raw:
                 if ok_insc:
-                    inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
+                    inf = fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
                     st.success(f"✔ {ti} válido: {inf}")
-                    st.code(fmt_reg_0000(ni), language=None)
                 else:
                     st.error("✖ CNPJ/CPF inválido")
     else:
         st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
-        st.markdown(
-            "<div class='cnpj-box'>"
-            "Informe o CNPJ ou CPF do titular dos lançamentos."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        cnpj_raw = st.text_input(
-            "CNPJ / CPF",
-            placeholder="00.000.000/0001-00  ou  000.000.000-00",
-            help="Digite o CNPJ (14 dígitos) ou CPF (11 dígitos).",
-            key="cnpj_lote",
-        )
+        cnpj_raw = st.text_input("CNPJ / CPF", placeholder="00.000.000/0001-00 ou 000.000.000-00", key="cnpj_lote")
         ok_insc, ti, ni = validar_inscricao(cnpj_raw)
         if cnpj_raw:
             if ok_insc:
-                inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
-                col_a, col_b = st.columns([1, 2])
-                with col_a:
-                    st.success(f"✔ {ti} válido")
-                with col_b:
-                    st.code(fmt_reg_0000(ni), language=None)
+                inf = fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
+                col_a, col_b = st.columns([1,2])
+                with col_a: st.success(f"✔ {ti} válido")
+                with col_b: st.code(fmt_reg_0000(ni), language=None)
             else:
-                st.error("✖ CNPJ/CPF inválido — verifique os dígitos.")
+                st.error("✖ CNPJ/CPF inválido")
 
     st.markdown("---")
     st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
-
     col_op1, _ = st.columns(2)
     with col_op1:
-        gerar_6110 = st.checkbox(
-            "Gerar registro 6110 (apenas SPED ECD)",
-            value=False,
-            help="Gera linha analítica 6110 após cada 6100 (somente para SPED ECD).",
-            disabled=(tipo != "ecd"),
-        )
-
-    col_b1, col_b2 = st.columns([2, 1])
+        gerar_6110 = st.checkbox("Gerar registro 6110 (apenas SPED ECD)", value=False,
+                                  disabled=(tipo != "ecd"))
+    col_b1, col_b2 = st.columns([2,1])
     with col_b1:
-        btn_converter = st.button(
-            "▶ CONVERTER",
-            disabled=(not ok_insc),
-            use_container_width=True,
-            type="primary",
-        )
+        btn_converter = st.button("▶ CONVERTER", disabled=(not ok_insc),
+                                   use_container_width=True, type="primary")
     with col_b2:
         btn_limpar = st.button("🗑 Limpar tudo", use_container_width=True)
 
     if btn_limpar:
-        _reset()
-        st.rerun()
+        _reset(); st.rerun()
 
     if btn_converter and ok_insc:
         conteudo   = st.session_state.arquivo_bytes
@@ -1933,46 +1539,35 @@ def main():
                             if l.startswith("|6100|"):
                                 campos = l.split("|")
                                 if len(campos) >= 6:
-                                    data_l  = campos[2]
-                                    deb_l   = campos[3]
-                                    cred_l  = campos[4]
-                                    valor_l = campos[5]
-                                    hist_l  = campos[7] if len(campos) > 7 else ""
+                                    data_l=campos[2]; deb_l=campos[3]; cred_l=campos[4]
+                                    valor_l=campos[5]; hist_l=campos[7] if len(campos)>7 else ""
                                     if deb_l:
-                                        linhas_com_6110.append(
-                                            f"|6110|{data_l}|{deb_l}|{valor_l}|D||{hist_l}|||||||"
-                                        )
+                                        linhas_com_6110.append(f"|6110|{data_l}|{deb_l}|{valor_l}|D||{hist_l}|||||||")
                                     if cred_l:
-                                        linhas_com_6110.append(
-                                            f"|6110|{data_l}|{cred_l}|{valor_l}|C||{hist_l}|||||||"
-                                        )
+                                        linhas_com_6110.append(f"|6110|{data_l}|{cred_l}|{valor_l}|C||{hist_l}|||||||")
                         linhas_ecd = linhas_com_6110
 
                     crono.etapa("Montagem do arquivo")
                     prog_bar.progress(90)
                     status_txt.text("Montando arquivo...")
-
                     buf_out = io.StringIO()
                     for i in range(0, len(linhas_ecd), WRITE_CHUNK):
-                        buf_out.write("\n".join(linhas_ecd[i:i + WRITE_CHUNK]) + "\n")
+                        buf_out.write("\n".join(linhas_ecd[i:i+WRITE_CHUNK]) + "\n")
                     resultado_bytes = buf_out.getvalue().encode("utf-8-sig")
-                    del buf_out, linhas_ecd
-                    gc.collect()
+                    del buf_out, linhas_ecd; gc.collect()
 
                     nome_saida = f"ECD_{ni}_dominio.txt"
                     st.session_state.resultado_bytes = resultado_bytes
                     st.session_state.resultado_nome  = nome_saida
-
                     n6000 = resultado_bytes.count(b"|6000|")
                     n6100 = resultado_bytes.count(b"|6100|")
                     st.session_state.metricas = {
-                        "CNPJ":               ecd.cnpj,
+                        "CNPJ": ecd.cnpj,
                         "Lançamentos (I200)": f"{len(ecd.lancamentos):,}",
-                        "Registros 6000":     f"{n6000:,}",
-                        "Registros 6100":     f"{n6100:,}",
-                        "Tamanho saída":      f"{len(resultado_bytes)/1024:.1f} KB",
+                        "Registros 6000": f"{n6000:,}",
+                        "Registros 6100": f"{n6100:,}",
+                        "Tamanho saída":  f"{len(resultado_bytes)/1024:.1f} KB",
                     }
-
                     if registros_erro:
                         erros_txt = _txt_erros_ecd(registros_erro, ecd.cnpj)
                         st.session_state.erros_bytes = erros_txt.encode("utf-8-sig")
@@ -1991,124 +1586,85 @@ def main():
                 crono.etapa("Leitura Excel")
                 status_txt.text("Lendo Excel...")
                 prog_bar.progress(8)
-
-                sh        = st.session_state.sheet_sel
+                sh = st.session_state.sheet_sel
                 lh_det, _ = detectar_cabecalho_excel(conteudo, sh)
-                lh        = lh_det if auto_head else linha_h
-                df, _     = ler_excel_lote(conteudo, sh, lh)
+                lh = lh_det if auto_head else linha_h
+                df, _ = ler_excel_lote(conteudo, sh, lh)
                 log.append(f"Excel — Aba: {sh} | Cabeçalho: linha {lh+1}")
                 log.append(f"Linhas carregadas: {len(df):,}")
                 prog_bar.progress(30)
-
                 crono.etapa("Montagem de lotes")
                 status_txt.text("Montando lotes...")
                 df, modo = montar_lotes_excel(df)
-                n_lotes  = int(df["_num_lote"].max()) if len(df) > 0 else 0
+                n_lotes = int(df["_num_lote"].max()) if len(df) > 0 else 0
                 log.append(f"Lotes: {n_lotes:,} [modo: {modo}]")
                 prog_bar.progress(45)
-
                 crono.etapa("Processamento / validação")
                 status_txt.text("Processando lotes...")
                 resultado_bytes, resumo, erros = processar_excel(df, ni, log)
-                del df
-                gc.collect()
+                del df; gc.collect()
                 prog_bar.progress(85)
-
                 n_gravados = resultado_bytes.count(b"|6000|")
-                ignoradas  = 0
-                enc_usado  = "N/A (Excel)"
-
                 st.session_state.resultado_bytes = resultado_bytes
                 st.session_state.resultado_nome  = "lancamentos.txt"
                 st.session_state.resumo          = resumo
                 st.session_state.erros_lote      = erros
-
                 crono.etapa("Geração do log")
-                log_txt = _montar_log_lote(
-                    resumo, erros, ni, ti, inf,
-                    n_gravados, ignoradas, enc_usado, crono,
-                )
+                log_txt = _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, 0, "N/A (Excel)", crono)
                 st.session_state.log_bytes = log_txt.encode("utf-8-sig")
                 st.session_state.log_nome  = "log_conversao.txt"
-
                 total_seg = crono.encerrar()
                 log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
-                for e in crono.etapas:
-                    log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-
                 st.session_state.metricas = {
-                    "Lotes total":   f"{len(resumo):,}",
-                    "Lotes OK":      f"{len(resumo)-len(erros):,}",
-                    "Lotes erro":    f"{len(erros):,}",
-                    "Reg. gerados":  f"{n_gravados:,}",
-                    "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
-                }
+                    "Lotes total":  f"{len(resumo):,}", "Lotes OK": f"{len(resumo)-len(erros):,}",
+                    "Lotes erro":   f"{len(erros):,}",  "Reg. gerados": f"{n_gravados:,}",
+                    "Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB"}
                 st.session_state.log_linhas = log
                 st.session_state.processado = True
-                prog_bar.progress(100)
-                status_txt.text("Concluído!")
+                prog_bar.progress(100); status_txt.text("Concluído!")
 
-            else:  # TXT streaming
+            else:
                 crono.etapa("Processamento streaming")
-                mb_txt = len(conteudo) / (1024 * 1024)
+                mb_txt = len(conteudo)/(1024*1024)
                 status_txt.text(f"Processando {mb_txt:.1f} MB em streaming...")
                 prog_bar.progress(5)
                 log.append(f"── TXT STREAMING — {mb_txt:.1f} MB ──")
-
                 resultado_bytes, resumo, erros, total_lins, ignoradas, enc_usado = \
                     processar_streaming(conteudo, ni, log)
-
                 prog_bar.progress(90)
                 n_gravados = resultado_bytes.count(b"|6000|")
-
                 st.session_state.resultado_bytes = resultado_bytes
                 st.session_state.resultado_nome  = "lancamentos.txt"
                 st.session_state.resumo          = resumo
                 st.session_state.erros_lote      = erros
-
                 crono.etapa("Geração do log")
-                log_txt = _montar_log_lote(
-                    resumo, erros, ni, ti, inf,
-                    n_gravados, ignoradas, enc_usado, crono,
-                )
+                log_txt = _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc_usado, crono)
                 st.session_state.log_bytes = log_txt.encode("utf-8-sig")
                 st.session_state.log_nome  = "log_conversao.txt"
-
                 total_seg = crono.encerrar()
                 log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
-                for e in crono.etapas:
-                    log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-
                 st.session_state.metricas = {
-                    "Linhas lidas":  f"{total_lins:,}",
-                    "Lotes total":   f"{len(resumo):,}",
-                    "Lotes OK":      f"{len(resumo)-len(erros):,}",
-                    "Lotes erro":    f"{len(erros):,}",
-                    "Reg. gerados":  f"{n_gravados:,}",
-                    "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
-                }
+                    "Linhas lidas": f"{total_lins:,}", "Lotes total": f"{len(resumo):,}",
+                    "Lotes OK": f"{len(resumo)-len(erros):,}", "Lotes erro": f"{len(erros):,}",
+                    "Reg. gerados": f"{n_gravados:,}", "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB"}
                 st.session_state.log_linhas = log
                 st.session_state.processado = True
-                prog_bar.progress(100)
-                status_txt.text("Concluído!")
+                prog_bar.progress(100); status_txt.text("Concluído!")
 
         except Exception as ex:
             tb = traceback.format_exc()
             st.error(f"⛔ Erro inesperado: {ex}")
             log.append(f"ERRO FATAL: {ex}\n{tb}")
             st.session_state.log_linhas = log
-            prog_bar.progress(0)
-            status_txt.text("Falha.")
+            prog_bar.progress(0); status_txt.text("Falha.")
 
         st.rerun()
 
     if st.session_state.processado:
-        tipo_proc = st.session_state.tipo_detectado
-        if tipo_proc == "ecd":
+        if st.session_state.tipo_detectado == "ecd":
             _render_resultados_ecd(exibir_log)
         else:
             _render_resultados_lote(exibir_log)
-
 
 if __name__ == "__main__":
     main()
