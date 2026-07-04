@@ -24,7 +24,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════════
-VERSAO        = "V1.5"
+VERSAO        = "V1.6"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -443,6 +443,7 @@ def _parse_ecd(conteudo: bytes, log: list) -> tuple:
                 if len(campos) > 2:
                     ecd.historicos[campos[1].strip()] = _norm_hist(campos[2])
             elif reg == "I200":
+                # ── Cada I200 é sempre um lançamento novo e independente ──
                 lote_atual = {
                     "num":      campos[1].strip() if len(campos) > 1 else "",
                     "data":     campos[2].strip() if len(campos) > 2 else "",
@@ -543,27 +544,11 @@ def _primeiro_hist(partidas):
             return h
     return ""
 
-def _agrupar(partidas):
-    ag = {}
-    for p in partidas:
-        chave = (p["conta"], p["dc"])
-        if chave not in ag:
-            ag[chave] = {
-                "conta":      p["conta"],
-                "valor":      0.0,
-                "dc":         p["dc"],
-                "descr_hist": p.get("descr_hist", ""),
-            }
-        ag[chave]["valor"] += _str2float(p["valor"])
-        if not ag[chave]["descr_hist"] and p.get("descr_hist"):
-            ag[chave]["descr_hist"] = p["descr_hist"]
-    return list(ag.values())
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CLASSIFICAÇÃO DO TIPO DE LANÇAMENTO
-# D = 1 débito  → vários créditos  (débito vem primeiro)
-# C = 1 crédito → vários débitos   (crédito vem primeiro)
 # X = 1 débito  → 1 crédito
+# D = 1 débito  → vários créditos
+# C = vários débitos → 1 crédito
 # V = vários débitos → vários créditos
 # ─────────────────────────────────────────────────────────────────────────────
 def _classif(nd, nc):
@@ -579,11 +564,18 @@ def tipo_lancamento(nd, nc):
 # GERAÇÃO DAS LINHAS 6100 — ECD
 # ─────────────────────────────────────────────────────────────────────────────
 def _linhas_ecd(lanc):
-    partidas = _agrupar(lanc["partidas"])
+    # ══════════════════════════════════════════════════════════════════════════
+    # CORREÇÃO V1.6: NÃO usar _agrupar — preservar cada partida individual
+    # do lançamento I200. O _agrupar mesclava partidas de contas iguais de
+    # I200 diferentes, gerando produto cartesiano indevido (tipo V).
+    # Cada I200 já chegou aqui com suas próprias partidas isoladas.
+    # ══════════════════════════════════════════════════════════════════════════
+    partidas = lanc["partidas"]          # ← era: _agrupar(lanc["partidas"])
     debs  = [p for p in partidas if p["dc"] == "D"]
     creds = [p for p in partidas if p["dc"] == "C"]
     if not debs or not creds:
         return []
+
     data = _fmt_data_ecd(lanc["data"])
     tipo = _classif(len(debs), len(creds))
     hist = _primeiro_hist(lanc["partidas"])
@@ -594,27 +586,34 @@ def _linhas_ecd(lanc):
 
     if tipo == "X":
         h = _montar_hist_ecd(debs[0]) or hist
-        out.append(linha(debs[0]["conta"], creds[0]["conta"], debs[0]["valor"], h))
+        out.append(linha(
+            debs[0]["conta"],
+            creds[0]["conta"],
+            _str2float(debs[0]["valor"]),
+            h,
+        ))
 
     elif tipo == "D":
+        # 1 débito → vários créditos
         h = _montar_hist_ecd(debs[0]) or hist
-        out.append(linha(debs[0]["conta"], "", debs[0]["valor"], h))
+        out.append(linha(debs[0]["conta"], "", _str2float(debs[0]["valor"]), h))
         for cr in creds:
             h = _montar_hist_ecd(cr) or _montar_hist_ecd(debs[0]) or hist
-            out.append(linha("", cr["conta"], cr["valor"], h))
+            out.append(linha("", cr["conta"], _str2float(cr["valor"]), h))
 
     elif tipo == "C":
+        # vários débitos → 1 crédito
         h = _montar_hist_ecd(creds[0]) or hist
-        out.append(linha("", creds[0]["conta"], creds[0]["valor"], h))
+        out.append(linha("", creds[0]["conta"], _str2float(creds[0]["valor"]), h))
         for db in debs:
             h = _montar_hist_ecd(db) or _montar_hist_ecd(creds[0]) or hist
-            out.append(linha(db["conta"], "", db["valor"], h))
+            out.append(linha(db["conta"], "", _str2float(db["valor"]), h))
 
-    else:  # V
+    else:  # V — produto cartesiano apenas quando o I200 realmente tem V×V
         for db in debs:
             for cr in creds:
                 h = _montar_hist_ecd(db) or _montar_hist_ecd(cr) or hist
-                out.append(linha(db["conta"], cr["conta"], cr["valor"], h))
+                out.append(linha(db["conta"], cr["conta"], _str2float(cr["valor"]), h))
 
     return out
 
@@ -815,17 +814,7 @@ def _gerar_linhas_6100(debs: pd.DataFrame, creds: pd.DataFrame, tp: str) -> list
     return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ▌▌▌ NÚCLEO DA CORREÇÃO — _flush_lote ▌▌▌
-#
-# LÓGICA DE DETECÇÃO:
-#   1. Se TODAS as linhas do lote têm débito E crédito preenchidos ao mesmo
-#      tempo → são lançamentos independentes 1×1 (tipo X). Cada linha gera
-#      seu próprio bloco |6000|X| + |6100|.
-#   2. Se ALGUMAS linhas têm ambos preenchidos e outras não → processamento
-#      misto: as linhas "ambos" viram X independentes; as demais seguem o
-#      fluxo normal de agrupamento.
-#   3. Caso nenhuma linha tenha ambos preenchidos → comportamento original
-#      (agrupa débitos vs créditos e determina tipo D/C/X/V).
+# ▌▌▌ NÚCLEO — _flush_lote ▌▌▌
 # ═══════════════════════════════════════════════════════════════════════════════
 def _flush_lote(
     df_lote:   pd.DataFrame,
@@ -842,8 +831,6 @@ def _flush_lote(
     cc_arr  = limpar_contas_vec(df_lote["Cód. Conta Credito"])
     td_arr  = cd_arr != ""
     tc_arr  = cc_arr != ""
-
-    # ── Detecta linhas que têm débito E crédito simultaneamente ──────────────
     ambos_arr = td_arr & tc_arr
 
     vd_arr  = np.where(td_arr, v_float, 0.0)
@@ -878,24 +865,16 @@ def _flush_lote(
     fx    = f"{lm}–{lx}" if lm != lx else str(lm)
     dt_fmt = formatar_data(dt_arr[0]) if len(dt_arr) else ""
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # CASO 1 — TODAS as linhas têm débito E crédito → lançamentos X individuais
-    # ══════════════════════════════════════════════════════════════════════════
     if ambos_arr.all():
         for _, row in W.iterrows():
             desc      = _norm_hist(str(row["desc"]))
             dt_linha  = formatar_data(str(row["dt"]))
             linha_out = fmt_reg_6100(
-                dt_linha,
-                str(row["cd"]),
-                str(row["cc"]),
-                float(row["vf"]),
-                "",
-                desc,
+                dt_linha, str(row["cd"]), str(row["cc"]),
+                float(row["vf"]), "", desc,
             )
             saida_buf.write(fmt_reg_6000("X") + "\n")
             saida_buf.write(linha_out + "\n")
-
             resumo.append({
                 "num_lote":      num,
                 "data":          dt_linha,
@@ -911,26 +890,17 @@ def _flush_lote(
         del W
         return
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # CASO 2 — ALGUMAS linhas têm ambos, outras não → separar e processar
-    # ══════════════════════════════════════════════════════════════════════════
     if ambos_arr.any():
-        # Processa individualmente as linhas com ambos preenchidos
         mask_ambos = W["ambos"]
         for _, row in W[mask_ambos].iterrows():
             desc      = _norm_hist(str(row["desc"]))
             dt_linha  = formatar_data(str(row["dt"]))
             linha_out = fmt_reg_6100(
-                dt_linha,
-                str(row["cd"]),
-                str(row["cc"]),
-                float(row["vf"]),
-                "",
-                desc,
+                dt_linha, str(row["cd"]), str(row["cc"]),
+                float(row["vf"]), "", desc,
             )
             saida_buf.write(fmt_reg_6000("X") + "\n")
             saida_buf.write(linha_out + "\n")
-
             resumo.append({
                 "num_lote":      num,
                 "data":          dt_linha,
@@ -943,17 +913,12 @@ def _flush_lote(
                 "faixa_linhas":  str(int(row["lo"])),
                 "diagnostico":   {},
             })
-
-        # Processa normalmente as linhas sem ambos preenchidos
         W_resto = W[~mask_ambos].reset_index(drop=True)
         if len(W_resto) > 0:
             _flush_lote_normal(W_resto, num, saida_buf, resumo, erros, fx, dt_fmt)
         del W
         return
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # CASO 3 — Nenhuma linha tem ambos → fluxo normal de agrupamento
-    # ══════════════════════════════════════════════════════════════════════════
     _flush_lote_normal(W, num, saida_buf, resumo, erros, fx, dt_fmt)
     del W
 
@@ -967,8 +932,6 @@ def _flush_lote_normal(
     fx:        str,
     dt_fmt:    str,
 ) -> None:
-    """Processa um lote com linhas que têm apenas débito OU apenas crédito."""
-
     td_arr = W["td"].to_numpy()
     tc_arr = W["tc"].to_numpy()
     vd_arr = W["vd"].to_numpy()
@@ -1047,16 +1010,11 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
             nums     = np.cumsum(marcador, dtype=np.int32) + num_lote_g
             chunk_df["_num_lote"] = nums
         else:
-            # ── CORREÇÃO PRINCIPAL ────────────────────────────────────────────
-            # Detecta se a linha tem débito E crédito simultaneamente.
-            # Nesse caso, cada linha é um lançamento independente e NÃO deve
-            # ser agrupada com a linha seguinte mesmo que tenha mesma chave.
             cd_tmp = limpar_contas_vec(chunk_df["Cód. Conta Debito"])
             cc_tmp = limpar_contas_vec(chunk_df["Cód. Conta Credito"])
             ambos_tmp = (cd_tmp != "") & (cc_tmp != "")
 
             if ambos_tmp.all():
-                # Todas as linhas têm D+C → cada linha é um lote único
                 nums = np.arange(
                     num_lote_g + 1,
                     num_lote_g + len(chunk_df) + 1,
@@ -1064,8 +1022,6 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
                 )
                 chunk_df["_num_lote"] = nums
             elif ambos_tmp.any():
-                # Mistura: linhas com D+C recebem número único;
-                # linhas com só D ou só C são agrupadas pela chave normal
                 desc  = (
                     chunk_df["Complemento Histórico"]
                     .fillna("").astype(str).str.strip()
@@ -1078,12 +1034,10 @@ def processar_streaming(conteudo: bytes, ni: str, log: list) -> tuple:
                 muda       = np.empty(len(chave), dtype=bool)
                 muda[0]    = True
                 muda[1:]   = chave[1:] != chave[:-1]
-                # Forçar nova quebra em toda linha com ambos preenchidos
                 muda = muda | ambos_tmp
                 nums = np.cumsum(muda, dtype=np.int32) + num_lote_g
                 chunk_df["_num_lote"] = nums
             else:
-                # Nenhuma linha tem D+C → agrupamento original por chave
                 desc  = (
                     chunk_df["Complemento Histórico"]
                     .fillna("").astype(str).str.strip()
@@ -1201,7 +1155,6 @@ def montar_lotes_excel(df: pd.DataFrame) -> tuple:
             np.int32(1),
         )
     else:
-        # ── CORREÇÃO EXCEL: mesma lógica de detecção D+C simultâneos ─────────
         cd_tmp    = limpar_contas_vec(R["Cód. Conta Debito"])
         cc_tmp    = limpar_contas_vec(R["Cód. Conta Credito"])
         ambos_tmp = (cd_tmp != "") & (cc_tmp != "")
