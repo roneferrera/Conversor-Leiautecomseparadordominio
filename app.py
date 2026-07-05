@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Domínio Sistemas — Conversor Unificado (Streamlit) V3.5
-Correção V3.5:
-  • Regra de modo do 6110 (deb/cred/ambos) aplicada a TODOS os módulos:
-    - TXT Posicional: já implementado em V3.4
-    - SPED ECD: 6110 gerado com modo inferido pela conta do 6100 pai
-    - TXT Streaming / Excel: sem 6110 (não há Reg 05 nesses formatos)
-  • Módulo ECD: 6110 gerado corretamente:
-    - 6100 com só débito  → |6110|cc_deb||valor| (modo="deb")
-    - 6100 com só crédito → |6110||cc_cred|valor| (modo="cred")
-    - 6100 tipo X         → |6110|cc_deb||valor| + |6110||cc_cred|valor| (modo="ambos")
+Domínio Sistemas — Conversor Unificado (Streamlit) V3.6
+Correção V3.6:
+  • Replicação de CC na contrapartida:
+    Se Reg 05 tem cc_deb preenchido e cc_cred vazio → gera também |6110||cc_deb|valor|
+    Se Reg 05 tem cc_cred preenchido e cc_deb vazio → gera também |6110|cc_cred||valor|
+    Aplicado a TODOS os módulos (posicional, ECD, TXT, Excel)
+  • Regra de modo mantida (deb/cred/ambos)
+  • NÃO replica se ambos os campos já estiverem preenchidos no Reg 05
 """
 import os
 import re
@@ -23,7 +21,7 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 
-VERSAO        = "V3.5"
+VERSAO        = "V3.6"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -251,32 +249,54 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
     return "latin-1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPER CENTRAL — gerar 6110 com filtro de modo
+# HELPER CENTRAL — gerar 6110 com filtro de modo E replicação de contrapartida
 # ═══════════════════════════════════════════════════════════════════════════════
 def _gerar_6110_linha(deb_cta: str, cred_cta: str, valor_fmt: str, modo: str) -> list:
     """
-    Gera as linhas |6110| respeitando o modo:
+    Gera as linhas |6110| respeitando o modo e replicando CC na contrapartida.
 
-    modo="ambos" → 6100 tem débito E crédito (tipo X):
-        - Se cc_deb preenchido: |6110|cc_deb||valor|
-        - Se cc_cred preenchido: |6110||cc_cred|valor|
-        (ambos podem ser gerados)
+    REGRA DE MODO (filtro):
+      modo="ambos" → 6100 tem débito E crédito (tipo X)
+      modo="deb"   → 6100 só tem débito
+      modo="cred"  → 6100 só tem crédito
 
-    modo="deb" → 6100 só tem débito:
-        - Só gera |6110|cc_deb||valor| se cc_deb preenchido
-        - IGNORA cc_cred
-
-    modo="cred" → 6100 só tem crédito:
-        - Só gera |6110||cc_cred|valor| se cc_cred preenchido
-        - IGNORA cc_deb
+    REGRA DE REPLICAÇÃO (V3.6):
+      Se apenas cc_deb preenchido e cc_cred vazio:
+        - Emite |6110|cc_deb||valor|  (original)
+        - Emite |6110||cc_deb|valor|  (replica na contrapartida crédito)
+      Se apenas cc_cred preenchido e cc_deb vazio:
+        - Emite |6110||cc_cred|valor|  (original)
+        - Emite |6110|cc_cred||valor|  (replica na contrapartida débito)
+      Se ambos preenchidos: emite apenas o original (sem replicação)
+      Se nenhum preenchido: não emite nada
 
     Parâmetros deb_cta e cred_cta são os CCs (não as contas contábeis).
     """
     linhas = []
-    if modo in ("ambos", "deb") and deb_cta:
-        linhas.append(f"|6110|{deb_cta}||{valor_fmt}|")
-    if modo in ("ambos", "cred") and cred_cta:
-        linhas.append(f"|6110||{cred_cta}|{valor_fmt}|")
+
+    if deb_cta and cred_cta:
+        # Ambos preenchidos — emite exatamente como está, sem replicação
+        if modo in ("ambos", "deb", "cred"):
+            linhas.append(f"|6110|{deb_cta}|{cred_cta}|{valor_fmt}|")
+
+    elif deb_cta and not cred_cta:
+        # Só cc_deb preenchido
+        if modo in ("ambos", "deb"):
+            linhas.append(f"|6110|{deb_cta}||{valor_fmt}|")       # original
+        if modo in ("ambos", "cred"):
+            linhas.append(f"|6110||{deb_cta}|{valor_fmt}|")        # replica na contrapartida
+        # modo="deb" em lançamento D/C/V: emite só o débito, sem replica
+        # modo="cred" em lançamento D/C/V: emite só como crédito (replica)
+        # modo="ambos" em tipo X: emite os dois
+
+    elif cred_cta and not deb_cta:
+        # Só cc_cred preenchido
+        if modo in ("ambos", "cred"):
+            linhas.append(f"|6110||{cred_cta}|{valor_fmt}|")       # original
+        if modo in ("ambos", "deb"):
+            linhas.append(f"|6110|{cred_cta}||{valor_fmt}|")        # replica na contrapartida
+        # mesmo raciocínio inverso
+
     return linhas
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,25 +492,19 @@ def _gerar_ecd(ecd: SpedECD, log: list, prog_bar, status) -> list:
 
 def _injetar_6110_ecd(linhas_ecd: list) -> list:
     """
-    Injeta 6110 logo após cada 6100 no módulo ECD, com filtro de modo:
-    - 6100 com deb e cred preenchidos → modo="ambos" → gera |6110|deb||valor| e |6110||cred|valor|
-    - 6100 com só deb → modo="deb" → gera |6110|deb||valor|
-    - 6100 com só cred → modo="cred" → gera |6110||cred|valor|
-
-    No ECD, o CC é a própria conta contábil (deb ou cred do 6100).
+    Injeta 6110 logo após cada 6100 no módulo ECD, com filtro de modo
+    e replicação de CC na contrapartida (V3.6).
     """
     resultado = []
     for l in linhas_ecd:
         resultado.append(l)
         if l.startswith("|6100|"):
             campos = l.split("|")
-            # |6100|data|deb|cred|valor||hist|||||||
             if len(campos) >= 6:
                 deb_l   = campos[3].strip()
                 cred_l  = campos[4].strip()
                 valor_l = campos[5].strip()
 
-                # Determina modo
                 if deb_l and cred_l:
                     modo = "ambos"
                 elif deb_l:
@@ -498,7 +512,6 @@ def _injetar_6110_ecd(linhas_ecd: list) -> list:
                 else:
                     modo = "cred"
 
-                # Gera 6110 com filtro de modo
                 for linha_6110 in _gerar_6110_linha(deb_l, cred_l, valor_l, modo):
                     resultado.append(linha_6110)
     return resultado
@@ -811,7 +824,7 @@ def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc, cro
     return "\n".join(L)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO DOMÍNIO TXT POSICIONAL — V3.5
+# MÓDULO DOMÍNIO TXT POSICIONAL — V3.6
 # ═══════════════════════════════════════════════════════════════════════════════
 def _extrair_filial(linha: str) -> str:
     if len(linha) < 564: return ""
@@ -969,8 +982,8 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                              usar_de_para: bool, mapa_filiais: dict,
                              log: list) -> bytes:
     """
-    Geração da saída posicional — V3.5.
-    Usa _gerar_6110_linha() com filtro de modo para todos os tipos.
+    Geração da saída posicional — V3.6.
+    Usa _gerar_6110_linha() com filtro de modo + replicação de contrapartida.
     """
     buf = io.StringIO()
     buf.write(f"|0000|{ni}|\n")
@@ -1001,7 +1014,6 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
 
         debug[tipo_real] = debug.get(tipo_real,0)+1
 
-        # Índice de centros por partida
         centros_por_partida: dict[int,list] = {}
         for cc in centros:
             idx = cc.get("idx_partida",-1)
@@ -1016,8 +1028,8 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
 
         def _escreve_6110(idx: int, modo: str = "ambos"):
             """
-            Emite os 6110 filhos do idx com filtro de modo.
-            Usa _gerar_6110_linha() centralizado.
+            Emite os 6110 filhos do idx com filtro de modo e replicação V3.6.
+            Usa _gerar_6110_linha() que já contém toda a lógica.
             """
             if not gerar_6110: return
             for cc in centros_por_partida.get(idx,[]):
@@ -1036,7 +1048,6 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
             buf.write(f"|6100|{data}|{deb_cta}|{cred_cta}|{valor_fmt}||{hist_safe}||{filial}||\n")
             cnt["t6100"] += 1
 
-            # Modo inferido pelo preenchimento das contas
             if deb_cta and cred_cta: modo = "ambos"
             elif deb_cta:            modo = "deb"
             else:                    modo = "cred"
@@ -1531,11 +1542,11 @@ def main():
             disabled=(tipo not in ("ecd","dominio_pos")),
             help=(
                 "Gera o registro 6110 imediatamente após cada 6100 pai.\n"
-                "Regra de modo aplicada em todos os módulos:\n"
-                "• 6100 tipo X (deb+cred): gera 6110 deb E 6110 cred\n"
-                "• 6100 só débito: gera apenas 6110 com cc_deb\n"
-                "• 6100 só crédito: gera apenas 6110 com cc_cred\n"
-                "Gerado EXATAMENTE como está no arquivo — sem inferir contrapartida."
+                "• Tipo X: emite CC débito E CC crédito (replica na contrapartida se só um preenchido)\n"
+                "• Linha só débito: emite CC débito + replica como CC crédito\n"
+                "• Linha só crédito: emite CC crédito + replica como CC débito\n"
+                "• Se ambos preenchidos: emite exatamente como está\n"
+                "• Se nenhum preenchido: não gera 6110"
             )
         )
     with col_op2:
@@ -1575,13 +1586,10 @@ def main():
                     prog_bar.progress(50); status_txt.text("Gerando registros...")
                     crono.etapa("Geração dos registros"); log.append("\n── GERAÇÃO ──")
                     linhas_ecd = _gerar_ecd(ecd, log, prog_bar, status_txt)
-
-                    # ── Injeção de 6110 com filtro de modo — V3.5 ──────────
                     if gerar_6110:
                         linhas_ecd = _injetar_6110_ecd(linhas_ecd)
                         n6110 = sum(1 for l in linhas_ecd if l.startswith("|6110|"))
                         log.append(f"  Reg. 6110 gerados  : {n6110:,}")
-
                     crono.etapa("Montagem do arquivo"); prog_bar.progress(90); status_txt.text("Montando arquivo...")
                     buf_out = io.StringIO()
                     for i in range(0,len(linhas_ecd),WRITE_CHUNK):
