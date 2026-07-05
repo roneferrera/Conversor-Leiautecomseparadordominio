@@ -1,17 +1,14 @@
-# ═══════════════════════════════════════════════════════════════════════════════
 # -*- coding: utf-8 -*-
 """
-Domínio Sistemas — Conversor Unificado (Streamlit) V3.3
-Correções V3.3:
-  • _gerar_saida_posicional — TIPO X: removido bloco extra de 6110 do crédito
-    que causava duplicação. d["idx"] == c["idx"] sempre no tipo X (mesmo Reg 03).
-    _escreve_6110(d["idx"]) já emite TODOS os Reg 05 desse Reg 03.
-  • 6110 gerado EXATAMENTE como está no arquivo:
-    - cc_deb preenchido e cc_cred vazio → |6110|cc_deb||valor|
-    - cc_cred preenchido e cc_deb vazio → |6110||cc_cred|valor|
-    - ambos preenchidos → |6110|cc_deb|cc_cred|valor|
-    - nenhum preenchido → NÃO gera nada
+Domínio Sistemas — Conversor Unificado (Streamlit) V3.4
+Correção V3.4:
+  • _escreve_6110 recebe parâmetro "modo" para filtrar quais Reg 05 emite:
+    - modo="ambos" → tipo X: emite todos os Reg 05 do idx (cc_deb OU cc_cred)
+    - modo="deb"   → 6100 só com débito: emite apenas Reg 05 com cc_deb preenchido
+    - modo="cred"  → 6100 só com crédito: emite apenas Reg 05 com cc_cred preenchido
+  • Elimina emissão de 6110 de CC débito sob um 6100 de crédito (e vice-versa)
   • NÃO infere contrapartida de CC
+  • Gera EXATAMENTE como está no arquivo
 """
 import os
 import re
@@ -25,7 +22,7 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 
-VERSAO        = "V3.3"
+VERSAO        = "V3.4"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -752,7 +749,7 @@ def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc, cro
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ███████████████████████████████████████████████████████████████████████████████
-# MÓDULO DOMÍNIO TXT POSICIONAL — V3.3  ← CORREÇÃO FINAL
+# MÓDULO DOMÍNIO TXT POSICIONAL — V3.4  ← CORREÇÃO FINAL
 # ███████████████████████████████████████████████████████████████████████████████
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -911,22 +908,25 @@ def _aplicar_de_para(filial: str, mapa: dict) -> str:
     return mapa.get(filial, filial)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# _gerar_saida_posicional — V3.3 FINAL
-# ÚNICA MUDANÇA em relação à V3.2:
-#   TIPO X — removido o bloco extra que tentava emitir 6110 do crédito
-#   separadamente (c["idx"] != d["idx"]). No arquivo posicional Domínio,
-#   débito e crédito do tipo X estão no MESMO Reg 03 (mesmo idx).
-#   _escreve_6110(d["idx"]) já captura TODOS os Reg 05 desse Reg 03,
-#   sejam eles com cc_deb, cc_cred ou ambos preenchidos.
+# _gerar_saida_posicional — V3.4 FINAL
 #
-# REGRA DO 6110:
-#   - Gerado SOMENTE se o Reg 05 correspondente existir no arquivo.
-#   - Gerado EXATAMENTE como está no arquivo:
-#       * cc_deb preenchido, cc_cred vazio  → |6110|cc_deb||valor|
-#       * cc_cred preenchido, cc_deb vazio  → |6110||cc_cred|valor|
-#       * ambos preenchidos                 → |6110|cc_deb|cc_cred|valor|
-#       * nenhum preenchido                 → NÃO gera nada
-#   - NÃO infere contrapartida de CC.
+# CORREÇÃO CENTRAL (V3.4):
+#   _escreve_6110 recebe parâmetro "modo" que filtra quais Reg 05 são emitidos:
+#
+#   modo="ambos" → tipo X (6100 tem débito E crédito)
+#                  emite todos os Reg 05 do idx que tenham cc_deb OU cc_cred
+#
+#   modo="deb"   → 6100 só com débito (tipos D, C, V — linha de débito)
+#                  emite APENAS Reg 05 com cc_deb preenchido
+#                  IGNORA Reg 05 com apenas cc_cred (evita emitir CC crédito
+#                  sob um 6100 que só tem débito)
+#
+#   modo="cred"  → 6100 só com crédito (tipos D, C, V — linha de crédito)
+#                  emite APENAS Reg 05 com cc_cred preenchido
+#                  IGNORA Reg 05 com apenas cc_deb (evita emitir CC débito
+#                  sob um 6100 que só tem crédito)
+#
+# O modo é inferido automaticamente em _escreve() pelo preenchimento das contas.
 # ═══════════════════════════════════════════════════════════════════════════════
 def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                              usar_de_para: bool, mapa_filiais: dict,
@@ -961,8 +961,6 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
         debug[tipo_real] = debug.get(tipo_real,0)+1
 
         # ── Índice de centros por partida ────────────────────────────────────
-        # Chave: campo "idx" posicional único da partida.
-        # Partidas sem Reg 05 → chave ausente → get() retorna [] → nenhum 6110.
         centros_por_partida: dict[int,list] = {}
         for cc in centros:
             idx = cc.get("idx_partida",-1)
@@ -975,23 +973,29 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                 f = _aplicar_de_para(f, mapa_filiais)
             return f
 
-        def _escreve_6110(idx: int):
+        def _escreve_6110(idx: int, modo: str = "ambos"):
             """
-            Emite os 6110 filhos do idx — exatamente como estão no arquivo.
+            Emite os 6110 filhos do idx com filtro por modo.
 
-            Regras:
-              - Gera SOMENTE se existe ao menos um Reg 05 para este idx.
-              - Gera SOMENTE se cc_deb OU cc_cred estiver preenchido.
-              - NÃO infere contrapartida. NÃO duplica.
-              - Pode gerar cc_deb preenchido e cc_cred vazio, ou vice-versa,
-                ou ambos — exatamente como veio do arquivo.
+            modo="ambos" → tipo X: emite todos os Reg 05 com cc_deb OU cc_cred
+            modo="deb"   → 6100 só débito: emite APENAS Reg 05 com cc_deb preenchido
+            modo="cred"  → 6100 só crédito: emite APENAS Reg 05 com cc_cred preenchido
+
+            Isso garante que:
+            - Um Reg 05 com cc_deb="4" e cc_cred="" NÃO é emitido sob um 6100 de crédito
+            - Um Reg 05 com cc_cred="4" e cc_deb="" NÃO é emitido sob um 6100 de débito
             """
             if not gerar_6110: return
             for cc in centros_por_partida.get(idx,[]):
                 cc_d = cc.get("cc_deb","")
                 cc_c = cc.get("cc_cred","")
                 v_cc = cc.get("valor",0.0)
-                # Gera apenas se pelo menos um CC está preenchido
+
+                # Aplica filtro por modo
+                if modo == "cred" and not cc_c: continue   # só emite se tiver cc_cred
+                if modo == "deb"  and not cc_d: continue   # só emite se tiver cc_deb
+                # modo="ambos": passa tudo que tem cc_d OU cc_c
+
                 if cc_d or cc_c:
                     v_fmt = f"{v_cc:.2f}".replace(".",",")
                     buf.write(f"|6110|{cc_d}|{cc_c}|{v_fmt}|\n")
@@ -1000,33 +1004,44 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
         def _escreve(deb_cta: str, cred_cta: str, valor: float,
                      hist: str, filial: str, idx: int):
             """
-            Escreve |6100| e imediatamente seus |6110| filhos (apenas do idx).
+            Escreve |6100| e seus |6110| filhos.
+
+            O modo é determinado pelo preenchimento das contas:
+              deb_cta e cred_cta preenchidos → modo="ambos" (tipo X)
+              apenas deb_cta preenchido      → modo="deb"
+              apenas cred_cta preenchido     → modo="cred"
             """
             valor_fmt = f"{valor:.2f}".replace(".",",")
             hist_safe = _norm_hist(hist)
             buf.write(f"|6100|{data}|{deb_cta}|{cred_cta}|{valor_fmt}||{hist_safe}||{filial}||\n")
             cnt["t6100"] += 1
-            _escreve_6110(idx)
+
+            # Determina o modo automaticamente
+            if deb_cta and cred_cta:
+                modo = "ambos"   # tipo X — ambas as contas preenchidas
+            elif deb_cta:
+                modo = "deb"     # linha só com débito
+            else:
+                modo = "cred"    # linha só com crédito
+
+            _escreve_6110(idx, modo)
 
         # Escreve 6000
         buf.write(f"|6000|{tipo_real}||||\n")
         cnt["t6000"] += 1
 
         # ── TIPO X — 1 débito × 1 crédito ────────────────────────────────────
-        # No arquivo posicional Domínio, débito e crédito estão no MESMO Reg 03
-        # (mesmo idx). Todos os Reg 05 desse Reg 03 pertencem ao mesmo idx.
-        # _escreve_6110(d["idx"]) emite TODOS eles de uma vez:
-        #   - Reg 05 com cc_deb preenchido  → |6110|cc_deb||valor|
-        #   - Reg 05 com cc_cred preenchido → |6110||cc_cred|valor|
-        # NÃO há segundo bloco para o crédito — seria duplicação.
+        # _escreve() detecta modo="ambos" automaticamente (ambas contas preenchidas)
+        # _escreve_6110() emite TODOS os Reg 05 do idx (cc_deb OU cc_cred)
         if tipo_real == "X":
             d = debs[0]; c = creds[0]
             h   = d["hist"] or c["hist"]
             fil = _filial_p(d) or _filial_p(c)
-            # d["idx"] == c["idx"] sempre no tipo X (mesmo Reg 03)
             _escreve(d["cta_deb"], c["cta_cred"], d["valor"], h, fil, d["idx"])
 
         # ── TIPO D — 1 débito → vários créditos ──────────────────────────────
+        # _escreve() com deb_cta preenchido → modo="deb" → só emite Reg 05 com cc_deb
+        # _escreve() com cred_cta preenchido → modo="cred" → só emite Reg 05 com cc_cred
         elif tipo_real == "D":
             d = debs[0]
             _escreve(d["cta_deb"],"",d["valor"],d["hist"],_filial_p(d),d["idx"])
@@ -1036,6 +1051,8 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                 _escreve("",c["cta_cred"],c["valor"],h,fil,c["idx"])
 
         # ── TIPO C — vários débitos → 1 crédito ──────────────────────────────
+        # _escreve() com cred_cta preenchido → modo="cred" → só emite Reg 05 com cc_cred
+        # _escreve() com deb_cta preenchido → modo="deb" → só emite Reg 05 com cc_deb
         elif tipo_real == "C":
             c = creds[0]
             _escreve("",c["cta_cred"],c["valor"],c["hist"],_filial_p(c),c["idx"])
@@ -1506,8 +1523,13 @@ def main():
             "Gerar registro 6110 (Centro de Custos)",
             value=False,
             disabled=(tipo not in ("ecd","dominio_pos")),
-            help="Gera o registro 6110 imediatamente após cada 6100 pai (filho direto). "
-                 "Gerado EXATAMENTE como está no arquivo — sem inferir contrapartida."
+            help=(
+                "Gera o registro 6110 imediatamente após cada 6100 pai.\n"
+                "• Tipo X: emite todos os Reg 05 do lançamento (cc_deb OU cc_cred)\n"
+                "• Linha só débito: emite apenas Reg 05 com cc_deb preenchido\n"
+                "• Linha só crédito: emite apenas Reg 05 com cc_cred preenchido\n"
+                "Gerado EXATAMENTE como está no arquivo — sem inferir contrapartida."
+            )
         )
     with col_op2:
         usar_de_para = st.checkbox(
