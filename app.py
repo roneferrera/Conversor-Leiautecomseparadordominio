@@ -1,5 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# -*-if = round(abs(td_sum-tc_sum),2); ok = dif < TOL_VALOR
+
     entrada coding: utf-8 -*-
 import os
 import re
