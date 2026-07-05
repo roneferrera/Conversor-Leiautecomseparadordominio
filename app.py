@@ -1,30 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # -*-if = round(abs(td_sum-tc_sum),2); ok = dif < TOL_VALOR
     entrada coding: utf-8 -*-
-"""
-Domínio Sistemas — Conversor = {"num_lote":num,"data":dt_fmt,
-               "descricao":_norm_hist(str(desc_arr[0])) if len(desc_arr) Unificado (Streamlit) V3.4 FINAL else "",
-               "total_debito":td_sum,"total_credito":tc_sum,
-               "diferenca":dif,"balanceado":ok,
-               "qtd_lin
-Correções aplicadas:
-  • Reg 05 vinculado aohas":len(W),"faixa_linhas":fx,"diagnostico":{}}
-    if not ok: último Reg 03 lido (vínculo posicional, f
-        entrada["diagnostico"] = diagnosticar_lote(W,dif); erros.append(entrada)
-    idelidade total)
-  • 6110 gerado sem nenhum filtro por tipoelse:
-        debs = W[W["td"]].reset_index(drop=True); creds = W[W["tc"]].reset_index(drop=True)
-        if len(debs) >  de CC
-  • 6110 escrito IMEDIATAMENTE após o 6100 pai0 and len(creds) > 0:
-            tp = tipo_lancamento(len(debs),len(creds))
-            lin
-  • Histórico normalizado sempre
-  • Filial lidahas_out = [fmt_reg_6000(tp)] + _gerar_linhas_6100(debs, corretamente das posições 558-564 docreds,tp)
-            saida_buf.write("\n".join(linhas_out)+"\n")
-    resumo.append(entrada)
-
-def proces Reg 03
-"""
 import os
 import re
 import gc
