@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Domínio Sistemas — Conversor Unificado (Streamlit) V3.4
-Correção V3.4:
-  • _escreve_6110 recebe parâmetro "modo" para filtrar quais Reg 05 emite:
-    - modo="ambos" → tipo X: emite todos os Reg 05 do idx (cc_deb OU cc_cred)
-    - modo="deb"   → 6100 só com débito: emite apenas Reg 05 com cc_deb preenchido
-    - modo="cred"  → 6100 só com crédito: emite apenas Reg 05 com cc_cred preenchido
-  • Elimina emissão de 6110 de CC débito sob um 6100 de crédito (e vice-versa)
-  • NÃO infere contrapartida de CC
-  • Gera EXATAMENTE como está no arquivo
+Domínio Sistemas — Conversor Unificado (Streamlit) V3.5
+Correção V3.5:
+  • Regra de modo do 6110 (deb/cred/ambos) aplicada a TODOS os módulos:
+    - TXT Posicional: já implementado em V3.4
+    - SPED ECD: 6110 gerado com modo inferido pela conta do 6100 pai
+    - TXT Streaming / Excel: sem 6110 (não há Reg 05 nesses formatos)
+  • Módulo ECD: 6110 gerado corretamente:
+    - 6100 com só débito  → |6110|cc_deb||valor| (modo="deb")
+    - 6100 com só crédito → |6110||cc_cred|valor| (modo="cred")
+    - 6100 tipo X         → |6110|cc_deb||valor| + |6110||cc_cred|valor| (modo="ambos")
 """
 import os
 import re
@@ -22,7 +23,7 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 
-VERSAO        = "V3.4"
+VERSAO        = "V3.5"
 CHUNK_SIZE    = 100_000
 WRITE_CHUNK   = 5_000
 TOL_VALOR     = 0.005
@@ -250,6 +251,35 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
     return "latin-1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HELPER CENTRAL — gerar 6110 com filtro de modo
+# ═══════════════════════════════════════════════════════════════════════════════
+def _gerar_6110_linha(deb_cta: str, cred_cta: str, valor_fmt: str, modo: str) -> list:
+    """
+    Gera as linhas |6110| respeitando o modo:
+
+    modo="ambos" → 6100 tem débito E crédito (tipo X):
+        - Se cc_deb preenchido: |6110|cc_deb||valor|
+        - Se cc_cred preenchido: |6110||cc_cred|valor|
+        (ambos podem ser gerados)
+
+    modo="deb" → 6100 só tem débito:
+        - Só gera |6110|cc_deb||valor| se cc_deb preenchido
+        - IGNORA cc_cred
+
+    modo="cred" → 6100 só tem crédito:
+        - Só gera |6110||cc_cred|valor| se cc_cred preenchido
+        - IGNORA cc_deb
+
+    Parâmetros deb_cta e cred_cta são os CCs (não as contas contábeis).
+    """
+    linhas = []
+    if modo in ("ambos", "deb") and deb_cta:
+        linhas.append(f"|6110|{deb_cta}||{valor_fmt}|")
+    if modo in ("ambos", "cred") and cred_cta:
+        linhas.append(f"|6110||{cred_cta}|{valor_fmt}|")
+    return linhas
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # IDENTIFICAÇÃO DE TIPO
 # ═══════════════════════════════════════════════════════════════════════════════
 def identificar_tipo(nome_arquivo: str, conteudo: bytes) -> str:
@@ -439,6 +469,39 @@ def _gerar_ecd(ecd: SpedECD, log: list, prog_bar, status) -> list:
     log.append(f"  Ignorados          : {ignorados:,}")
     log.append(f"  Tipos — X:{debug.get('X',0)} D:{debug.get('D',0)} C:{debug.get('C',0)} V:{debug.get('V',0)}")
     return linhas
+
+def _injetar_6110_ecd(linhas_ecd: list) -> list:
+    """
+    Injeta 6110 logo após cada 6100 no módulo ECD, com filtro de modo:
+    - 6100 com deb e cred preenchidos → modo="ambos" → gera |6110|deb||valor| e |6110||cred|valor|
+    - 6100 com só deb → modo="deb" → gera |6110|deb||valor|
+    - 6100 com só cred → modo="cred" → gera |6110||cred|valor|
+
+    No ECD, o CC é a própria conta contábil (deb ou cred do 6100).
+    """
+    resultado = []
+    for l in linhas_ecd:
+        resultado.append(l)
+        if l.startswith("|6100|"):
+            campos = l.split("|")
+            # |6100|data|deb|cred|valor||hist|||||||
+            if len(campos) >= 6:
+                deb_l   = campos[3].strip()
+                cred_l  = campos[4].strip()
+                valor_l = campos[5].strip()
+
+                # Determina modo
+                if deb_l and cred_l:
+                    modo = "ambos"
+                elif deb_l:
+                    modo = "deb"
+                else:
+                    modo = "cred"
+
+                # Gera 6110 com filtro de modo
+                for linha_6110 in _gerar_6110_linha(deb_l, cred_l, valor_l, modo):
+                    resultado.append(linha_6110)
+    return resultado
 
 def _txt_erros_ecd(registros_erro: list, cnpj: str) -> str:
     linhas = ["="*70,"RELATÓRIO DE ERROS — SPED ECD",f"CNPJ : {cnpj}",f"Total: {len(registros_erro)}","="*70,""]
@@ -748,11 +811,8 @@ def _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc, cro
     return "\n".join(L)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ███████████████████████████████████████████████████████████████████████████████
-# MÓDULO DOMÍNIO TXT POSICIONAL — V3.4  ← CORREÇÃO FINAL
-# ███████████████████████████████████████████████████████████████████████████████
+# MÓDULO DOMÍNIO TXT POSICIONAL — V3.5
 # ═══════════════════════════════════════════════════════════════════════════════
-
 def _extrair_filial(linha: str) -> str:
     if len(linha) < 564: return ""
     raw = linha[557:564].strip()
@@ -842,7 +902,6 @@ def _parse_posicional(conteudo: bytes, log: list) -> dict:
 
                 valor_dec = _posicional_para_decimal(val_raw)
                 hist_norm = _norm_hist(historico)
-
                 idx_partida = len(lote_atual["partidas"])
 
                 lote_atual["partidas"].append({
@@ -872,7 +931,6 @@ def _parse_posicional(conteudo: bytes, log: list) -> dict:
                 cc_deb  = _extrair_cc(cc_deb_raw)
                 cc_cred = _extrair_cc(cc_cred_raw)
                 valor_c = _posicional_para_decimal(val_raw5)
-
                 idx_pai = lote_atual["partidas"][-1]["idx"]
 
                 lote_atual["centros"].append({
@@ -907,30 +965,13 @@ def _aplicar_de_para(filial: str, mapa: dict) -> str:
     if not filial: return ""
     return mapa.get(filial, filial)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _gerar_saida_posicional — V3.4 FINAL
-#
-# CORREÇÃO CENTRAL (V3.4):
-#   _escreve_6110 recebe parâmetro "modo" que filtra quais Reg 05 são emitidos:
-#
-#   modo="ambos" → tipo X (6100 tem débito E crédito)
-#                  emite todos os Reg 05 do idx que tenham cc_deb OU cc_cred
-#
-#   modo="deb"   → 6100 só com débito (tipos D, C, V — linha de débito)
-#                  emite APENAS Reg 05 com cc_deb preenchido
-#                  IGNORA Reg 05 com apenas cc_cred (evita emitir CC crédito
-#                  sob um 6100 que só tem débito)
-#
-#   modo="cred"  → 6100 só com crédito (tipos D, C, V — linha de crédito)
-#                  emite APENAS Reg 05 com cc_cred preenchido
-#                  IGNORA Reg 05 com apenas cc_deb (evita emitir CC débito
-#                  sob um 6100 que só tem crédito)
-#
-# O modo é inferido automaticamente em _escreve() pelo preenchimento das contas.
-# ═══════════════════════════════════════════════════════════════════════════════
 def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                              usar_de_para: bool, mapa_filiais: dict,
                              log: list) -> bytes:
+    """
+    Geração da saída posicional — V3.5.
+    Usa _gerar_6110_linha() com filtro de modo para todos os tipos.
+    """
     buf = io.StringIO()
     buf.write(f"|0000|{ni}|\n")
 
@@ -960,7 +1001,7 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
 
         debug[tipo_real] = debug.get(tipo_real,0)+1
 
-        # ── Índice de centros por partida ────────────────────────────────────
+        # Índice de centros por partida
         centros_por_partida: dict[int,list] = {}
         for cc in centros:
             idx = cc.get("idx_partida",-1)
@@ -975,73 +1016,42 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
 
         def _escreve_6110(idx: int, modo: str = "ambos"):
             """
-            Emite os 6110 filhos do idx com filtro por modo.
-
-            modo="ambos" → tipo X: emite todos os Reg 05 com cc_deb OU cc_cred
-            modo="deb"   → 6100 só débito: emite APENAS Reg 05 com cc_deb preenchido
-            modo="cred"  → 6100 só crédito: emite APENAS Reg 05 com cc_cred preenchido
-
-            Isso garante que:
-            - Um Reg 05 com cc_deb="4" e cc_cred="" NÃO é emitido sob um 6100 de crédito
-            - Um Reg 05 com cc_cred="4" e cc_deb="" NÃO é emitido sob um 6100 de débito
+            Emite os 6110 filhos do idx com filtro de modo.
+            Usa _gerar_6110_linha() centralizado.
             """
             if not gerar_6110: return
             for cc in centros_por_partida.get(idx,[]):
                 cc_d = cc.get("cc_deb","")
                 cc_c = cc.get("cc_cred","")
                 v_cc = cc.get("valor",0.0)
-
-                # Aplica filtro por modo
-                if modo == "cred" and not cc_c: continue   # só emite se tiver cc_cred
-                if modo == "deb"  and not cc_d: continue   # só emite se tiver cc_deb
-                # modo="ambos": passa tudo que tem cc_d OU cc_c
-
-                if cc_d or cc_c:
-                    v_fmt = f"{v_cc:.2f}".replace(".",",")
-                    buf.write(f"|6110|{cc_d}|{cc_c}|{v_fmt}|\n")
+                v_fmt = f"{v_cc:.2f}".replace(".",",")
+                for linha_6110 in _gerar_6110_linha(cc_d, cc_c, v_fmt, modo):
+                    buf.write(linha_6110 + "\n")
                     cnt["t6110"] += 1
 
         def _escreve(deb_cta: str, cred_cta: str, valor: float,
                      hist: str, filial: str, idx: int):
-            """
-            Escreve |6100| e seus |6110| filhos.
-
-            O modo é determinado pelo preenchimento das contas:
-              deb_cta e cred_cta preenchidos → modo="ambos" (tipo X)
-              apenas deb_cta preenchido      → modo="deb"
-              apenas cred_cta preenchido     → modo="cred"
-            """
             valor_fmt = f"{valor:.2f}".replace(".",",")
             hist_safe = _norm_hist(hist)
             buf.write(f"|6100|{data}|{deb_cta}|{cred_cta}|{valor_fmt}||{hist_safe}||{filial}||\n")
             cnt["t6100"] += 1
 
-            # Determina o modo automaticamente
-            if deb_cta and cred_cta:
-                modo = "ambos"   # tipo X — ambas as contas preenchidas
-            elif deb_cta:
-                modo = "deb"     # linha só com débito
-            else:
-                modo = "cred"    # linha só com crédito
+            # Modo inferido pelo preenchimento das contas
+            if deb_cta and cred_cta: modo = "ambos"
+            elif deb_cta:            modo = "deb"
+            else:                    modo = "cred"
 
             _escreve_6110(idx, modo)
 
-        # Escreve 6000
         buf.write(f"|6000|{tipo_real}||||\n")
         cnt["t6000"] += 1
 
-        # ── TIPO X — 1 débito × 1 crédito ────────────────────────────────────
-        # _escreve() detecta modo="ambos" automaticamente (ambas contas preenchidas)
-        # _escreve_6110() emite TODOS os Reg 05 do idx (cc_deb OU cc_cred)
         if tipo_real == "X":
             d = debs[0]; c = creds[0]
             h   = d["hist"] or c["hist"]
             fil = _filial_p(d) or _filial_p(c)
             _escreve(d["cta_deb"], c["cta_cred"], d["valor"], h, fil, d["idx"])
 
-        # ── TIPO D — 1 débito → vários créditos ──────────────────────────────
-        # _escreve() com deb_cta preenchido → modo="deb" → só emite Reg 05 com cc_deb
-        # _escreve() com cred_cta preenchido → modo="cred" → só emite Reg 05 com cc_cred
         elif tipo_real == "D":
             d = debs[0]
             _escreve(d["cta_deb"],"",d["valor"],d["hist"],_filial_p(d),d["idx"])
@@ -1050,9 +1060,6 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                 fil = _filial_p(c) or _filial_p(d)
                 _escreve("",c["cta_cred"],c["valor"],h,fil,c["idx"])
 
-        # ── TIPO C — vários débitos → 1 crédito ──────────────────────────────
-        # _escreve() com cred_cta preenchido → modo="cred" → só emite Reg 05 com cc_cred
-        # _escreve() com deb_cta preenchido → modo="deb" → só emite Reg 05 com cc_deb
         elif tipo_real == "C":
             c = creds[0]
             _escreve("",c["cta_cred"],c["valor"],c["hist"],_filial_p(c),c["idx"])
@@ -1061,7 +1068,6 @@ def _gerar_saida_posicional(parsed: dict, ni: str, gerar_6110: bool,
                 fil = _filial_p(d) or _filial_p(c)
                 _escreve(d["cta_deb"],"",d["valor"],h,fil,d["idx"])
 
-        # ── TIPO V — vários débitos × vários créditos ─────────────────────────
         else:
             for c in creds:
                 _escreve("",c["cta_cred"],c["valor"],c["hist"],_filial_p(c),c["idx"])
@@ -1525,9 +1531,10 @@ def main():
             disabled=(tipo not in ("ecd","dominio_pos")),
             help=(
                 "Gera o registro 6110 imediatamente após cada 6100 pai.\n"
-                "• Tipo X: emite todos os Reg 05 do lançamento (cc_deb OU cc_cred)\n"
-                "• Linha só débito: emite apenas Reg 05 com cc_deb preenchido\n"
-                "• Linha só crédito: emite apenas Reg 05 com cc_cred preenchido\n"
+                "Regra de modo aplicada em todos os módulos:\n"
+                "• 6100 tipo X (deb+cred): gera 6110 deb E 6110 cred\n"
+                "• 6100 só débito: gera apenas 6110 com cc_deb\n"
+                "• 6100 só crédito: gera apenas 6110 com cc_cred\n"
                 "Gerado EXATAMENTE como está no arquivo — sem inferir contrapartida."
             )
         )
@@ -1568,18 +1575,13 @@ def main():
                     prog_bar.progress(50); status_txt.text("Gerando registros...")
                     crono.etapa("Geração dos registros"); log.append("\n── GERAÇÃO ──")
                     linhas_ecd = _gerar_ecd(ecd, log, prog_bar, status_txt)
+
+                    # ── Injeção de 6110 com filtro de modo — V3.5 ──────────
                     if gerar_6110:
-                        linhas_com_6110 = []
-                        for l in linhas_ecd:
-                            linhas_com_6110.append(l)
-                            if l.startswith("|6100|"):
-                                campos = l.split("|")
-                                if len(campos) >= 6:
-                                    deb_l=campos[3]; cred_l=campos[4]; valor_l=campos[5]
-                                    hist_l=campos[7] if len(campos)>7 else ""; data_l=campos[2]
-                                    if deb_l: linhas_com_6110.append(f"|6110|{data_l}|{deb_l}|{valor_l}|D||{hist_l}|||||||")
-                                    if cred_l: linhas_com_6110.append(f"|6110|{data_l}|{cred_l}|{valor_l}|C||{hist_l}|||||||")
-                        linhas_ecd = linhas_com_6110
+                        linhas_ecd = _injetar_6110_ecd(linhas_ecd)
+                        n6110 = sum(1 for l in linhas_ecd if l.startswith("|6110|"))
+                        log.append(f"  Reg. 6110 gerados  : {n6110:,}")
+
                     crono.etapa("Montagem do arquivo"); prog_bar.progress(90); status_txt.text("Montando arquivo...")
                     buf_out = io.StringIO()
                     for i in range(0,len(linhas_ecd),WRITE_CHUNK):
@@ -1588,11 +1590,14 @@ def main():
                     nome_saida = f"ECD_{ni}_dominio.txt"
                     st.session_state.resultado_bytes = resultado_bytes; st.session_state.resultado_nome = nome_saida
                     n6000 = resultado_bytes.count(b"|6000|"); n6100 = resultado_bytes.count(b"|6100|")
-                    st.session_state.metricas = {
+                    n6110_f = resultado_bytes.count(b"|6110|")
+                    metricas = {
                         "CNPJ":ecd.cnpj,"Lançamentos (I200)":f"{len(ecd.lancamentos):,}",
                         "Registros 6000":f"{n6000:,}","Registros 6100":f"{n6100:,}",
                         "Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB"
                     }
+                    if gerar_6110: metricas["Registros 6110"] = f"{n6110_f:,}"
+                    st.session_state.metricas = metricas
                     if registros_erro:
                         erros_txt = _txt_erros_ecd(registros_erro,ecd.cnpj)
                         st.session_state.erros_bytes = erros_txt.encode("utf-8-sig")
