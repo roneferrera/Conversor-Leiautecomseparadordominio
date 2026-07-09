@@ -1,25 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Domínio Sistemas — Conversor Unificado (Streamlit) V3.6
-Novidades V3.6 (sobre V3.5):
-  ┌─ MÓDULO EXCEL ────────────────────────────────────────────────────────────┐
-  │ • Inicia Lote usado como IDENTIFICADOR de lote                            │
-  │ • Lotes reordenados por (Data ↑, Filial ↑)                               │
-  │ • Filial extraída de "Código Matriz/Filial" → campo 9 do |6100|           │
-  │ • De/Para de filiais habilitado para Excel                                │
-  │ • Registro |6110| gerado com mesma regra do módulo posicional             │
-  │ • Validação de balanceamento por lote                                     │
-  └───────────────────────────────────────────────────────────────────────────┘
-  ┌─ MÓDULO SALDO INICIAL (NOVO) ─────────────────────────────────────────────┐
-  │ • Extrai saldo final do SPED ECD (I155 + I355)                            │
-  │ • I155 → Ativo / Passivo / PL  (último período I150)                     │
-  │ • I355 → Receitas / Despesas (antes do encerramento)                      │
-  │ • Gera UM único lote de saldo inicial no último dia do exercício          │
-  │ • Leiaute padrão Domínio com separador |                                  │
-  │ • IND_DC=D → cta_deb | IND_DC=C → cta_cred                              │
-  │ • Tipo X/D/C/V detectado automaticamente                                  │
-  │ • Valida balanceamento D = C                                              │
-  └───────────────────────────────────────────────────────────────────────────┘
 """
 import os
 import re
@@ -74,7 +55,7 @@ def apply_theme():
                 border-radius:6px;border:1px solid #FFD166;display:inline-block;}
     .badge-pos{background:#0a1a2e;color:#6EC6FF;font-weight:700;padding:6px 14px;
                border-radius:6px;border:1px solid #6EC6FF;display:inline-block;}
-    .badge-si{background:#1a0a0a;color:#FF9EBC;font-weight:700;padding:6px 14px;
+    .badge-si{background:#1a0a2e;color:#FF9EBC;font-weight:700;padding:6px 14px;
               border-radius:6px;border:1px solid #FF9EBC;display:inline-block;}
     .header-box{background:#102040;padding:20px 24px 14px;border-radius:8px;
                 border-top:5px solid #FF6B00;margin-bottom:20px;}
@@ -138,7 +119,7 @@ class Cronometro:
         return self._etapas
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS — NORMALIZAÇÃO DE HISTÓRICO
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 _MAPA_ESPECIAIS = {
     "\u2018": "'",  "\u2019": "'",  "\u201C": '"',  "\u201D": '"',
@@ -318,7 +299,7 @@ def _detectar_encoding_bytes(conteudo: bytes) -> str:
     return "latin-1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPER CENTRAL — gerar 6110 com filtro de modo
+# HELPER CENTRAL — gerar 6110
 # ═══════════════════════════════════════════════════════════════════════════════
 def _gerar_6110_linha(deb_cta: str, cred_cta: str, valor_fmt: str, modo: str) -> list:
     linhas = []
@@ -519,10 +500,8 @@ def _linhas_ecd(lanc: dict) -> list:
 
     def so_deb(conta, val, h):
         return fmt_reg_6100(data, conta, "", val, "", h)
-
     def so_cred(conta, val, h):
         return fmt_reg_6100(data, "", conta, val, "", h)
-
     def deb_e_cred(conta_d, conta_c, val, h):
         return fmt_reg_6100(data, conta_d, conta_c, val, "", h)
 
@@ -600,15 +579,21 @@ def _injetar_6110_ecd(linhas_ecd: list) -> list:
     return resultado
 
 def _txt_erros_ecd(registros_erro: list, cnpj: str) -> str:
+    """
+    Gera relatório de erros compatível com AMBOS os formatos:
+      - Módulo ECD lançamentos: {'linha': N, 'motivo': '...', 'conteudo': '...'}
+      - Módulo Saldo Inicial  : {'linha': N, 'motivo': '...', 'conteudo': '...'}
+                                 (normalizado antes de chamar esta função)
+    """
     linhas = [
         "="*70, "RELATÓRIO DE ERROS — SPED ECD",
         f"CNPJ : {cnpj}", f"Total: {len(registros_erro)}", "="*70, ""
     ]
     for i, r in enumerate(registros_erro, 1):
         linhas += [
-            f"[{i:04d}] Linha   : {r['linha']}",
-            f"       Motivo  : {r['motivo']}",
-            f"       Conteúdo: {r['conteudo']}", ""
+            f"[{i:04d}] Linha   : {r.get('linha', '-')}",
+            f"       Motivo  : {r.get('motivo', '')}",
+            f"       Conteúdo: {r.get('conteudo', '')}", ""
         ]
     linhas += ["="*70, "FIM DO RELATÓRIO"]
     return "\n".join(linhas)
@@ -617,7 +602,7 @@ def _txt_erros_ecd(registros_erro: list, cnpj: str) -> str:
 # MÓDULO SALDO INICIAL — extrai I155 + I355 do SPED ECD
 # ═══════════════════════════════════════════════════════════════════════════════
 def _normalizar_data_ecd(d: str) -> str:
-    """Converte data ECD (DDMMAAAA ou DD/MM/AAAA ou AAAA-MM-DD) para DD/MM/AAAA."""
+    """Converte DDMMAAAA / DD/MM/AAAA / AAAA-MM-DD → DD/MM/AAAA."""
     d = d.strip()
     if not d: return ""
     if re.fullmatch(r"\d{2}/\d{2}/\d{4}", d): return d
@@ -628,16 +613,12 @@ def _normalizar_data_ecd(d: str) -> str:
 
 def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     """
-    Lê o SPED ECD e extrai:
-      - CNPJ (registro 0000)
-      - Data fim da escrituração (último I150.DT_FIN ou 0000.DT_FIN)
-      - Saldos finais de I155 (patrimoniais)  → {cod_cta: (valor, dc)}
-      - Saldos de I355 (resultado)             → {cod_cta: (valor, dc)}
+    Lê I150, I155, I355 do SPED ECD.
 
     Estrutura dos registros:
-      I150: |I150|DT_INI|DT_FIN|  (campo 1=DT_INI, campo 2=DT_FIN)
+      I150: |I150|DT_INI|DT_FIN|
       I155: |I155|COD_CTA|COD_CCUS|VL_SLD_INI|IND_DC_INI|VL_DEB|VL_CRED|VL_SLD_FIN|IND_DC_FIN|
-               idx:  0       1        2           3          4      5      6     7          8
+               idx:  0       1        2           3           4      5      6     7          8
       I355: |I355|COD_CTA|COD_CCUS|VL_CTA|IND_DC|
                idx:  0       1        2      3      4
     """
@@ -651,13 +632,13 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     linhas = texto.splitlines()
     log.append(f"  Total de linhas    : {len(linhas):,}")
 
-    cnpj            = ""
-    dt_fin_0000     = ""
-    periodos        = []          # [(dt_ini, dt_fin)]
-    i155_por_periodo: dict = {}   # {idx_periodo: {cod_cta: (valor, dc)}}
+    cnpj              = ""
+    dt_fin_0000       = ""
+    periodos          = []
+    i155_por_periodo  = {}
     periodo_atual_idx = -1
-    saldos_i355: dict = {}
-    erros: list = []
+    saldos_i355       = {}
+    erros             = []
     cnt = {"0000": 0, "I150": 0, "I155": 0, "I355": 0}
 
     for num_linha, linha in enumerate(linhas, 1):
@@ -685,8 +666,6 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                     i155_por_periodo[periodo_atual_idx] = {}
 
             elif reg == "I155":
-                # |I155|COD_CTA|COD_CCUS|VL_SLD_INI|IND_DC_INI|VL_DEB|VL_CRED|VL_SLD_FIN|IND_DC_FIN|
-                #   0      1       2         3           4         5      6        7           8
                 cnt["I155"] += 1
                 if periodo_atual_idx < 0:
                     erros.append({
@@ -696,8 +675,8 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                     })
                     continue
                 cod_cta    = _campo(campos, 1).strip()
-                vl_fin     = _campo(campos, 7).strip()   # VL_SLD_FIN
-                ind_dc_fin = _campo(campos, 8).strip().upper()  # IND_DC_FIN
+                vl_fin     = _campo(campos, 7).strip()
+                ind_dc_fin = _campo(campos, 8).strip().upper()
                 if not cod_cta: continue
                 if ind_dc_fin not in ("D", "C"): ind_dc_fin = "D"
                 try:
@@ -707,8 +686,6 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 i155_por_periodo[periodo_atual_idx][cod_cta] = (valor_f, ind_dc_fin)
 
             elif reg == "I355":
-                # |I355|COD_CTA|COD_CCUS|VL_CTA|IND_DC|
-                #   0      1       2        3      4
                 cnt["I355"] += 1
                 cod_cta = _campo(campos, 1).strip()
                 vl_cta  = _campo(campos, 3).strip()
@@ -728,17 +705,17 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 "conteudo": linha[:80],
             })
 
-    # Saldos I155 do ÚLTIMO período (saldo final real do exercício)
-    saldos_i155: dict = {}
+    # Saldos I155 do ÚLTIMO período
+    saldos_i155 = {}
     if i155_por_periodo:
-        ultimo_idx = max(i155_por_periodo.keys())
+        ultimo_idx  = max(i155_por_periodo.keys())
         saldos_i155 = i155_por_periodo[ultimo_idx]
         log.append(f"  Períodos I150      : {len(periodos):,}")
-        log.append(f"  Último período     : {periodos[ultimo_idx][0]} a {periodos[ultimo_idx][1]}")
+        log.append(f"  Último período     : {periodos[ultimo_idx][0]} "
+                   f"a {periodos[ultimo_idx][1]}")
     else:
         log.append("  AVISO: Nenhum registro I150/I155 encontrado.")
 
-    # Data de referência: último I150.DT_FIN ou 0000.DT_FIN
     data_ref = periodos[-1][1] if periodos else dt_fin_0000
     data_ref = _normalizar_data_ecd(data_ref)
 
@@ -761,21 +738,19 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                                   historico_prefixo: str,
                                   log: list) -> tuple:
     """
-    Gera o arquivo TXT no leiaute padrão Domínio a partir dos saldos do ECD.
+    Monta UM único lançamento (6000 + N linhas 6100) com todos os saldos.
 
-    Regra D/C → débito/crédito no 6100:
-      IND_DC = "D" (Saldo Devedor)  → conta no campo DÉBITO   (cta_deb)
-      IND_DC = "C" (Saldo Credor)   → conta no campo CRÉDITO  (cta_cred)
+    Regra D/C:
+      IND_DC = "D"  →  conta no campo DÉBITO   (cta_deb)
+      IND_DC = "C"  →  conta no campo CRÉDITO  (cta_cred)
 
-    Tipo de lançamento:
-      1×1 → X | 1 deb × N cred → D | N deb × 1 cred → C | N×N → V
+    Tipo detectado automaticamente: X / D / C / V
     """
     data_ref   = parsed["data_ref"]
     saldos_155 = parsed["saldos_i155"]
     saldos_355 = parsed["saldos_i355"]
 
-    # Une I155 (patrimonial) + I355 (resultado) — conjuntos normalmente disjuntos
-    todos_saldos: dict = {}
+    todos_saldos = {}
     todos_saldos.update(saldos_155)
     todos_saldos.update(saldos_355)
 
@@ -803,7 +778,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
     log.append(f"  Partidas débito    : {len(debs):,}  → R$ {total_deb:,.2f}")
     log.append(f"  Partidas crédito   : {len(creds):,}  → R$ {total_cred:,.2f}")
     log.append(f"  Diferença          : R$ {diferenca:,.2f}")
-    log.append(f"  Balanceado         : {'SIM' if balanceado else 'NÃO — ATENÇÃO'}")
+    log.append(f"  Balanceado         : {'SIM' if balanceado else 'NAO — ATENÇÃO'}")
 
     buf = io.StringIO()
     buf.write(fmt_reg_0000(ni) + "\n")
@@ -865,12 +840,14 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
         "contas_i355":   len(saldos_355),
     }
 
+    # Erros de geração — formato NORMALIZADO com 'linha', 'motivo', 'conteudo'
     erros_out = []
     if not balanceado:
         erros_out.append({
-            "motivo":     f"Lançamento desbalanceado: dif. R$ {diferenca:,.2f}",
-            "deb_total":  total_deb,
-            "cred_total": total_cred,
+            "linha":    0,
+            "motivo":   f"Lançamento desbalanceado: dif. R$ {diferenca:,.2f} "
+                        f"(D={total_deb:,.2f} / C={total_cred:,.2f})",
+            "conteudo": "",
         })
 
     return resultado_bytes, resumo, erros_out
@@ -895,9 +872,13 @@ def processar_saldo_inicial_ecd(conteudo: bytes, ni: str,
     status.text("Gerando lançamento único de saldo inicial...")
     log.append("\n── GERAÇÃO ──")
 
-    resultado_bytes, resumo, erros = _gerar_saldo_inicial_dominio(
+    resultado_bytes, resumo, erros_geracao = _gerar_saldo_inicial_dominio(
         parsed, cnpj_uso, historico_prefixo, log
     )
+
+    # Une erros de parse + erros de geração — todos com chaves normalizadas
+    # {'linha': N, 'motivo': '...', 'conteudo': '...'}
+    todos_erros = parsed["erros"] + erros_geracao
 
     prog_bar.progress(90)
     n6100 = resultado_bytes.count(b"|6100|") if resultado_bytes else 0
@@ -912,12 +893,12 @@ def processar_saldo_inicial_ecd(conteudo: bytes, ni: str,
         "Tipo":            resumo.get("tipo", "-"),
         "Reg. 6100":       f"{n6100:,}",
         "Balanceado":      "SIM" if resumo.get("balanceado") else "NAO",
-        "Tamanho saída":   f"{len(resultado_bytes)/1024:.1f} KB",
+        "Tamanho":         f"{len(resultado_bytes)/1024:.1f} KB",
     }
 
     prog_bar.progress(100)
     status.text("Concluído!")
-    return resultado_bytes, metricas, erros
+    return resultado_bytes, metricas, todos_erros
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MÓDULO TXT STREAMING
@@ -1828,10 +1809,9 @@ def _init_state():
         "cnpj_ecd_fmt":       "",
         "mapa_filiais_df":    None,
         "filiais_detectadas": [],
-        # ── Saldo Inicial ──────────────────────────────────────────────────
+        # ── Saldo Inicial ──────────────────────────────────────────────
         "modo_saldo_inicial": False,
         "hist_prefixo_si":    "SALDO INICIAL",
-        "si_resumo":          {},
     }
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
@@ -1842,12 +1822,12 @@ def _reset():
         "log_bytes","log_nome","log_linhas","resumo","erros_lote","metricas",
         "tipo_detectado","sheets","sheet_sel","arquivo_bytes","arquivo_nome",
         "processado","cnpj_ecd","cnpj_ecd_fmt","filiais_detectadas",
-        "modo_saldo_inicial","si_resumo",
+        "modo_saldo_inicial",
     ]
     for k in keys:
         st.session_state[k] = (
             []    if k in ("log_linhas","resumo","erros_lote","sheets","filiais_detectadas") else
-            {}    if k in ("metricas","si_resumo") else
+            {}    if k == "metricas" else
             None  if k.endswith("_bytes") else
             False if k in ("processado","modo_saldo_inicial") else ""
         )
@@ -2077,20 +2057,16 @@ def _render_resultados_posicional(exibir_log: bool):
             f"{'#FF4444' if tem_erro else '#1A3050'};'>{log_txt}</div>",
             unsafe_allow_html=True)
 
-# ── NOVO: Renderização Saldo Inicial ──────────────────────────────────────────
 def _render_resultados_saldo_inicial(exibir_log: bool):
     metricas = st.session_state.metricas or {}
     st.markdown("---")
     st.markdown("## 📊 Resultado — Saldo Inicial (SPED ECD → Domínio)")
     if metricas:
         items = list(metricas.items())
-        # Exibe até 5 métricas por linha
         for inicio in range(0, len(items), 5):
             bloco = items[inicio:inicio+5]
             cols  = st.columns(len(bloco))
-            for i, (k, v) in enumerate(bloco):
-                cols[i].metric(k, v)
-
+            for i, (k, v) in enumerate(bloco): cols[i].metric(k, v)
     bal = metricas.get("Balanceado", "")
     if bal == "SIM":
         st.markdown(
@@ -2104,7 +2080,6 @@ def _render_resultados_saldo_inicial(exibir_log: bool):
             "<b style='color:#FF4444;font-size:18px;'>"
             "Lançamento DESBALANCEADO — verifique o relatório de erros.</b></div>",
             unsafe_allow_html=True)
-
     st.markdown("#### ⬇ Downloads")
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
@@ -2132,7 +2107,6 @@ def _render_resultados_saldo_inicial(exibir_log: bool):
                 data=log_txt.encode("utf-8-sig"),
                 file_name="log_saldo_inicial.txt",
                 mime="text/plain", use_container_width=True)
-
     if exibir_log and st.session_state.log_linhas:
         st.markdown("#### 🖥 Log de Processamento")
         log_txt  = "\n".join(str(l) for l in st.session_state.log_linhas)
@@ -2260,7 +2234,7 @@ def main():
 
     ni = ""; ok_insc = False; ti = ""; inf = ""
 
-    # ── CNPJ para ECD (lançamentos OU saldo inicial) ───────────────────────
+    # ── CNPJ para ECD (lançamentos OU saldo inicial) ──────────────────────────
     if tipo in ("ecd", "ecd_saldo"):
         st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
         cnpj_ecd = st.session_state.cnpj_ecd
@@ -2283,46 +2257,44 @@ def main():
                 else:
                     st.error("✖ CNPJ/CPF inválido")
 
-        # ── Bloco Saldo Inicial — aparece apenas quando tipo base é "ecd" ──
-        if st.session_state.tipo_detectado in ("ecd", "ecd_saldo"):
-            st.markdown("---")
-            st.markdown(
-                "<div class='si-box'>"
-                "<b style='color:#FF9EBC;font-size:15px;'>📥 Módulo Saldo Inicial</b><br>"
-                "<small style='color:#C8A0B8;'>"
-                "Extrai o <b>saldo final</b> de todas as contas do SPED ECD e gera um "
-                "<b>único lançamento de saldo inicial</b> no leiaute padrão Domínio, "
-                "datado no último dia do exercício.<br>"
-                "• <b>I155</b> → Ativo / Passivo / Patrimônio Líquido (último período I150)<br>"
-                "• <b>I355</b> → Receitas / Despesas (antes do encerramento)"
-                "</small></div>",
-                unsafe_allow_html=True)
+        # ── Bloco Saldo Inicial ───────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown(
+            "<div class='si-box'>"
+            "<b style='color:#FF9EBC;font-size:15px;'>📥 Módulo Saldo Inicial</b><br>"
+            "<small style='color:#C8A0B8;'>"
+            "Extrai o <b>saldo final</b> de todas as contas do SPED ECD e gera um "
+            "<b>único lançamento de saldo inicial</b> no leiaute padrão Domínio, "
+            "datado no último dia do exercício.<br>"
+            "• <b>I155</b> → Ativo / Passivo / PL (último período I150)<br>"
+            "• <b>I355</b> → Receitas / Despesas (antes do encerramento)"
+            "</small></div>",
+            unsafe_allow_html=True)
 
-            col_si1, col_si2 = st.columns([1, 2])
-            with col_si1:
-                modo_saldo = st.checkbox(
-                    "🔄 Gerar Saldo Inicial a partir deste ECD",
-                    value=st.session_state.get("modo_saldo_inicial", False),
-                    key="chk_saldo_inicial")
-                st.session_state.modo_saldo_inicial = modo_saldo
-            with col_si2:
-                hist_prefixo = st.text_input(
-                    "Prefixo do histórico",
-                    value=st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
-                    max_chars=60,
-                    key="hist_prefixo_si_widget",
-                    help="Texto que precede o código da conta em cada linha 6100.")
-                st.session_state.hist_prefixo_si = hist_prefixo
+        col_si1, col_si2 = st.columns([1, 2])
+        with col_si1:
+            modo_saldo = st.checkbox(
+                "🔄 Gerar Saldo Inicial a partir deste ECD",
+                value=st.session_state.get("modo_saldo_inicial", False),
+                key="chk_saldo_inicial")
+            st.session_state.modo_saldo_inicial = modo_saldo
+        with col_si2:
+            hist_prefixo = st.text_input(
+                "Prefixo do histórico",
+                value=st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
+                max_chars=60,
+                key="hist_prefixo_si_widget",
+                help="Texto que precede o código da conta em cada linha 6100.")
+            st.session_state.hist_prefixo_si = hist_prefixo
 
-            # Atualiza o tipo detectado conforme checkbox
-            if modo_saldo:
-                st.session_state.tipo_detectado = "ecd_saldo"
-                tipo = "ecd_saldo"
-            else:
-                # Só reverte se ainda não processou como saldo
-                if st.session_state.tipo_detectado == "ecd_saldo" and not st.session_state.processado:
-                    st.session_state.tipo_detectado = "ecd"
-                    tipo = "ecd"
+        # Atualiza tipo conforme checkbox
+        if modo_saldo:
+            st.session_state.tipo_detectado = "ecd_saldo"
+            tipo = "ecd_saldo"
+        else:
+            if st.session_state.tipo_detectado == "ecd_saldo" and not st.session_state.processado:
+                st.session_state.tipo_detectado = "ecd"
+                tipo = "ecd"
 
     else:
         st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
@@ -2348,7 +2320,7 @@ def main():
         gerar_6110 = st.checkbox(
             "Gerar registro 6110 (Centro de Custos)",
             value=False,
-            disabled=(tipo not in ("ecd", "dominio_pos", "excel")),
+            disabled=(tipo not in ("ecd", "ecd_saldo", "dominio_pos", "excel")),
             help=(
                 "Gera o registro 6110 imediatamente após cada 6100 pai.\n"
                 "• 6100 tipo X: gera 6110 deb E 6110 cred\n"
@@ -2367,7 +2339,6 @@ def main():
                 "Excel: detectado da coluna 'Código Matriz/Filial'."
             ))
 
-    # ── Widget De/Para ─────────────────────────────────────────────────────────
     mapa_filiais = {}
     if tipo == "dominio_pos" and usar_de_para:
         filiais_detectadas = st.session_state.get("filiais_detectadas", [])
@@ -2408,7 +2379,7 @@ def main():
             if tipo == "ecd_saldo":
                 crono.etapa("Saldo Inicial ECD")
                 log.append("── SALDO INICIAL — SPED ECD ──")
-                resultado_bytes, metricas, erros_si = processar_saldo_inicial_ecd(
+                resultado_bytes, metricas, todos_erros = processar_saldo_inicial_ecd(
                     conteudo, ni,
                     st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
                     log, prog_bar, status_txt
@@ -2418,8 +2389,9 @@ def main():
                 st.session_state.resultado_nome  = nome_saida
                 st.session_state.metricas        = metricas
                 st.session_state.processado      = True
-                if erros_si:
-                    erros_txt = _txt_erros_ecd(erros_si, ni)
+                # ── CORREÇÃO DO BUG: usa _txt_erros_ecd que agora aceita .get() ──
+                if todos_erros:
+                    erros_txt = _txt_erros_ecd(todos_erros, ni)
                     st.session_state.erros_bytes = erros_txt.encode("utf-8-sig")
                     st.session_state.erros_nome  = f"SALDO_INI_{ni}_erros.txt"
                 total_seg = crono.encerrar()
@@ -2480,7 +2452,7 @@ def main():
                     st.session_state.processado = True
                     prog_bar.progress(100); status_txt.text("Concluído!")
 
-            # ── EXCEL — V3.6 ──────────────────────────────────────────────────
+            # ── EXCEL ─────────────────────────────────────────────────────────
             elif tipo == "excel":
                 crono.etapa("Leitura Excel")
                 status_txt.text("Lendo Excel..."); prog_bar.progress(8)
