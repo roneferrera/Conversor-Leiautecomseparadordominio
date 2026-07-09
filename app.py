@@ -474,7 +474,44 @@ def _normalizar_data_ecd(d: str) -> str:
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", d)
     if m: return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
     return d
+def _sugerir_conta_pl(contas_pl_candidatas: list,
+                      saldos_i155_raw: dict,
+                      resultado_liquido: float,
+                      log: list) -> str:
+    if not contas_pl_candidatas:
+        log.append("  Sugestão PL        : nenhuma candidata encontrada no I050")
+        return ""
 
+    candidatas_com_saldo = []
+    for c in contas_pl_candidatas:
+        cod = c["cod_cta"]
+        if cod in saldos_i155_raw:
+            v, dc = saldos_i155_raw[cod]
+            diff  = abs(abs(v) - resultado_liquido)
+            candidatas_com_saldo.append({**c, "saldo": v, "dc": dc, "diff": diff})
+
+    if not candidatas_com_saldo:
+        c = contas_pl_candidatas[0]
+        log.append(f"  Sugestão PL        : {c['cod_cta']} — {c['nome']} (sem saldo no I155)")
+        return c["cod_cta"]
+
+    def _score(c):
+        prioridade_nat = 0 if c["cod_nat"] in ("09", "9") else 1
+        return (prioridade_nat, c["diff"])
+
+    candidatas_com_saldo.sort(key=_score)
+    melhor = candidatas_com_saldo[0]
+
+    log.append(f"\n  ── SUGESTÃO AUTOMÁTICA — CONTA PL/RESULTADO ──")
+    log.append(f"  Conta sugerida     : {melhor['cod_cta']}")
+    log.append(f"  Nome               : {melhor['nome']}")
+    log.append(f"  COD_NAT            : {melhor['cod_nat']}")
+    log.append(f"  Saldo no I155      : R$ {melhor['saldo']:,.2f} {melhor['dc']}")
+    log.append(f"  Resultado líquido  : R$ {resultado_liquido:,.2f}")
+    log.append(f"  Critério detecção  : {melhor['criterio']}")
+
+    return melhor["cod_cta"]
+  
 def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     """
     Lê I150, I155, I355 do SPED ECD.
@@ -494,6 +531,11 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     contas_i355: set = set()
     cnt={"0000":0,"I150":0,"I155":0,"I355":0}
 
+    mapa_nome_cta: dict = {}
+    mapa_nat_cta: dict = {}
+    contas_pl_candidatas: list = []
+    mapa_reduz_para_cta: dict = {}
+
     for num_linha, linha in enumerate(linhas, 1):
         linha = linha.strip()
         if not linha: continue
@@ -505,6 +547,43 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 cnt["0000"] += 1
                 if len(campos) > 5: cnpj = re.sub(r"\D","",_campo(campos,5).strip())
                 if len(campos) > 4: dt_fin_0000 = _campo(campos,4).strip()
+
+            elif reg == "I050":
+                if len(campos) < 6:
+                    continue
+                cod_nat  = _campo(campos, 2).strip()
+                ind_cta  = _campo(campos, 3).strip().upper()
+                cod_cta  = _campo(campos, 5).strip()
+                cod_sup  = _campo(campos, 6).strip() if len(campos) > 6 else ""
+                nome_cta = _campo(campos, 7).strip() if len(campos) > 7 else ""
+                cta_reduz = cod_cta
+
+                if cod_cta:
+                    mapa_reduz_para_cta[cod_cta] = cod_cta
+                    if cta_reduz:
+                        mapa_reduz_para_cta[cta_reduz] = cod_cta
+                    mapa_nome_cta[cod_cta] = nome_cta
+                    mapa_nat_cta[cod_cta]  = cod_nat
+
+                    eh_resultado_nat = cod_nat in ("05", "09", "5", "9")
+                    nome_up = nome_cta.upper()
+                    palavras_resultado = (
+                        "SUPERAVIT", "DÉFICIT", "DEFICIT",
+                        "RESULTADO", "LUCRO", "PREJUIZO", "PREJUÍZO",
+                        "SOBRA", "PERDA", "SURPLUS",
+                        "RESULTADO DO EXERC", "LUCROS OU PREJUIZ",
+                    )
+                    eh_resultado_nome = any(p in nome_up for p in palavras_resultado)
+
+                    if ind_cta == "A" and (eh_resultado_nat or eh_resultado_nome):
+                        contas_pl_candidatas.append({
+                            "cod_cta":  cod_cta,
+                            "nome":     nome_cta,
+                            "cod_nat":  cod_nat,
+                            "cod_sup":  cod_sup,
+                            "criterio": "COD_NAT" if eh_resultado_nat else "NOME",
+                        })
+
             elif reg == "I150":
                 cnt["I150"] += 1
                 dt_ini=_campo(campos,1).strip(); dt_fin=_campo(campos,2).strip()
@@ -512,8 +591,8 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 periodo_atual_idx = len(periodos)-1
                 if periodo_atual_idx not in i155_por_periodo:
                     i155_por_periodo[periodo_atual_idx] = {}
+
             elif reg == "I155":
-                # |I155|COD_CTA|COD_CCUS|VL_SLD_INI|IND_DC_INI|VL_DEB|VL_CRED|VL_SLD_FIN|IND_DC_FIN|
                 cnt["I155"] += 1
                 if periodo_atual_idx < 0:
                     erros.append({"linha":num_linha,"motivo":"I155 sem I150","conteudo":linha[:80]}); continue
@@ -524,8 +603,8 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 try: valor_f=_str2float(vl_fin)
                 except: valor_f=0.0
                 i155_por_periodo[periodo_atual_idx][cod_cta]=(valor_f,ind_dc_fin)
+
             elif reg == "I355":
-                # |I355|COD_CTA|COD_CCUS|VL_CTA|IND_DC|
                 cnt["I355"] += 1
                 cod_cta=_campo(campos,1).strip(); vl_cta=_campo(campos,3).strip()
                 ind_dc=_campo(campos,4).strip().upper()
@@ -535,6 +614,7 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
                 except: valor_f=0.0
                 saldos_i355[cod_cta]=(valor_f,ind_dc)
                 contas_i355.add(cod_cta)
+
         except Exception as ex:
             erros.append({"linha":num_linha,"motivo":f"Exceção: {ex}","conteudo":linha[:80]})
 
@@ -548,7 +628,7 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     else:
         log.append("  AVISO: Nenhum registro I150/I155 encontrado.")
 
-    # Separa patrimoniais (sem contas de resultado zeradas) de resultado
+    # Separa patrimoniais de resultado
     saldos_i155_pat = {cta:(v,dc) for cta,(v,dc) in saldos_i155_raw.items() if cta not in contas_i355}
     saldos_i155_res = {cta:(v,dc) for cta,(v,dc) in saldos_i155_raw.items() if cta in contas_i355}
 
@@ -560,14 +640,35 @@ def _parse_saldo_inicial_ecd(conteudo: bytes, log: list) -> dict:
     log.append(f"  I155 patrimoniais  : {len(saldos_i155_pat):,} contas")
     log.append(f"  I155 resultado     : {len(saldos_i155_res):,} contas (zeradas no encerramento)")
     log.append(f"  I355 resultado     : {len(saldos_i355):,} contas (antes do encerramento)")
+    log.append(f"  Candidatas PL      : {len(contas_pl_candidatas):,} conta(s) detectada(s) no I050")
     if erros: log.append(f"  Erros/avisos       : {len(erros):,}")
 
+    # ── Sugestão automática da conta PL ──────────────────────────────────────
+    # ↑ indentação correta: 4 espaços, alinhado com o restante do corpo da função
+    total_rec = sum(v for v, dc in saldos_i355.values() if dc == "C")
+    total_des = sum(v for v, dc in saldos_i355.values() if dc == "D")
+    resultado_liq_ref = round(abs(total_rec - total_des), 2)
+    conta_pl_sugerida = _sugerir_conta_pl(
+        contas_pl_candidatas, saldos_i155_raw, resultado_liq_ref, log
+    )
+    if conta_pl_sugerida:
+        nome_sug = mapa_nome_cta.get(conta_pl_sugerida, "")
+        st.session_state["conta_pl_sugerida"]      = conta_pl_sugerida
+        st.session_state["conta_pl_sugerida_nome"] = nome_sug
+        log.append(f"\n  ── ORIENTAÇÃO ──")
+        log.append(f"  Conta sugerida     : {conta_pl_sugerida}")
+        log.append(f"  Nome               : {nome_sug}")
+        log.append(f"  Use este código no campo 'Conta PL/Resultado' abaixo.")
+
     return {
-        "cnpj": cnpj, "data_ref": data_ref,
-        "saldos_i155_pat": saldos_i155_pat,   # Ativo/Passivo/PL sem resultado
-        "saldos_i155_res": saldos_i155_res,   # resultado zerado (informativo)
-        "saldos_i355":     saldos_i355,        # resultado aberto (antes encerramento)
-        "erros": erros, "cnt": cnt,
+        "cnpj":              cnpj,
+        "data_ref":          data_ref,
+        "saldos_i155_pat":   saldos_i155_pat,
+        "saldos_i155_res":   saldos_i155_res,
+        "saldos_i355":       saldos_i355,
+        "conta_pl_sugerida": conta_pl_sugerida,
+        "erros":             erros,
+        "cnt":               cnt,
     }
 
 
@@ -815,6 +916,12 @@ def processar_saldo_inicial_ecd(conteudo: bytes, ni: str,
     log.append("── PARSE SALDO INICIAL (ECD) V3.6.2 ──")
 
     parsed = _parse_saldo_inicial_ecd(conteudo, log)
+    conta_pl_sugerida = parsed.get("conta_pl_sugerida", "")
+    if conta_pl_sugerida:
+        nome_pl = parsed.get("mapa_nome_cta", {}).get(conta_pl_sugerida, "")
+        st.session_state["conta_pl_sugerida"]      = conta_pl_sugerida
+        st.session_state["conta_pl_sugerida_nome"] = nome_pl
+      
     cnpj_uso = ni if ni else parsed["cnpj"]
     if not cnpj_uso:
         log.append("ERRO: CNPJ não encontrado.")
@@ -1825,24 +1932,42 @@ def main():
             st.session_state.modo_resultado_si=modo_resultado
 
             conta_pl=""
-            if modo_resultado=="aberto_com_resultado":
-                st.markdown(
-                    "<div class='card-warn'>⚠ <b style='color:#FFD166;'>Informe a conta de Superávit/Déficit do PL.</b><br>"
-                    "<small>O sistema irá deduzir o resultado líquido do I355 desta conta para fechar o balanço (D=C).<br>"
-                    "Exemplo: conta <b>3.1.1.01</b> — Superávit/Déficit do Exercício.</small></div>",
-                    unsafe_allow_html=True)
-                conta_pl=st.text_input(
+            if modo_resultado == "aberto_com_resultado":
+                sugerida      = st.session_state.get("conta_pl_sugerida", "")
+                sugerida_nome = st.session_state.get("conta_pl_sugerida_nome", "")
+
+                if sugerida:
+                    st.markdown(
+                        f"<div class='si-box'>"
+                        f"<b style='color:#FF9EBC;'>💡 Conta sugerida automaticamente:</b><br>"
+                        f"<span style='color:#FFD166;font-size:18px;font-weight:700;'>{sugerida}</span>"
+                        f"<span style='color:#9BB0C8;margin-left:12px;'>{sugerida_nome}</span><br>"
+                        f"<small style='color:#9BB0C8;'>Detectada pelo COD_NAT/nome no I050 do SPED ECD.<br>"
+                        f"Confirme se este é o código correto antes de processar.</small>"
+                        f"</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        "<div class='card-warn'>⚠ <b style='color:#FFD166;'>Informe a conta de Superávit/Déficit do PL.</b><br>"
+                        "<small>O sistema irá deduzir o resultado líquido do I355 desta conta para fechar o balanço (D=C).<br>"
+                        "Exemplo: conta <b>3.1.1.01</b> — Superávit/Déficit do Exercício.</small></div>",
+                        unsafe_allow_html=True)
+
+                conta_pl = st.text_input(
                     "Código da conta de Superávit/Déficit (PL)",
-                    value=st.session_state.get("conta_pl_resultado_si",""),
+                    value=sugerida if sugerida else st.session_state.get("conta_pl_resultado_si", ""),
                     placeholder="Ex: 311010101",
                     key="conta_pl_resultado_si_widget",
-                    help="Código exato como aparece no I155 do SPED ECD (somente números, sem pontos).")
-                st.session_state.conta_pl_resultado_si=conta_pl
+                    help="Código exato como aparece no I155 do SPED ECD.")
+                st.session_state.conta_pl_resultado_si = conta_pl
+
                 if not conta_pl:
                     st.warning("⚠ Informe a conta de PL/Resultado para que o balanço feche corretamente.")
+                elif sugerida and conta_pl != sugerida:
+                    st.info(f"ℹ Usando conta informada manualmente: {conta_pl} (sugestão era: {sugerida})")
+
             else:
-                conta_pl=""
-                st.session_state.conta_pl_resultado_si=""
+                conta_pl = ""
+                st.session_state.conta_pl_resultado_si = ""
 
             # Atualiza tipo
             st.session_state.tipo_detectado="ecd_saldo"; tipo="ecd_saldo"
