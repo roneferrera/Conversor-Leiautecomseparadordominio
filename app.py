@@ -903,7 +903,98 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             "conteudo": "",
         })
     return resultado_bytes, resumo, erros_out
+def _pre_scan_conta_pl_sugerida(conteudo: bytes):
+    """
+    Lê apenas I050, I150, I155 e I355 para sugerir a conta PL
+    sem precisar processar o arquivo completo.
+    Grava o resultado no st.session_state.
+    """
+    log_tmp = []
+    enc = _detectar_encoding_bytes(conteudo)
+    try: texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
 
+    contas_pl_candidatas = []
+    saldos_i355 = {}
+    mapa_nome_cta = {}
+    i155_por_periodo = {}
+    periodo_atual_idx = -1
+
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha: continue
+        campos = _split_pipe(linha)
+        if not campos: continue
+        reg = campos[0]
+
+        if reg == "I050":
+            if len(campos) < 6: continue
+            cod_nat  = _campo(campos, 2).strip()
+            ind_cta  = _campo(campos, 3).strip().upper()
+            cod_cta  = _campo(campos, 5).strip()
+            nome_cta = _campo(campos, 7).strip() if len(campos) > 7 else ""
+            if not cod_cta: continue
+            mapa_nome_cta[cod_cta] = nome_cta
+            eh_resultado_nat  = cod_nat in ("05", "09", "5", "9")
+            nome_up = nome_cta.upper()
+            palavras_resultado = (
+                "SUPERAVIT","DÉFICIT","DEFICIT","RESULTADO",
+                "LUCRO","PREJUIZO","PREJUÍZO","SOBRA","PERDA",
+                "SURPLUS","RESULTADO DO EXERC","LUCROS OU PREJUIZ",
+            )
+            eh_resultado_nome = any(p in nome_up for p in palavras_resultado)
+            if ind_cta == "A" and (eh_resultado_nat or eh_resultado_nome):
+                contas_pl_candidatas.append({
+                    "cod_cta":  cod_cta,
+                    "nome":     nome_cta,
+                    "cod_nat":  cod_nat,
+                    "cod_sup":  _campo(campos, 6).strip() if len(campos) > 6 else "",
+                    "criterio": "COD_NAT" if eh_resultado_nat else "NOME",
+                })
+
+        elif reg == "I150":
+            periodo_atual_idx += 1
+            i155_por_periodo[periodo_atual_idx] = {}
+
+        elif reg == "I155":
+            if periodo_atual_idx < 0: continue
+            cod_cta = _campo(campos, 1).strip()
+            vl_fin  = _campo(campos, 7).strip()
+            ind_dc  = _campo(campos, 8).strip().upper()
+            if not cod_cta: continue
+            if ind_dc not in ("D", "C"): ind_dc = "D"
+            try: valor_f = _str2float(vl_fin)
+            except: valor_f = 0.0
+            i155_por_periodo[periodo_atual_idx][cod_cta] = (valor_f, ind_dc)
+
+        elif reg == "I355":
+            cod_cta = _campo(campos, 1).strip()
+            vl_cta  = _campo(campos, 3).strip()
+            ind_dc  = _campo(campos, 4).strip().upper()
+            if not cod_cta: continue
+            if ind_dc not in ("D", "C"): ind_dc = "D"
+            try: valor_f = _str2float(vl_cta)
+            except: valor_f = 0.0
+            saldos_i355[cod_cta] = (valor_f, ind_dc)
+
+    # Pega saldos do último período I155
+    saldos_i155_raw = {}
+    if i155_por_periodo:
+        ultimo_idx = max(i155_por_periodo.keys())
+        saldos_i155_raw = i155_por_periodo[ultimo_idx]
+
+    # Calcula resultado líquido do I355
+    total_rec = sum(v for v, dc in saldos_i355.values() if dc == "C")
+    total_des = sum(v for v, dc in saldos_i355.values() if dc == "D")
+    resultado_liq_ref = round(abs(total_rec - total_des), 2)
+
+    # Sugere a conta PL e grava no session_state
+    sugerida = _sugerir_conta_pl(
+        contas_pl_candidatas, saldos_i155_raw, resultado_liq_ref, log_tmp
+    )
+    if sugerida:
+        st.session_state["conta_pl_sugerida"]      = sugerida
+        st.session_state["conta_pl_sugerida_nome"] = mapa_nome_cta.get(sugerida, "")
 
 def processar_saldo_inicial_ecd(conteudo: bytes, ni: str,
                                  historico_prefixo: str,
@@ -1846,6 +1937,7 @@ def main():
             elif tipo=="ecd":
                 cnpj_num=_pre_scan_cnpj_ecd(conteudo)
                 st.session_state.cnpj_ecd=cnpj_num; st.session_state.cnpj_ecd_fmt=fmt_cnpj(cnpj_num) if cnpj_num else ""
+                _pre_scan_conta_pl_sugerida(conteudo)
             elif tipo=="dominio_pos":
                 filiais=_pre_scan_posicional(conteudo); st.session_state.filiais_detectadas=filiais
 
