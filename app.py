@@ -747,11 +747,12 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
     log.append(f"  Modo               : {modo}")
 
     # ── Monta conjunto de saldos conforme modo ────────────────────────────────
+        # ── Monta conjunto de saldos conforme modo ────────────────────────────────
     if modo == "apenas_patrimonial":
         todos_saldos = dict(saldos_pat)
         log.append(f"  Contas incluídas   : {len(todos_saldos):,} (somente patrimoniais)")
 
-        elif modo == "aberto_com_resultado":
+    elif modo == "aberto_com_resultado":
         if not saldos_i355:
             log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
             todos_saldos = dict(saldos_pat)
@@ -810,8 +811,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
         log.append("  Modo inválido — usando apenas_patrimonial.")
 
     # Remove saldos zero
-    todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}
-               
+    todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}               
     if not todos_saldos:
         log.append("  AVISO: Nenhum saldo diferente de zero encontrado.")
         return b"", {}, []
