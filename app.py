@@ -735,64 +735,12 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
 
     elif modo == "aberto_com_resultado":
         if not saldos_i355:
-            log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
-            todos_saldos = dict(saldos_pat)
-
+            ...
         elif not conta_pl_resultado:
-            log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
-            todos_saldos = dict(saldos_pat)
-            modo = "apenas_patrimonial"
-
+            ...
         else:
-            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-            total_rec = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "C"), 2)
-            total_des = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "D"), 2)
-            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
-            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
-            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
-                       f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
-
-            todos_saldos = dict(saldos_pat)
-
-            if conta_pl_resultado in todos_saldos:
-                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL           : {conta_pl_resultado} | "
-                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
-
-                deb_pat  = sum(v for _, (v, dc) in todos_saldos.items() if dc == "D")
-                cred_pat = sum(v for _, (v, dc) in todos_saldos.items() if dc == "C")
-                dif_pat  = round(deb_pat - cred_pat, 2)
-                log.append(f"  Balanço I155 puro  : D={deb_pat:,.2f} C={cred_pat:,.2f} Dif={dif_pat:,.2f}")
-
-                if abs(dif_pat) > TOL_VALOR:
-                    if dif_pat > 0:
-                        if dc_pl == "C":
-                            novo_saldo = round(saldo_pl + abs(dif_pat), 2)
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
-                        else:
-                            novo_saldo = round(saldo_pl - abs(dif_pat), 2)
-                            if novo_saldo >= 0:
-                                todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
-                            else:
-                                todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "C")
-                    else:
-                        if dc_pl == "D":
-                            novo_saldo = round(saldo_pl + abs(dif_pat), 2)
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
-                        else:
-                            novo_saldo = round(saldo_pl - abs(dif_pat), 2)
-                            if novo_saldo >= 0:
-                                todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
-                            else:
-                                todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "D")
-
-                novo_v, novo_dc = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
-                           f"(ajuste de R$ {abs(dif_pat):,.2f} aplicado)")
-            else:
-                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
-                           f"balanço não fechará.")
-
+            ...
+            # TUDO DENTRO DESTE else: até a linha:
             log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
                        f"(somente patrimoniais, PL ajustado pelo resultado I355)")
 
