@@ -1863,16 +1863,25 @@ def _render_resultados_saldo_inicial(exibir_log):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    st.set_page_config(page_title="Domínio Sistemas | Thomson Reuters",page_icon="🟠",layout="wide",initial_sidebar_state="expanded")
-    apply_theme(); _init_state()
-    st.markdown(f"<div class='header-box'><h2 style='color:#FF6B00;margin:0;'>Domínio Sistemas — Conversor Unificado</h2>"
-                f"<p style='color:#6B7A8D;margin:6px 0 0;'>Lançamentos Contábeis (TXT/Excel/Posicional) &nbsp;|&nbsp; "
-                f"SPED ECD &nbsp;→&nbsp; 0000 + 6000 + 6100 &nbsp;|&nbsp; Saldo Inicial ECD &nbsp;|&nbsp; "
-                f"<b style='color:#FF6B00;'>Thomson Reuters</b>&nbsp;|&nbsp; <small>{VERSAO}</small></p></div>",unsafe_allow_html=True)
+    st.set_page_config(
+        page_title="Domínio Sistemas | Thomson Reuters",
+        page_icon="🟠", layout="wide", initial_sidebar_state="expanded"
+    )
+    apply_theme()
+    _init_state()
+
+    st.markdown(
+        f"<div class='header-box'>"
+        f"<h2 style='color:#FF6B00;margin:0;'>Domínio Sistemas — Conversor Unificado</h2>"
+        f"<p style='color:#6B7A8D;margin:6px 0 0;'>Lançamentos Contábeis (TXT/Excel/Posicional) &nbsp;|&nbsp; "
+        f"SPED ECD &nbsp;→&nbsp; 0000 + 6000 + 6100 &nbsp;|&nbsp; Saldo Inicial ECD &nbsp;|&nbsp; "
+        f"<b style='color:#FF6B00;'>Thomson Reuters</b>&nbsp;|&nbsp; <small>{VERSAO}</small></p></div>",
+        unsafe_allow_html=True
+    )
 
     with st.sidebar:
         st.markdown("### ⚙ Configurações"); st.markdown("---")
-        exibir_log=st.checkbox("Exibir log de processamento",value=True)
+        exibir_log = st.checkbox("Exibir log de processamento", value=True)
         st.markdown("---"); st.markdown(f"**Versão:** {VERSAO}")
         st.markdown("**Thomson Reuters — Domínio Sistemas**"); st.markdown("---")
         st.markdown("**Formatos suportados:**")
@@ -1880,326 +1889,539 @@ def main():
                     "- 📋 SPED ECD (.txt) — lançamentos\n- 📋 SPED ECD (.txt) — saldo inicial\n"
                     "- 📋 TXT Posicional Domínio")
         st.markdown("---")
-        st.code("|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST||FILIAL||\n|6110|CC_DEB|CC_CRED|VALOR|",language=None)
+        st.code("|0000|CNPJ|\n|6000|TIPO||||\n|6100|DATA|DEB|CRED|VALOR||HIST||FILIAL||\n|6110|CC_DEB|CC_CRED|VALOR|", language=None)
         st.markdown(f"**Limite:** {MAX_UPLOAD_MB} MB")
 
-    st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
-    uploaded=st.file_uploader(f"Arraste ou clique (Excel, TXT separado por ';', SPED ECD ou TXT Posicional — máx. {MAX_UPLOAD_MB} MB)",
-                              type=["xlsx","xls","xlsm","txt","csv"])
+    # ── ABAS — existem sempre, independente de upload ─────────────────────────
+    aba_conv, aba_i052 = st.tabs([
+        "🔄 Conversor / Saldo Inicial",
+        "🔍 Comparar I052 entre ECDs",
+    ])
 
-    if uploaded is not None:
-        conteudo=uploaded.read(); mb=len(conteudo)/(1024*1024)
-        if mb>MAX_UPLOAD_MB: st.error(f"⛔ Arquivo muito grande ({mb:.1f} MB). Limite: {MAX_UPLOAD_MB} MB."); return
-        if conteudo!=st.session_state.arquivo_bytes or uploaded.name!=st.session_state.arquivo_nome:
-            _reset()
-            st.session_state.arquivo_bytes=conteudo; st.session_state.arquivo_nome=uploaded.name
-            tipo=identificar_tipo(uploaded.name,conteudo); st.session_state.tipo_detectado=tipo
-            if tipo=="excel":
-                try:
-                    xl=pd.ExcelFile(io.BytesIO(conteudo),engine="openpyxl")
-                    st.session_state.sheets=xl.sheet_names
-                    st.session_state.sheet_sel="Plan1" if "Plan1" in xl.sheet_names else xl.sheet_names[0]
-                except: st.session_state.sheets=[]
-            elif tipo=="ecd":
-                cnpj_num=_pre_scan_cnpj_ecd(conteudo)
-                st.session_state.cnpj_ecd=cnpj_num; st.session_state.cnpj_ecd_fmt=fmt_cnpj(cnpj_num) if cnpj_num else ""
-                _pre_scan_conta_pl_sugerida(conteudo)
-            elif tipo=="dominio_pos":
-                filiais=_pre_scan_posicional(conteudo); st.session_state.filiais_detectadas=filiais
+    # ═════════════════════════════════════════════════════════════════════════
+    # ABA 2 — COMPARAÇÃO I052 (independente de upload principal)
+    # ═════════════════════════════════════════════════════════════════════════
+    with aba_i052:
+        st.markdown("### 🔍 Comparação de I052 — ECD Anterior vs. ECD Atual")
+        st.markdown(
+            "<div class='info-box'>"
+            "Suba os dois arquivos SPED ECD. O sistema irá:<br>"
+            "① Extrair os <b>I052</b> (vínculos conta → COD_AGL) de cada arquivo<br>"
+            "② Comparar o <b>saldo final</b> de cada COD_AGL no anterior com o "
+            "<b>saldo inicial</b> no atual (regra <code>REGRA_VALIDA_BALANCO_SALDO_INI</code>)<br>"
+            "③ Apontar contas que <b>mudaram de grupo</b> entre os dois arquivos"
+            "</div>", unsafe_allow_html=True
+        )
 
-    if st.session_state.arquivo_bytes is None:
-        st.markdown("<div class='info-box'>⬆ Selecione um arquivo para começar.</div>",unsafe_allow_html=True); return
-
-    tipo=st.session_state.tipo_detectado
-    badges={"ecd":"<span class='badge-ecd'>📋 SPED ECD</span>",
-            "ecd_saldo":"<span class='badge-si'>📥 SPED ECD — Saldo Inicial</span>",
-            "excel":"<span class='badge-excel'>📊 Excel</span>",
-            "lote":"<span class='badge-lote'>📄 TXT Lote (;)</span>",
-            "dominio_pos":"<span class='badge-pos'>📋 TXT Posicional Domínio</span>"}
-    mb_info=len(st.session_state.arquivo_bytes)/(1024*1024)
-    st.markdown(f"{badges.get(tipo,'')} <span style='color:#6B7A8D;font-size:13px;margin-left:12px;'>{st.session_state.arquivo_nome} — {mb_info:.1f} MB</span>",unsafe_allow_html=True)
-    st.markdown("")
-
-    sheet_sel=""; linha_h=3; auto_head=True
-    if tipo=="excel" and st.session_state.sheets:
-        st.markdown("#### 📋 Passo 2 — Configurar Excel")
-        col1,col2,col3=st.columns([2,1,1])
-        with col1:
-            sheet_sel=st.selectbox("Aba (Sheet)",st.session_state.sheets,
-                                   index=(st.session_state.sheets.index(st.session_state.sheet_sel)
-                                          if st.session_state.sheet_sel in st.session_state.sheets else 0))
-            st.session_state.sheet_sel=sheet_sel
-        with col2: auto_head=st.checkbox("Detectar cabeçalho automaticamente",value=True)
-        with col3:
-            if not auto_head: linha_h=st.number_input("Linha do cabeçalho",min_value=1,max_value=50,value=4)-1
-
-    ni=""; ok_insc=False; ti=""; inf=""
-
-    if tipo in ("ecd","ecd_saldo"):
-        st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
-        cnpj_ecd=st.session_state.cnpj_ecd
-        if cnpj_ecd and validar_cnpj(cnpj_ecd):
-            st.markdown(f"<div class='cnpj-auto'>✔ CNPJ extraído: <span>{st.session_state.cnpj_ecd_fmt}</span></div>",unsafe_allow_html=True)
-            st.code(fmt_reg_0000(cnpj_ecd),language=None)
-            ok_insc=True; ti="CNPJ"; ni=cnpj_ecd; inf=st.session_state.cnpj_ecd_fmt
-        else:
-            st.warning("⚠ CNPJ não encontrado. Informe manualmente.")
-            cnpj_raw=st.text_input("CNPJ / CPF",placeholder="00.000.000/0001-00",key="cnpj_manual_ecd")
-            ok_insc,ti,ni=validar_inscricao(cnpj_raw)
-            if cnpj_raw:
-                if ok_insc: inf=fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni); st.success(f"✔ {ti} válido: {inf}")
-                else: st.error("✖ CNPJ/CPF inválido")
-
-        # ── Bloco Saldo Inicial ───────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("<div class='si-box'><b style='color:#FF9EBC;font-size:15px;'>📥 Módulo Saldo Inicial</b><br>"
-                    "<small style='color:#C8A0B8;'>Extrai o saldo final do SPED ECD e gera um único lançamento "
-                    "de saldo inicial no leiaute Domínio.</small></div>",unsafe_allow_html=True)
-
-        col_si1,col_si2=st.columns([1,2])
-        with col_si1:
-            modo_saldo=st.checkbox("🔄 Gerar Saldo Inicial",
-                                   value=st.session_state.get("modo_saldo_inicial",False),key="chk_saldo_inicial")
-            st.session_state.modo_saldo_inicial=modo_saldo
-        with col_si2:
-            hist_prefixo=st.text_input("Prefixo do histórico",
-                                       value=st.session_state.get("hist_prefixo_si","SALDO INICIAL"),
-                                       max_chars=60,key="hist_prefixo_si_widget")
-            st.session_state.hist_prefixo_si=hist_prefixo
-
-        if modo_saldo:
-            st.markdown("##### Tratamento das contas de Resultado")
-
-            modo_resultado=st.radio(
-                "Como tratar as contas de Resultado (I355)?",
-                options=["apenas_patrimonial","aberto_com_resultado"],
-                format_func=lambda x:{
-                    "apenas_patrimonial":  "✅ Apenas Patrimonial — Ativo/Passivo/PL (balanço fechado, sem resultado)",
-                    "aberto_com_resultado":"📂 Aberto com Resultado — inclui Receitas/Despesas para encerrar no sistema destino",
-                }[x],
-                index=0 if st.session_state.get("modo_resultado_si","apenas_patrimonial")=="apenas_patrimonial" else 1,
-                key="modo_resultado_si_widget",
-                help=(
-                    "Apenas Patrimonial: usa somente I155. Contas de resultado zeradas. "
-                    "Balanço D=C garantido.\n\n"
-                    "Aberto com Resultado: usa I155 patrimonial + I355 (receitas/despesas abertas). "
-                    "O sistema deduz automaticamente o resultado líquido da conta de PL informada, "
-                    "para que D=C. Permite encerrar as despesas no sistema destino."
-                )
+        col_u1, col_u2 = st.columns(2)
+        with col_u1:
+            st.markdown("**📁 Arquivo ECD — ANTERIOR (ano N-1)**")
+            upload_ant = st.file_uploader(
+                "ECD anterior", type=["txt"], key="upload_i052_ant",
+                help="Arquivo SPED ECD do período anterior (ex: 2023)"
             )
-            st.session_state.modo_resultado_si=modo_resultado
+        with col_u2:
+            st.markdown("**📁 Arquivo ECD — ATUAL (ano N)**")
+            upload_atu = st.file_uploader(
+                "ECD atual", type=["txt"], key="upload_i052_atu",
+                help="Arquivo SPED ECD do período atual (ex: 2024)"
+            )
 
-            conta_pl=""
-            if modo_resultado == "aberto_com_resultado":
-                sugerida      = st.session_state.get("conta_pl_sugerida", "")
-                sugerida_nome = st.session_state.get("conta_pl_sugerida_nome", "")
+        btn_comparar = st.button(
+            "🔍 COMPARAR I052",
+            disabled=(upload_ant is None or upload_atu is None),
+            type="primary", use_container_width=True, key="btn_comparar_i052"
+        )
 
-                if sugerida:
-                    st.markdown(
-                        f"<div class='si-box'>"
-                        f"<b style='color:#FF9EBC;'>💡 Conta sugerida automaticamente:</b><br>"
-                        f"<span style='color:#FFD166;font-size:18px;font-weight:700;'>{sugerida}</span>"
-                        f"<span style='color:#9BB0C8;margin-left:12px;'>{sugerida_nome}</span><br>"
-                        f"<small style='color:#9BB0C8;'>Detectada pelo COD_NAT/nome no I050 do SPED ECD.<br>"
-                        f"Confirme se este é o código correto antes de processar.</small>"
-                        f"</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown(
-                        "<div class='card-warn'>⚠ <b style='color:#FFD166;'>Informe a conta de Superávit/Déficit do PL.</b><br>"
-                        "<small>O sistema irá deduzir o resultado líquido do I355 desta conta para fechar o balanço (D=C).<br>"
-                        "Exemplo: conta <b>3.1.1.01</b> — Superávit/Déficit do Exercício.</small></div>",
-                        unsafe_allow_html=True)
+        if btn_comparar and upload_ant and upload_atu:
+            log_cmp = []
+            with st.spinner("Lendo arquivo anterior..."):
+                log_cmp.append("── PARSE ARQUIVO ANTERIOR ──")
+                parsed_ant = _parse_i052_completo(upload_ant.read(), log_cmp)
+            with st.spinner("Lendo arquivo atual..."):
+                log_cmp.append("\n── PARSE ARQUIVO ATUAL ──")
+                parsed_atu = _parse_i052_completo(upload_atu.read(), log_cmp)
+            with st.spinner("Comparando..."):
+                resultado_cmp = _comparar_i052(parsed_ant, parsed_atu)
 
-                conta_pl = st.text_input(
-                    "Código da conta de Superávit/Déficit (PL)",
-                    value=sugerida if sugerida else st.session_state.get("conta_pl_resultado_si", ""),
-                    placeholder="Ex: 311010101",
-                    key="conta_pl_resultado_si_widget",
-                    help="Código exato como aparece no I155 do SPED ECD.")
-                st.session_state.conta_pl_resultado_si = conta_pl
+            # Persiste no session_state para sobreviver ao rerun
+            st.session_state["i052_resultado"]  = resultado_cmp
+            st.session_state["i052_parsed_ant"] = parsed_ant
+            st.session_state["i052_parsed_atu"] = parsed_atu
+            st.session_state["i052_label_ant"]  = upload_ant.name
+            st.session_state["i052_label_atu"]  = upload_atu.name
+            st.session_state["i052_log"]        = log_cmp
 
-                if not conta_pl:
-                    st.warning("⚠ Informe a conta de PL/Resultado para que o balanço feche corretamente.")
-                elif sugerida and conta_pl != sugerida:
-                    st.info(f"ℹ Usando conta informada manualmente: {conta_pl} (sugestão era: {sugerida})")
+        # Renderiza se já existe resultado salvo
+        if st.session_state.get("i052_resultado"):
+            _render_comparacao_i052(
+                st.session_state["i052_resultado"],
+                st.session_state["i052_label_ant"],
+                st.session_state["i052_label_atu"],
+                st.session_state["i052_parsed_ant"],
+                st.session_state["i052_parsed_atu"],
+            )
+            if exibir_log and st.session_state.get("i052_log"):
+                st.markdown("#### 🖥 Log")
+                log_txt = "\n".join(st.session_state["i052_log"])
+                st.markdown(f"<div class='bloco-log'>{log_txt}</div>", unsafe_allow_html=True)
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # ABA 1 — CONVERSOR / SALDO INICIAL
+    # ═════════════════════════════════════════════════════════════════════════
+    with aba_conv:
+
+        st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
+        uploaded = st.file_uploader(
+            f"Arraste ou clique (Excel, TXT separado por ';', SPED ECD ou TXT Posicional — máx. {MAX_UPLOAD_MB} MB)",
+            type=["xlsx", "xls", "xlsm", "txt", "csv"],
+            key="upload_principal"
+        )
+
+        if uploaded is None:
+            st.markdown(
+                "<div class='info-box'>⬆ Selecione um arquivo para começar.</div>",
+                unsafe_allow_html=True
+            )
+            # Aba sem arquivo: encerra aqui, sem st.stop() para não afetar aba_i052
+            return
+
+        # ── Leitura e detecção do arquivo ────────────────────────────────────
+        conteudo = uploaded.read()
+        mb = len(conteudo) / (1024 * 1024)
+        if mb > MAX_UPLOAD_MB:
+            st.error(f"⛔ Arquivo muito grande ({mb:.1f} MB). Limite: {MAX_UPLOAD_MB} MB.")
+            return
+
+        if conteudo != st.session_state.arquivo_bytes or uploaded.name != st.session_state.arquivo_nome:
+            _reset()
+            st.session_state.arquivo_bytes = conteudo
+            st.session_state.arquivo_nome  = uploaded.name
+            tipo = identificar_tipo(uploaded.name, conteudo)
+            st.session_state.tipo_detectado = tipo
+            if tipo == "excel":
+                try:
+                    xl = pd.ExcelFile(io.BytesIO(conteudo), engine="openpyxl")
+                    st.session_state.sheets   = xl.sheet_names
+                    st.session_state.sheet_sel = (
+                        "Plan1" if "Plan1" in xl.sheet_names else xl.sheet_names[0]
+                    )
+                except:
+                    st.session_state.sheets = []
+            elif tipo == "ecd":
+                cnpj_num = _pre_scan_cnpj_ecd(conteudo)
+                st.session_state.cnpj_ecd     = cnpj_num
+                st.session_state.cnpj_ecd_fmt = fmt_cnpj(cnpj_num) if cnpj_num else ""
+                _pre_scan_conta_pl_sugerida(conteudo)
+            elif tipo == "dominio_pos":
+                filiais = _pre_scan_posicional(conteudo)
+                st.session_state.filiais_detectadas = filiais
+
+        tipo = st.session_state.tipo_detectado
+
+        # ── Badge e info do arquivo ───────────────────────────────────────────
+        badges = {
+            "ecd":        "<span class='badge-ecd'>📋 SPED ECD</span>",
+            "ecd_saldo":  "<span class='badge-si'>📥 SPED ECD — Saldo Inicial</span>",
+            "excel":      "<span class='badge-excel'>📊 Excel</span>",
+            "lote":       "<span class='badge-lote'>📄 TXT Lote (;)</span>",
+            "dominio_pos":"<span class='badge-pos'>📋 TXT Posicional Domínio</span>",
+        }
+        mb_info = len(st.session_state.arquivo_bytes) / (1024 * 1024)
+        st.markdown(
+            f"{badges.get(tipo, '')} "
+            f"<span style='color:#6B7A8D;font-size:13px;margin-left:12px;'>"
+            f"{st.session_state.arquivo_nome} — {mb_info:.1f} MB</span>",
+            unsafe_allow_html=True
+        )
+        st.markdown("")
+
+        # ── Configuração Excel ────────────────────────────────────────────────
+        sheet_sel = ""; linha_h = 3; auto_head = True
+        if tipo == "excel" and st.session_state.sheets:
+            st.markdown("#### 📋 Passo 2 — Configurar Excel")
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                sheet_sel = st.selectbox(
+                    "Aba (Sheet)", st.session_state.sheets,
+                    index=(st.session_state.sheets.index(st.session_state.sheet_sel)
+                           if st.session_state.sheet_sel in st.session_state.sheets else 0)
+                )
+                st.session_state.sheet_sel = sheet_sel
+            with col2:
+                auto_head = st.checkbox("Detectar cabeçalho automaticamente", value=True)
+            with col3:
+                if not auto_head:
+                    linha_h = st.number_input("Linha do cabeçalho", min_value=1, max_value=50, value=4) - 1
+
+        # ── CNPJ ─────────────────────────────────────────────────────────────
+        ni = ""; ok_insc = False; ti = ""; inf = ""
+
+        if tipo in ("ecd", "ecd_saldo"):
+            st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
+            cnpj_ecd = st.session_state.cnpj_ecd
+            if cnpj_ecd and validar_cnpj(cnpj_ecd):
+                st.markdown(
+                    f"<div class='cnpj-auto'>✔ CNPJ extraído: "
+                    f"<span>{st.session_state.cnpj_ecd_fmt}</span></div>",
+                    unsafe_allow_html=True
+                )
+                st.code(fmt_reg_0000(cnpj_ecd), language=None)
+                ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd; inf = st.session_state.cnpj_ecd_fmt
             else:
+                st.warning("⚠ CNPJ não encontrado. Informe manualmente.")
+                cnpj_raw = st.text_input("CNPJ / CPF", placeholder="00.000.000/0001-00",
+                                         key="cnpj_manual_ecd")
+                ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+                if cnpj_raw:
+                    if ok_insc:
+                        inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
+                        st.success(f"✔ {ti} válido: {inf}")
+                    else:
+                        st.error("✖ CNPJ/CPF inválido")
+
+            # ── Bloco Saldo Inicial ───────────────────────────────────────────
+            st.markdown("---")
+            st.markdown(
+                "<div class='si-box'><b style='color:#FF9EBC;font-size:15px;'>📥 Módulo Saldo Inicial</b><br>"
+                "<small style='color:#C8A0B8;'>Extrai o saldo final do SPED ECD e gera um único lançamento "
+                "de saldo inicial no leiaute Domínio.</small></div>",
+                unsafe_allow_html=True
+            )
+
+            col_si1, col_si2 = st.columns([1, 2])
+            with col_si1:
+                modo_saldo = st.checkbox(
+                    "🔄 Gerar Saldo Inicial",
+                    value=st.session_state.get("modo_saldo_inicial", False),
+                    key="chk_saldo_inicial"
+                )
+                st.session_state.modo_saldo_inicial = modo_saldo
+            with col_si2:
+                hist_prefixo = st.text_input(
+                    "Prefixo do histórico",
+                    value=st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
+                    max_chars=60, key="hist_prefixo_si_widget"
+                )
+                st.session_state.hist_prefixo_si = hist_prefixo
+
+            if modo_saldo:
+                st.markdown("##### Tratamento das contas de Resultado")
+                modo_resultado = st.radio(
+                    "Como tratar as contas de Resultado (I355)?",
+                    options=["apenas_patrimonial", "aberto_com_resultado"],
+                    format_func=lambda x: {
+                        "apenas_patrimonial":   "✅ Apenas Patrimonial — Ativo/Passivo/PL (balanço fechado, sem resultado)",
+                        "aberto_com_resultado": "📂 Aberto com Resultado — inclui Receitas/Despesas para encerrar no sistema destino",
+                    }[x],
+                    index=0 if st.session_state.get("modo_resultado_si", "apenas_patrimonial") == "apenas_patrimonial" else 1,
+                    key="modo_resultado_si_widget"
+                )
+                st.session_state.modo_resultado_si = modo_resultado
+
                 conta_pl = ""
-                st.session_state.conta_pl_resultado_si = ""
-
-            # Atualiza tipo
-            st.session_state.tipo_detectado="ecd_saldo"; tipo="ecd_saldo"
-        else:
-            if st.session_state.tipo_detectado=="ecd_saldo" and not st.session_state.processado:
-                st.session_state.tipo_detectado="ecd"; tipo="ecd"
-
-    else:
-        st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
-        cnpj_raw=st.text_input("CNPJ / CPF",placeholder="00.000.000/0001-00 ou 000.000.000-00",key="cnpj_lote")
-        ok_insc,ti,ni=validar_inscricao(cnpj_raw)
-        if cnpj_raw:
-            if ok_insc:
-                inf=fmt_cnpj(ni) if ti=="CNPJ" else fmt_cpf(ni)
-                col_a,col_b=st.columns([1,2])
-                with col_a: st.success(f"✔ {ti} válido")
-                with col_b: st.code(fmt_reg_0000(ni),language=None)
-            else: st.error("✖ CNPJ/CPF inválido")
-
-    st.markdown("---"); st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
-    col_op1,col_op2=st.columns(2)
-    with col_op1:
-        gerar_6110=st.checkbox("Gerar registro 6110 (Centro de Custos)",value=False,
-                               disabled=(tipo not in ("ecd","dominio_pos","excel")))
-    with col_op2:
-        usar_de_para=st.checkbox("🏢 Habilitar De/Para de filiais",value=False,
-                                 disabled=(tipo not in ("dominio_pos","excel")))
-
-    mapa_filiais={}
-    if tipo=="dominio_pos" and usar_de_para:
-        mapa_filiais=_widget_de_para_filiais(True,st.session_state.get("filiais_detectadas",[]))
-    elif tipo=="excel" and usar_de_para:
-        filiais_excel=[]
-        if st.session_state.get("arquivo_bytes") and st.session_state.get("sheet_sel"):
-            try:
-                sh_scan=st.session_state.sheet_sel; lh_scan,_=detectar_cabecalho_excel(st.session_state.arquivo_bytes,sh_scan)
-                df_scan,_=ler_excel_lote(st.session_state.arquivo_bytes,sh_scan,lh_scan)
-                filiais_excel=_pre_scan_filiais_excel(df_scan); del df_scan
-            except: filiais_excel=[]
-        mapa_filiais=_widget_de_para_filiais(True,filiais_excel)
-
-    col_b1,col_b2=st.columns([2,1])
-    with col_b1: btn_converter=st.button("▶ CONVERTER",disabled=(not ok_insc),use_container_width=True,type="primary")
-    with col_b2: btn_limpar=st.button("🗑 Limpar tudo",use_container_width=True)
-    if btn_limpar: _reset(); st.rerun()
-
-    if btn_converter and ok_insc:
-        conteudo=st.session_state.arquivo_bytes
-        log=[]; crono=Cronometro(); crono.iniciar()
-        status_txt=st.empty(); prog_bar=st.progress(0)
-        try:
-            # ── SALDO INICIAL ─────────────────────────────────────────────────
-            if tipo=="ecd_saldo":
-                crono.etapa("Saldo Inicial ECD"); log.append("── SALDO INICIAL — SPED ECD V3.6.2 ──")
-                resultado_bytes,metricas,todos_erros=processar_saldo_inicial_ecd(
-                    conteudo, ni,
-                    st.session_state.get("hist_prefixo_si","SALDO INICIAL"),
-                    st.session_state.get("modo_resultado_si","apenas_patrimonial"),
-                    st.session_state.get("conta_pl_resultado_si",""),
-                    log, prog_bar, status_txt)
-                st.session_state.resultado_bytes=resultado_bytes
-                st.session_state.resultado_nome=f"SALDO_INI_{ni}.txt"
-                st.session_state.metricas=metricas; st.session_state.processado=True
-                if todos_erros:
-                    st.session_state.erros_bytes=_txt_erros_ecd(todos_erros,ni).encode("utf-8-sig")
-                    st.session_state.erros_nome=f"SALDO_INI_{ni}_erros.txt"
-                total_seg=crono.encerrar()
-                log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
-                for e in crono.etapas: log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-                st.session_state.log_linhas=log
-
-            # ── SPED ECD lançamentos ──────────────────────────────────────────
-            elif tipo=="ecd":
-                status_txt.text("Lendo SPED ECD..."); log.append("── LEITURA SPED ECD ──")
-                crono.etapa("Leitura SPED ECD"); prog_bar.progress(10)
-                ecd,registros_erro=_parse_ecd(conteudo,log)
-                if ecd is None: st.error("Falha na leitura do SPED ECD."); st.session_state.log_linhas=log
+                if modo_resultado == "aberto_com_resultado":
+                    sugerida      = st.session_state.get("conta_pl_sugerida", "")
+                    sugerida_nome = st.session_state.get("conta_pl_sugerida_nome", "")
+                    if sugerida:
+                        st.markdown(
+                            f"<div class='si-box'>"
+                            f"<b style='color:#FF9EBC;'>💡 Conta sugerida automaticamente:</b><br>"
+                            f"<span style='color:#FFD166;font-size:18px;font-weight:700;'>{sugerida}</span>"
+                            f"<span style='color:#9BB0C8;margin-left:12px;'>{sugerida_nome}</span><br>"
+                            f"<small style='color:#9BB0C8;'>Detectada pelo COD_NAT/nome no I050 do SPED ECD.<br>"
+                            f"Confirme se este é o código correto antes de processar.</small>"
+                            f"</div>", unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            "<div class='card-warn'>⚠ <b style='color:#FFD166;'>Informe a conta de Superávit/Déficit do PL.</b><br>"
+                            "<small>O sistema irá deduzir o resultado líquido do I355 desta conta para fechar o balanço (D=C).</small></div>",
+                            unsafe_allow_html=True
+                        )
+                    conta_pl = st.text_input(
+                        "Código da conta de Superávit/Déficit (PL)",
+                        value=sugerida if sugerida else st.session_state.get("conta_pl_resultado_si", ""),
+                        placeholder="Ex: 311010101",
+                        key="conta_pl_resultado_si_widget"
+                    )
+                    st.session_state.conta_pl_resultado_si = conta_pl
+                    if not conta_pl:
+                        st.warning("⚠ Informe a conta de PL/Resultado para que o balanço feche corretamente.")
+                    elif sugerida and conta_pl != sugerida:
+                        st.info(f"ℹ Usando conta informada manualmente: {conta_pl} (sugestão era: {sugerida})")
                 else:
-                    prog_bar.progress(50); status_txt.text("Gerando registros..."); crono.etapa("Geração dos registros")
-                    log.append("\n── GERAÇÃO ──"); linhas_ecd=_gerar_ecd(ecd,log,prog_bar,status_txt)
+                    conta_pl = ""
+                    st.session_state.conta_pl_resultado_si = ""
+
+                st.session_state.tipo_detectado = "ecd_saldo"
+                tipo = "ecd_saldo"
+            else:
+                if st.session_state.tipo_detectado == "ecd_saldo" and not st.session_state.processado:
+                    st.session_state.tipo_detectado = "ecd"
+                    tipo = "ecd"
+
+        else:
+            st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
+            cnpj_raw = st.text_input(
+                "CNPJ / CPF", placeholder="00.000.000/0001-00 ou 000.000.000-00",
+                key="cnpj_lote"
+            )
+            ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+            if cnpj_raw:
+                if ok_insc:
+                    inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
+                    col_a, col_b = st.columns([1, 2])
+                    with col_a: st.success(f"✔ {ti} válido")
+                    with col_b: st.code(fmt_reg_0000(ni), language=None)
+                else:
+                    st.error("✖ CNPJ/CPF inválido")
+
+        # ── Opções e conversão ────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
+        col_op1, col_op2 = st.columns(2)
+        with col_op1:
+            gerar_6110 = st.checkbox(
+                "Gerar registro 6110 (Centro de Custos)", value=False,
+                disabled=(tipo not in ("ecd", "dominio_pos", "excel"))
+            )
+        with col_op2:
+            usar_de_para = st.checkbox(
+                "🏢 Habilitar De/Para de filiais", value=False,
+                disabled=(tipo not in ("dominio_pos", "excel"))
+            )
+
+        mapa_filiais = {}
+        if tipo == "dominio_pos" and usar_de_para:
+            mapa_filiais = _widget_de_para_filiais(True, st.session_state.get("filiais_detectadas", []))
+        elif tipo == "excel" and usar_de_para:
+            filiais_excel = []
+            if st.session_state.get("arquivo_bytes") and st.session_state.get("sheet_sel"):
+                try:
+                    sh_scan  = st.session_state.sheet_sel
+                    lh_scan, _ = detectar_cabecalho_excel(st.session_state.arquivo_bytes, sh_scan)
+                    df_scan, _ = ler_excel_lote(st.session_state.arquivo_bytes, sh_scan, lh_scan)
+                    filiais_excel = _pre_scan_filiais_excel(df_scan)
+                    del df_scan
+                except:
+                    filiais_excel = []
+            mapa_filiais = _widget_de_para_filiais(True, filiais_excel)
+
+        col_b1, col_b2 = st.columns([2, 1])
+        with col_b1:
+            btn_converter = st.button(
+                "▶ CONVERTER", disabled=(not ok_insc),
+                use_container_width=True, type="primary"
+            )
+        with col_b2:
+            btn_limpar = st.button("🗑 Limpar tudo", use_container_width=True)
+
+        if btn_limpar:
+            _reset()
+            st.rerun()
+
+        if btn_converter and ok_insc:
+            conteudo = st.session_state.arquivo_bytes
+            log = []; crono = Cronometro(); crono.iniciar()
+            status_txt = st.empty(); prog_bar = st.progress(0)
+            try:
+                # ── SALDO INICIAL ─────────────────────────────────────────────
+                if tipo == "ecd_saldo":
+                    crono.etapa("Saldo Inicial ECD")
+                    log.append("── SALDO INICIAL — SPED ECD V3.6.2 ──")
+                    resultado_bytes, metricas, todos_erros = processar_saldo_inicial_ecd(
+                        conteudo, ni,
+                        st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
+                        st.session_state.get("modo_resultado_si", "apenas_patrimonial"),
+                        st.session_state.get("conta_pl_resultado_si", ""),
+                        log, prog_bar, status_txt
+                    )
+                    st.session_state.resultado_bytes = resultado_bytes
+                    st.session_state.resultado_nome  = f"SALDO_INI_{ni}.txt"
+                    st.session_state.metricas        = metricas
+                    st.session_state.processado      = True
+                    if todos_erros:
+                        st.session_state.erros_bytes = _txt_erros_ecd(todos_erros, ni).encode("utf-8-sig")
+                        st.session_state.erros_nome  = f"SALDO_INI_{ni}_erros.txt"
+                    total_seg = crono.encerrar()
+                    log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                    for e in crono.etapas:
+                        log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                    st.session_state.log_linhas = log
+
+                # ── SPED ECD lançamentos ──────────────────────────────────────
+                elif tipo == "ecd":
+                    status_txt.text("Lendo SPED ECD...")
+                    log.append("── LEITURA SPED ECD ──")
+                    crono.etapa("Leitura SPED ECD"); prog_bar.progress(10)
+                    ecd, registros_erro = _parse_ecd(conteudo, log)
+                    if ecd is None:
+                        st.error("Falha na leitura do SPED ECD.")
+                        st.session_state.log_linhas = log
+                    else:
+                        prog_bar.progress(50)
+                        status_txt.text("Gerando registros...")
+                        crono.etapa("Geração dos registros")
+                        log.append("\n── GERAÇÃO ──")
+                        linhas_ecd = _gerar_ecd(ecd, log, prog_bar, status_txt)
+                        if gerar_6110:
+                            linhas_ecd = _injetar_6110_ecd(linhas_ecd)
+                            n6110 = sum(1 for l in linhas_ecd if l.startswith("|6110|"))
+                            log.append(f"  Reg. 6110 gerados  : {n6110:,}")
+                        crono.etapa("Montagem do arquivo")
+                        prog_bar.progress(90); status_txt.text("Montando arquivo...")
+                        buf_out = io.StringIO()
+                        for i in range(0, len(linhas_ecd), WRITE_CHUNK):
+                            buf_out.write("\n".join(linhas_ecd[i:i+WRITE_CHUNK]) + "\n")
+                        resultado_bytes = buf_out.getvalue().encode("utf-8-sig")
+                        del buf_out, linhas_ecd; gc.collect()
+                        st.session_state.resultado_bytes = resultado_bytes
+                        st.session_state.resultado_nome  = f"ECD_{ni}_dominio.txt"
+                        n6000   = resultado_bytes.count(b"|6000|")
+                        n6100   = resultado_bytes.count(b"|6100|")
+                        n6110_f = resultado_bytes.count(b"|6110|")
+                        metricas = {
+                            "CNPJ": ecd.cnpj,
+                            "Lançamentos (I200)": f"{len(ecd.lancamentos):,}",
+                            "Registros 6000": f"{n6000:,}",
+                            "Registros 6100": f"{n6100:,}",
+                            "Tamanho saída":  f"{len(resultado_bytes)/1024:.1f} KB",
+                        }
+                        if gerar_6110:
+                            metricas["Registros 6110"] = f"{n6110_f:,}"
+                        st.session_state.metricas = metricas
+                        if registros_erro:
+                            st.session_state.erros_bytes = _txt_erros_ecd(registros_erro, ecd.cnpj).encode("utf-8-sig")
+                            st.session_state.erros_nome  = f"ECD_{ni}_erros.txt"
+                        total_seg = crono.encerrar()
+                        log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                        for e in crono.etapas:
+                            log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                        st.session_state.log_linhas = log
+                        st.session_state.processado = True
+                        prog_bar.progress(100); status_txt.text("Concluído!")
+
+                # ── EXCEL ─────────────────────────────────────────────────────
+                elif tipo == "excel":
+                    crono.etapa("Leitura Excel")
+                    status_txt.text("Lendo Excel..."); prog_bar.progress(8)
+                    sh = st.session_state.sheet_sel
+                    lh_det, _ = detectar_cabecalho_excel(conteudo, sh)
+                    lh = lh_det if auto_head else linha_h
+                    df, _ = ler_excel_lote(conteudo, sh, lh)
+                    log.append(f"Excel — Aba: {sh} | Cabeçalho: linha {lh+1}")
+                    log.append(f"Linhas carregadas: {len(df):,}"); prog_bar.progress(20)
+                    crono.etapa("Montagem de lotes")
+                    status_txt.text("Agrupando lotes...")
+                    df, modo = montar_lotes_excel(df)
+                    n_lotes = int(df["_num_lote"].max()) if len(df) > 0 else 0
+                    log.append(f"Lotes detectados  : {n_lotes:,} [modo: {modo}]"); prog_bar.progress(35)
+                    crono.etapa("Ordenação")
+                    status_txt.text("Reordenando lotes...")
+                    df = _ordenar_lotes_por_data_filial(df)
+                    log.append(f"Lotes reordenados : {n_lotes:,}"); prog_bar.progress(50)
+                    log.append(f"De/Para filiais   : {len(mapa_filiais)} regra(s)" if mapa_filiais else "De/Para filiais   : desabilitado")
+                    log.append("Reg. 6110         : habilitado" if gerar_6110 else "Reg. 6110         : desabilitado")
+                    crono.etapa("Processamento")
+                    status_txt.text("Processando lotes...")
+                    resultado_bytes, resumo, erros = processar_excel(df, ni, mapa_filiais, gerar_6110, log)
+                    del df; gc.collect(); prog_bar.progress(85)
+                    n_gravados = resultado_bytes.count(b"|6000|")
+                    n6110_f    = resultado_bytes.count(b"|6110|")
+                    st.session_state.resultado_bytes = resultado_bytes
+                    st.session_state.resultado_nome  = "lancamentos.txt"
+                    st.session_state.resumo          = resumo
+                    st.session_state.erros_lote      = erros
+                    crono.etapa("Log")
+                    log_txt = _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, 0, "N/A (Excel)", crono)
+                    st.session_state.log_bytes = log_txt.encode("utf-8-sig")
+                    st.session_state.log_nome  = "log_conversao.txt"
+                    total_seg = crono.encerrar()
+                    log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
+                    metricas = {
+                        "Lotes total": f"{len(resumo):,}",
+                        "Lotes OK":    f"{len(resumo)-len(erros):,}",
+                        "Lotes erro":  f"{len(erros):,}",
+                        "Reg. gerados":f"{n_gravados:,}",
+                        "Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB",
+                    }
                     if gerar_6110:
-                        linhas_ecd=_injetar_6110_ecd(linhas_ecd)
-                        n6110=sum(1 for l in linhas_ecd if l.startswith("|6110|")); log.append(f"  Reg. 6110 gerados  : {n6110:,}")
-                    crono.etapa("Montagem do arquivo"); prog_bar.progress(90); status_txt.text("Montando arquivo...")
-                    buf_out=io.StringIO()
-                    for i in range(0,len(linhas_ecd),WRITE_CHUNK): buf_out.write("\n".join(linhas_ecd[i:i+WRITE_CHUNK])+"\n")
-                    resultado_bytes=buf_out.getvalue().encode("utf-8-sig"); del buf_out,linhas_ecd; gc.collect()
-                    st.session_state.resultado_bytes=resultado_bytes; st.session_state.resultado_nome=f"ECD_{ni}_dominio.txt"
-                    n6000=resultado_bytes.count(b"|6000|"); n6100=resultado_bytes.count(b"|6100|"); n6110_f=resultado_bytes.count(b"|6110|")
-                    metricas={"CNPJ":ecd.cnpj,"Lançamentos (I200)":f"{len(ecd.lancamentos):,}",
-                              "Registros 6000":f"{n6000:,}","Registros 6100":f"{n6100:,}","Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB"}
-                    if gerar_6110: metricas["Registros 6110"]=f"{n6110_f:,}"
-                    st.session_state.metricas=metricas
-                    if registros_erro:
-                        st.session_state.erros_bytes=_txt_erros_ecd(registros_erro,ecd.cnpj).encode("utf-8-sig")
-                        st.session_state.erros_nome=f"ECD_{ni}_erros.txt"
-                    total_seg=crono.encerrar(); log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
-                    for e in crono.etapas: log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-                    st.session_state.log_linhas=log; st.session_state.processado=True
+                        metricas["Reg. 6110"] = f"{n6110_f:,}"
+                    st.session_state.metricas    = metricas
+                    st.session_state.log_linhas  = log
+                    st.session_state.processado  = True
                     prog_bar.progress(100); status_txt.text("Concluído!")
 
-            # ── EXCEL ─────────────────────────────────────────────────────────
-            elif tipo=="excel":
-                crono.etapa("Leitura Excel"); status_txt.text("Lendo Excel..."); prog_bar.progress(8)
-                sh=st.session_state.sheet_sel; lh_det,_=detectar_cabecalho_excel(conteudo,sh)
-                lh=lh_det if auto_head else linha_h; df,_=ler_excel_lote(conteudo,sh,lh)
-                log.append(f"Excel — Aba: {sh} | Cabeçalho: linha {lh+1}"); log.append(f"Linhas carregadas: {len(df):,}"); prog_bar.progress(20)
-                crono.etapa("Montagem de lotes"); status_txt.text("Agrupando lotes...")
-                df,modo=montar_lotes_excel(df); n_lotes=int(df["_num_lote"].max()) if len(df)>0 else 0
-                log.append(f"Lotes detectados  : {n_lotes:,} [modo: {modo}]"); prog_bar.progress(35)
-                crono.etapa("Ordenação"); status_txt.text("Reordenando lotes...")
-                df=_ordenar_lotes_por_data_filial(df); log.append(f"Lotes reordenados : {n_lotes:,}"); prog_bar.progress(50)
-                log.append(f"De/Para filiais   : {len(mapa_filiais)} regra(s)" if mapa_filiais else "De/Para filiais   : desabilitado")
-                log.append("Reg. 6110         : habilitado" if gerar_6110 else "Reg. 6110         : desabilitado")
-                crono.etapa("Processamento"); status_txt.text("Processando lotes...")
-                resultado_bytes,resumo,erros=processar_excel(df,ni,mapa_filiais,gerar_6110,log)
-                del df; gc.collect(); prog_bar.progress(85)
-                n_gravados=resultado_bytes.count(b"|6000|"); n6110_f=resultado_bytes.count(b"|6110|")
-                st.session_state.resultado_bytes=resultado_bytes; st.session_state.resultado_nome="lancamentos.txt"
-                st.session_state.resumo=resumo; st.session_state.erros_lote=erros
-                crono.etapa("Log"); log_txt=_montar_log_lote(resumo,erros,ni,ti,inf,n_gravados,0,"N/A (Excel)",crono)
-                st.session_state.log_bytes=log_txt.encode("utf-8-sig"); st.session_state.log_nome="log_conversao.txt"
-                total_seg=crono.encerrar(); log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
-                metricas={"Lotes total":f"{len(resumo):,}","Lotes OK":f"{len(resumo)-len(erros):,}",
-                          "Lotes erro":f"{len(erros):,}","Reg. gerados":f"{n_gravados:,}","Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB"}
-                if gerar_6110: metricas["Reg. 6110"]=f"{n6110_f:,}"
-                st.session_state.metricas=metricas; st.session_state.log_linhas=log; st.session_state.processado=True
-                prog_bar.progress(100); status_txt.text("Concluído!")
+                # ── TXT POSICIONAL ────────────────────────────────────────────
+                elif tipo == "dominio_pos":
+                    crono.etapa("Parse posicional")
+                    log.append("── TXT POSICIONAL DOMÍNIO ──")
+                    resultado_bytes, metricas, erros_parse, filiais_enc = processar_dominio_posicional(
+                        conteudo, ni, gerar_6110, usar_de_para, mapa_filiais, log, prog_bar, status_txt
+                    )
+                    st.session_state.filiais_detectadas = filiais_enc
+                    st.session_state.resultado_bytes    = resultado_bytes
+                    st.session_state.resultado_nome     = f"DOM_POS_{ni}_dominio.txt"
+                    st.session_state.metricas           = metricas
+                    st.session_state.processado         = True
+                    if erros_parse:
+                        st.session_state.erros_bytes = _txt_erros_ecd(erros_parse, ni).encode("utf-8-sig")
+                        st.session_state.erros_nome  = f"DOM_POS_{ni}_erros.txt"
+                    total_seg = crono.encerrar()
+                    log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                    for e in crono.etapas:
+                        log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                    st.session_state.log_linhas = log
 
-            # ── TXT POSICIONAL ────────────────────────────────────────────────
-            elif tipo=="dominio_pos":
-                crono.etapa("Parse posicional"); log.append("── TXT POSICIONAL DOMÍNIO ──")
-                resultado_bytes,metricas,erros_parse,filiais_enc=processar_dominio_posicional(
-                    conteudo,ni,gerar_6110,usar_de_para,mapa_filiais,log,prog_bar,status_txt)
-                st.session_state.filiais_detectadas=filiais_enc
-                st.session_state.resultado_bytes=resultado_bytes; st.session_state.resultado_nome=f"DOM_POS_{ni}_dominio.txt"
-                st.session_state.metricas=metricas; st.session_state.processado=True
-                if erros_parse:
-                    st.session_state.erros_bytes=_txt_erros_ecd(erros_parse,ni).encode("utf-8-sig")
-                    st.session_state.erros_nome=f"DOM_POS_{ni}_erros.txt"
-                total_seg=crono.encerrar(); log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
-                for e in crono.etapas: log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
-                st.session_state.log_linhas=log
+                # ── TXT STREAMING ─────────────────────────────────────────────
+                else:
+                    crono.etapa("Streaming")
+                    mb_txt = len(conteudo) / (1024 * 1024)
+                    status_txt.text(f"Processando {mb_txt:.1f} MB..."); prog_bar.progress(5)
+                    log.append(f"── TXT STREAMING — {mb_txt:.1f} MB ──")
+                    resultado_bytes, resumo, erros, total_lins, ignoradas, enc_usado = processar_streaming(conteudo, ni, log)
+                    prog_bar.progress(90)
+                    n_gravados = resultado_bytes.count(b"|6000|")
+                    st.session_state.resultado_bytes = resultado_bytes
+                    st.session_state.resultado_nome  = "lancamentos.txt"
+                    st.session_state.resumo          = resumo
+                    st.session_state.erros_lote      = erros
+                    crono.etapa("Log")
+                    log_txt = _montar_log_lote(resumo, erros, ni, ti, inf, n_gravados, ignoradas, enc_usado, crono)
+                    st.session_state.log_bytes = log_txt.encode("utf-8-sig")
+                    st.session_state.log_nome  = "log_conversao.txt"
+                    total_seg = crono.encerrar()
+                    log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
+                    st.session_state.metricas = {
+                        "Linhas lidas":  f"{total_lins:,}",
+                        "Lotes total":   f"{len(resumo):,}",
+                        "Lotes OK":      f"{len(resumo)-len(erros):,}",
+                        "Lotes erro":    f"{len(erros):,}",
+                        "Reg. gerados":  f"{n_gravados:,}",
+                        "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
+                    }
+                    st.session_state.log_linhas = log
+                    st.session_state.processado = True
+                    prog_bar.progress(100); status_txt.text("Concluído!")
 
-            # ── TXT STREAMING ─────────────────────────────────────────────────
-            else:
-                crono.etapa("Streaming"); mb_txt=len(conteudo)/(1024*1024)
-                status_txt.text(f"Processando {mb_txt:.1f} MB..."); prog_bar.progress(5)
-                log.append(f"── TXT STREAMING — {mb_txt:.1f} MB ──")
-                resultado_bytes,resumo,erros,total_lins,ignoradas,enc_usado=processar_streaming(conteudo,ni,log)
-                prog_bar.progress(90); n_gravados=resultado_bytes.count(b"|6000|")
-                st.session_state.resultado_bytes=resultado_bytes; st.session_state.resultado_nome="lancamentos.txt"
-                st.session_state.resumo=resumo; st.session_state.erros_lote=erros
-                crono.etapa("Log"); log_txt=_montar_log_lote(resumo,erros,ni,ti,inf,n_gravados,ignoradas,enc_usado,crono)
-                st.session_state.log_bytes=log_txt.encode("utf-8-sig"); st.session_state.log_nome="log_conversao.txt"
-                total_seg=crono.encerrar(); log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
-                st.session_state.metricas={"Linhas lidas":f"{total_lins:,}","Lotes total":f"{len(resumo):,}",
-                                           "Lotes OK":f"{len(resumo)-len(erros):,}","Lotes erro":f"{len(erros):,}",
-                                           "Reg. gerados":f"{n_gravados:,}","Tamanho saída":f"{len(resultado_bytes)/1024:.1f} KB"}
-                st.session_state.log_linhas=log; st.session_state.processado=True
-                prog_bar.progress(100); status_txt.text("Concluído!")
+            except Exception as ex:
+                tb = traceback.format_exc()
+                st.error(f"⛔ Erro inesperado: {ex}")
+                log.append(f"ERRO FATAL: {ex}\n{tb}")
+                st.session_state.log_linhas = log
+                prog_bar.progress(0); status_txt.text("Falha.")
 
-        except Exception as ex:
-            tb=traceback.format_exc(); st.error(f"⛔ Erro inesperado: {ex}")
-            log.append(f"ERRO FATAL: {ex}\n{tb}"); st.session_state.log_linhas=log
-            prog_bar.progress(0); status_txt.text("Falha.")
-        st.rerun()
+            st.rerun()
 
-    if st.session_state.processado:
-        tipo_proc=st.session_state.tipo_detectado
-        if tipo_proc=="ecd_saldo": _render_resultados_saldo_inicial(exibir_log)
-        elif tipo_proc=="ecd":     _render_resultados_ecd(exibir_log)
-        elif tipo_proc=="dominio_pos": _render_resultados_posicional(exibir_log)
-        else: _render_resultados_lote(exibir_log)
+        # ── Renderização dos resultados ───────────────────────────────────────
+        if st.session_state.processado:
+            tipo_proc = st.session_state.tipo_detectado
+            if   tipo_proc == "ecd_saldo":   _render_resultados_saldo_inicial(exibir_log)
+            elif tipo_proc == "ecd":         _render_resultados_ecd(exibir_log)
+            elif tipo_proc == "dominio_pos": _render_resultados_posicional(exibir_log)
+            else:                            _render_resultados_lote(exibir_log)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
