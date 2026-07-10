@@ -772,36 +772,30 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             todos_saldos = dict(saldos_pat)
 
             if conta_pl_resultado in todos_saldos:
-                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL           : {conta_pl_resultado} | "
-                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
+    saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+    log.append(f"  Conta PL           : {conta_pl_resultado} | "
+               f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
 
-                if dc_res == "D":  # Déficit
-                    if dc_pl == "C":
-                        novo = round(saldo_pl - res_liq, 2)
-                        if novo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo, "C")
-                        else:
-                            todos_saldos[conta_pl_resultado] = (abs(novo), "D")
-                    else:
-                        todos_saldos[conta_pl_resultado] = (round(saldo_pl + res_liq, 2), "D")
-                else:  # Superávit
-                    if dc_pl == "D":
-                        novo = round(saldo_pl - res_liq, 2)
-                        if novo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo, "D")
-                        else:
-                            todos_saldos[conta_pl_resultado] = (abs(novo), "C")
-                    else:
-                        todos_saldos[conta_pl_resultado] = (round(saldo_pl + res_liq, 2), "C")
+    # Regra: mesmo sentido = soma, sentido oposto = subtrai
+    if dc_res == dc_pl:
+        # Mesmo sentido: soma o resultado ao saldo existente
+        novo_saldo = round(saldo_pl + res_liq, 2)
+        todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+    else:
+        # Sentido oposto: subtrai o resultado do saldo existente
+        novo_saldo = round(saldo_pl - res_liq, 2)
+        if novo_saldo >= 0:
+            todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+        else:
+            # Saldo inverteu de lado
+            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_res)
 
-                novo_v, novo_dc = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
-                           f"(ajuste de R$ {res_liq:,.2f} aplicado)")
-            else:
-                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
-                           f"balanço não fechará.")
-
+    novo_v, novo_dc = todos_saldos[conta_pl_resultado]
+    log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
+               f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+else:
+    log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
+               f"balanço não fechará.")
             todos_saldos.update(saldos_i355)
             log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
                        f"(patrimoniais ajustadas + resultado I355 aberto)")
