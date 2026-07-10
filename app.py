@@ -723,111 +723,84 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                                   modo: str,
                                   conta_pl_resultado: str,
                                   log: list) -> tuple:
-    """
-    Gera o lançamento de saldo inicial no leiaute Domínio.
-
-    modo = "apenas_patrimonial"
-        Usa somente I155 patrimonial (Ativo/Passivo/PL).
-        Contas de resultado NÃO entram.
-        ✅ Correto para balanço de abertura — D = C garantido pelo ECD.
-
-    modo = "aberto_com_resultado"
-        Usa I155 patrimonial + I355 (Receitas/Despesas abertas).
-        Para fechar o balanço (D = C):
-          → Deduz o resultado líquido do I355 da conta de PL informada.
-          → Superávit: reduz o saldo credor da conta PL (ou aumenta devedor).
-          → Déficit:   reduz o saldo devedor da conta PL (ou aumenta credor).
-        Permite encerrar as despesas/receitas no sistema destino.
-        ⚠ Requer que a conta de Superávit/Déficit seja informada.
-    """
     data_ref    = parsed["data_ref"]
     saldos_pat  = parsed["saldos_i155_pat"]
     saldos_i355 = parsed["saldos_i355"]
 
     log.append(f"  Modo               : {modo}")
 
-    # ── Monta conjunto de saldos conforme modo ────────────────────────────────
-        # ── Monta conjunto de saldos conforme modo ────────────────────────────────
     if modo == "apenas_patrimonial":
         todos_saldos = dict(saldos_pat)
         log.append(f"  Contas incluídas   : {len(todos_saldos):,} (somente patrimoniais)")
 
-   elif modo == "aberto_com_resultado":
-    if not saldos_i355:
-        log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
-        todos_saldos = dict(saldos_pat)
+    elif modo == "aberto_com_resultado":
+        if not saldos_i355:
+            log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
+            todos_saldos = dict(saldos_pat)
 
-    elif not conta_pl_resultado:
-        log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
-        todos_saldos = dict(saldos_pat)
-        modo = "apenas_patrimonial"
-
-    else:
-        res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-        total_rec = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "C"), 2)
-        total_des = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "D"), 2)
-        log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
-        log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
-        log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
-                   f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
-
-        # Start from patrimonial only — I355 accounts are NEVER added separately
-        todos_saldos = dict(saldos_pat)
-
-        if conta_pl_resultado in todos_saldos:
-            saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
-            log.append(f"  Conta PL           : {conta_pl_resultado} | "
-                       f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
-
-            # Contábil rule:
-            # Superávit (dc_res = C) → increases a C-side PL account (soma)
-            #                        → decreases a D-side PL account (subtrai)
-            # Déficit   (dc_res = D) → increases a D-side PL account (soma)
-            #                        → decreases a C-side PL account (subtrai)
-            if dc_res == dc_pl:
-                # Same side: result reinforces the existing balance
-                novo_saldo = round(saldo_pl + res_liq, 2)
-                todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
-            else:
-                # Opposite side: result offsets the existing balance
-                novo_saldo = round(saldo_pl - res_liq, 2)
-                if novo_saldo >= 0:
-                    todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
-                else:
-                    # Balance flipped to the other side
-                    todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_res)
-
-            novo_v, novo_dc = todos_saldos[conta_pl_resultado]
-            log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
-                       f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+        elif not conta_pl_resultado:
+            log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
+            todos_saldos = dict(saldos_pat)
+            modo = "apenas_patrimonial"
 
         else:
-            log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
-                       f"balanço não fechará.")
+            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
+            total_rec = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "C"), 2)
+            total_des = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "D"), 2)
+            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
+            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
+            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
+                       f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
 
-        # ── KEY DIFFERENCE ──────────────────────────────────────────────────
-        # Do NOT call todos_saldos.update(saldos_i355)
-        # I355 accounts are consumed entirely by the PL adjustment above.
-        # They never appear as separate lines in the output.
-        # ────────────────────────────────────────────────────────────────────
+            # Começa apenas com patrimonial — I355 NÃO entra como linhas separadas
+            todos_saldos = dict(saldos_pat)
 
-        log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                   f"(somente patrimoniais, PL já ajustado pelo resultado I355)")
+            if conta_pl_resultado in todos_saldos:
+                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+                log.append(f"  Conta PL           : {conta_pl_resultado} | "
+                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
+
+                if dc_res == dc_pl:
+                    novo_saldo = round(saldo_pl + res_liq, 2)
+                    todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+                else:
+                    novo_saldo = round(saldo_pl - res_liq, 2)
+                    if novo_saldo >= 0:
+                        todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+                    else:
+                        todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_res)
+
+                novo_v, novo_dc = todos_saldos[conta_pl_resultado]
+                log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
+                           f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+            else:
+                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
+                           f"balanço não fechará.")
+
+            # ── PONTO CRÍTICO ────────────────────────────────────────────────
+            # NÃO chamar todos_saldos.update(saldos_i355)
+            # O resultado do I355 já foi absorvido pelo ajuste da conta PL acima.
+            # Contas de receita/despesa NÃO aparecem como linhas no saldo inicial.
+            # ─────────────────────────────────────────────────────────────────
+            log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
+                       f"(somente patrimoniais, PL ajustado pelo resultado I355)")
+
     else:
         todos_saldos = dict(saldos_pat)
         log.append("  Modo inválido — usando apenas_patrimonial.")
 
     # Remove saldos zero
-    todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}               
+    todos_saldos = {cta: (v, dc) for cta, (v, dc) in todos_saldos.items() if abs(v) > 1e-6}
+
     if not todos_saldos:
         log.append("  AVISO: Nenhum saldo diferente de zero encontrado.")
         return b"", {}, []
 
-    debs  = sorted([(cta,v,dc) for cta,(v,dc) in todos_saldos.items() if dc=="D"], key=lambda x:x[0])
-    creds = sorted([(cta,v,dc) for cta,(v,dc) in todos_saldos.items() if dc=="C"], key=lambda x:x[0])
+    debs  = sorted([(cta, v, dc) for cta, (v, dc) in todos_saldos.items() if dc == "D"], key=lambda x: x[0])
+    creds = sorted([(cta, v, dc) for cta, (v, dc) in todos_saldos.items() if dc == "C"], key=lambda x: x[0])
 
-    total_deb  = round(sum(v for _,v,_ in debs),  2)
-    total_cred = round(sum(v for _,v,_ in creds), 2)
+    total_deb  = round(sum(v for _, v, _ in debs),  2)
+    total_cred = round(sum(v for _, v, _ in creds), 2)
     diferenca  = round(abs(total_deb - total_cred), 2)
     balanceado = diferenca < TOL_VALOR
 
@@ -839,33 +812,33 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
     buf = io.StringIO()
     buf.write(fmt_reg_0000(ni) + "\n")
 
-    nd=len(debs); nc=len(creds)
-    if   nd==1 and nc==1: tp="X"
-    elif nd==1 and nc>1:  tp="D"
-    elif nd>1  and nc==1: tp="C"
-    else:                 tp="V"
+    nd = len(debs); nc = len(creds)
+    if   nd == 1 and nc == 1: tp = "X"
+    elif nd == 1 and nc > 1:  tp = "D"
+    elif nd > 1  and nc == 1: tp = "C"
+    else:                     tp = "V"
     buf.write(fmt_reg_6000(tp) + "\n")
 
     def _hist(cta):
         return _norm_hist(f"{(historico_prefixo or 'SALDO INICIAL').strip()} {cta}")[:250]
 
     if tp == "X":
-        cta_d,v_d,_ = debs[0]; cta_c,v_c,_ = creds[0]
-        buf.write(fmt_reg_6100(data_ref, cta_d, cta_c, round((v_d+v_c)/2,2), "", _hist(cta_d)) + "\n")
+        cta_d, v_d, _ = debs[0]; cta_c, v_c, _ = creds[0]
+        buf.write(fmt_reg_6100(data_ref, cta_d, cta_c, round((v_d + v_c) / 2, 2), "", _hist(cta_d)) + "\n")
     elif tp == "D":
-        cta_d,v_d,_ = debs[0]
+        cta_d, v_d, _ = debs[0]
         buf.write(fmt_reg_6100(data_ref, cta_d, "", v_d, "", _hist(cta_d)) + "\n")
-        for cta_c,v_c,_ in creds:
+        for cta_c, v_c, _ in creds:
             buf.write(fmt_reg_6100(data_ref, "", cta_c, v_c, "", _hist(cta_c)) + "\n")
     elif tp == "C":
-        cta_c,v_c,_ = creds[0]
+        cta_c, v_c, _ = creds[0]
         buf.write(fmt_reg_6100(data_ref, "", cta_c, v_c, "", _hist(cta_c)) + "\n")
-        for cta_d,v_d,_ in debs:
+        for cta_d, v_d, _ in debs:
             buf.write(fmt_reg_6100(data_ref, cta_d, "", v_d, "", _hist(cta_d)) + "\n")
     else:
-        for cta_c,v_c,_ in creds:
+        for cta_c, v_c, _ in creds:
             buf.write(fmt_reg_6100(data_ref, "", cta_c, v_c, "", _hist(cta_c)) + "\n")
-        for cta_d,v_d,_ in debs:
+        for cta_d, v_d, _ in debs:
             buf.write(fmt_reg_6100(data_ref, cta_d, "", v_d, "", _hist(cta_d)) + "\n")
 
     n6100 = buf.getvalue().count("|6100|")
@@ -891,6 +864,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             "conteudo": "",
         })
     return resultado_bytes, resumo, erros_out
+                                    
 def _pre_scan_conta_pl_sugerida(conteudo: bytes):
     """
     Lê apenas I050, I150, I155 e I355 para sugerir a conta PL
