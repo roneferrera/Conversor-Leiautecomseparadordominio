@@ -791,58 +791,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
 
     # Remove saldos zero
     todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}
-                # Lógica de ajuste:
-                # O encerramento CREDITOU o PL com o superávit (ou DEBITOU com o déficit).
-                # Para reverter: se superávit → reduz crédito do PL; se déficit → reduz débito.
-                if dc_res == "C":
-                    # Superávit foi creditado no PL → reverte subtraindo do crédito
-                    if dc_pl_orig == "C":
-                        novo_saldo = round(saldo_pl_orig - res_liq, 2)
-                        if novo_saldo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
-                        else:
-                            # Saldo virou devedor após ajuste
-                            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "D")
-                    else:
-                        # PL estava devedor — superávit aumenta o crédito (reduz débito)
-                        novo_saldo = round(saldo_pl_orig - res_liq, 2)
-                        if novo_saldo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
-                        else:
-                            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "C")
-                else:
-                    # Déficit foi debitado no PL → reverte subtraindo do débito
-                    if dc_pl_orig == "D":
-                        novo_saldo = round(saldo_pl_orig - res_liq, 2)
-                        if novo_saldo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
-                        else:
-                            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "C")
-                    else:
-                        novo_saldo = round(saldo_pl_orig - res_liq, 2)
-                        if novo_saldo >= 0:
-                            todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
-                        else:
-                            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "D")
-
-                novo_saldo_f, novo_dc_f = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL ajustada  : R$ {novo_saldo_f:,.2f} {novo_dc_f} "
-                           f"(deduzido resultado R$ {res_liq:,.2f})")
-            else:
-                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
-                           f"PL não ajustado. Balanço pode não fechar.")
-
-            # Adiciona contas de resultado (I355) ao conjunto
-            todos_saldos.update(saldos_i355)
-            log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                       f"(patrimoniais ajustadas + resultado I355 aberto)")
-    else:
-        todos_saldos = dict(saldos_pat)
-        log.append("  Modo inválido — usando apenas_patrimonial.")
-
-    # Remove saldos zero
-    todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}
-
+               
     if not todos_saldos:
         log.append("  AVISO: Nenhum saldo diferente de zero encontrado.")
         return b"", {}, []
