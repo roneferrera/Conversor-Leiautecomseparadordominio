@@ -752,54 +752,67 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
         todos_saldos = dict(saldos_pat)
         log.append(f"  Contas incluídas   : {len(todos_saldos):,} (somente patrimoniais)")
 
-    elif modo == "aberto_com_resultado":
-        if not saldos_i355:
-            log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
-            todos_saldos = dict(saldos_pat)
-        elif not conta_pl_resultado:
-            log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
-            todos_saldos = dict(saldos_pat)
-            modo = "apenas_patrimonial"
-        else:
-            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-            total_rec = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="C"), 2)
-            total_des = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="D"), 2)
-            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
-            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
-            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
-                       f"({'Superávit' if dc_res=='C' else 'Déficit'})")
+   elif modo == "aberto_com_resultado":
+    if not saldos_i355:
+        log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
+        todos_saldos = dict(saldos_pat)
 
-            todos_saldos = dict(saldos_pat)
+    elif not conta_pl_resultado:
+        log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
+        todos_saldos = dict(saldos_pat)
+        modo = "apenas_patrimonial"
 
-            if conta_pl_resultado in todos_saldos:
-    saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
-    log.append(f"  Conta PL           : {conta_pl_resultado} | "
-               f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
-
-    # Regra: mesmo sentido = soma, sentido oposto = subtrai
-    if dc_res == dc_pl:
-        # Mesmo sentido: soma o resultado ao saldo existente
-        novo_saldo = round(saldo_pl + res_liq, 2)
-        todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
     else:
-        # Sentido oposto: subtrai o resultado do saldo existente
-        novo_saldo = round(saldo_pl - res_liq, 2)
-        if novo_saldo >= 0:
-            todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+        res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
+        total_rec = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "C"), 2)
+        total_des = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "D"), 2)
+        log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
+        log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
+        log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
+                   f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
+
+        # Start from patrimonial only — I355 accounts are NEVER added separately
+        todos_saldos = dict(saldos_pat)
+
+        if conta_pl_resultado in todos_saldos:
+            saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+            log.append(f"  Conta PL           : {conta_pl_resultado} | "
+                       f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
+
+            # Contábil rule:
+            # Superávit (dc_res = C) → increases a C-side PL account (soma)
+            #                        → decreases a D-side PL account (subtrai)
+            # Déficit   (dc_res = D) → increases a D-side PL account (soma)
+            #                        → decreases a C-side PL account (subtrai)
+            if dc_res == dc_pl:
+                # Same side: result reinforces the existing balance
+                novo_saldo = round(saldo_pl + res_liq, 2)
+                todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+            else:
+                # Opposite side: result offsets the existing balance
+                novo_saldo = round(saldo_pl - res_liq, 2)
+                if novo_saldo >= 0:
+                    todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+                else:
+                    # Balance flipped to the other side
+                    todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_res)
+
+            novo_v, novo_dc = todos_saldos[conta_pl_resultado]
+            log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
+                       f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+
         else:
-            # Saldo inverteu de lado
-            todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_res)
+            log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
+                       f"balanço não fechará.")
 
-    novo_v, novo_dc = todos_saldos[conta_pl_resultado]
-    log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
-               f"(ajuste de R$ {res_liq:,.2f} aplicado)")
-else:
-    log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
-               f"balanço não fechará.")
-            todos_saldos.update(saldos_i355)
-            log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                       f"(patrimoniais ajustadas + resultado I355 aberto)")
+        # ── KEY DIFFERENCE ──────────────────────────────────────────────────
+        # Do NOT call todos_saldos.update(saldos_i355)
+        # I355 accounts are consumed entirely by the PL adjustment above.
+        # They never appear as separate lines in the output.
+        # ────────────────────────────────────────────────────────────────────
 
+        log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
+                   f"(somente patrimoniais, PL já ajustado pelo resultado I355)")
     else:
         todos_saldos = dict(saldos_pat)
         log.append("  Modo inválido — usando apenas_patrimonial.")
