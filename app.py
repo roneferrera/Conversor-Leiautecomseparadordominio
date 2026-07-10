@@ -735,14 +735,59 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
 
     elif modo == "aberto_com_resultado":
         if not saldos_i355:
-            ...
+            log.append("  AVISO: Nenhum registro I355 encontrado — usando apenas patrimonial.")
+            todos_saldos = dict(saldos_pat)
+
         elif not conta_pl_resultado:
-            ...
+            log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
+            todos_saldos = dict(saldos_pat)
+
         else:
-            ...
-            # TUDO DENTRO DESTE else: até a linha:
+            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
+            total_rec = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "C"), 2)
+            total_des = round(sum(v for _, (v, dc) in saldos_i355.items() if dc == "D"), 2)
+            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
+            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
+            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
+                       f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
+
+            # Começa com o patrimonial
+            todos_saldos = dict(saldos_pat)
+
+            if conta_pl_resultado in todos_saldos:
+                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+                log.append(f"  Conta PL           : {conta_pl_resultado} | "
+                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
+
+                # Retira o resultado líquido da conta PL para "reabrir" via I355
+                if dc_pl == "C" and dc_res == "C":
+                    novo_saldo = round(saldo_pl - res_liq, 2)
+                elif dc_pl == "D" and dc_res == "D":
+                    novo_saldo = round(saldo_pl - res_liq, 2)
+                elif dc_pl == "C" and dc_res == "D":
+                    novo_saldo = round(saldo_pl + res_liq, 2)
+                else:
+                    novo_saldo = round(saldo_pl + res_liq, 2)
+
+                if novo_saldo >= 0:
+                    todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+                else:
+                    dc_inv = "D" if dc_pl == "C" else "C"
+                    todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_inv)
+
+                novo_v, novo_dc = todos_saldos[conta_pl_resultado]
+                log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
+                           f"(resultado de R$ {res_liq:,.2f} retirado para reabrir via I355)")
+            else:
+                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
+                           f"balanço não fechará.")
+
+            # Inclui as contas de resultado abertas (I355) como linhas separadas
+            for cta, (v, dc) in saldos_i355.items():
+                todos_saldos[cta] = (v, dc)
+
             log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                       f"(somente patrimoniais, PL ajustado pelo resultado I355)")
+                       f"(patrimonial + {len(saldos_i355):,} contas de resultado abertas)")
 
     else:
         todos_saldos = dict(saldos_pat)
@@ -821,8 +866,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                        f"Verifique se a conta de PL/Resultado informada está correta."),
             "conteudo": "",
         })
-    return resultado_bytes, resumo, erros_out                                    
-def _pre_scan_conta_pl_sugerida(conteudo: bytes):
+    return resultado_bytes, resumo, erros_outdef _pre_scan_conta_pl_sugerida(conteudo: bytes):
     """
     Lê apenas I050, I150, I155 e I355 para sugerir a conta PL
     sem precisar processar o arquivo completo.
