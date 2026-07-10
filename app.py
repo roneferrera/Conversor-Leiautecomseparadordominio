@@ -760,15 +760,36 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                 log.append(f"  Conta PL           : {conta_pl_resultado} | "
                            f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
 
-                dc_ajuste = "C" if dc_res == "D" else "D"
+                                # Mede o desequilíbrio real do I155 puro antes de ajustar
+                deb_pat  = sum(v for _, (v, dc) in todos_saldos.items() if dc == "D")
+                cred_pat = sum(v for _, (v, dc) in todos_saldos.items() if dc == "C")
+                dif_pat  = round(deb_pat - cred_pat, 2)
 
-                if dc_ajuste == dc_pl:
-                    novo_saldo = round(saldo_pl + res_liq, 2)
-                    todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
-                else:
-                    novo_saldo = round(saldo_pl - res_liq, 2)
-                    if novo_saldo >= 0:
-                        todos_saldos[conta_pl_resultado] = (novo_saldo, dc_pl)
+                log.append(f"  Balanço I155 puro  : D={deb_pat:,.2f} C={cred_pat:,.2f} Dif={dif_pat:,.2f}")
+
+                if abs(dif_pat) > TOL_VALOR:
+                    if dif_pat > 0:
+                        # Falta crédito → aumenta lado C da conta PL
+                        if dc_pl == "C":
+                            novo_saldo = round(saldo_pl + abs(dif_pat), 2)
+                            todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
+                        else:
+                            novo_saldo = round(saldo_pl - abs(dif_pat), 2)
+                            if novo_saldo >= 0:
+                                todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
+                            else:
+                                todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "C")
+                    else:
+                        # Falta débito → aumenta lado D da conta PL
+                        if dc_pl == "D":
+                            novo_saldo = round(saldo_pl + abs(dif_pat), 2)
+                            todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
+                        else:
+                            novo_saldo = round(saldo_pl - abs(dif_pat), 2)
+                            if novo_saldo >= 0:
+                                todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
+                            else:
+                                todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "D")
                     else:
                         todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_ajuste)
                 novo_v, novo_dc = todos_saldos[conta_pl_resultado]
