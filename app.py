@@ -760,7 +760,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                 log.append(f"  Conta PL           : {conta_pl_resultado} | "
                            f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
 
-               dc_ajuste = "C" if dc_res == "D" else "D"
+                dc_ajuste = "C" if dc_res == "D" else "D"
 
                 if dc_ajuste == dc_pl:
                     novo_saldo = round(saldo_pl + res_liq, 2)
