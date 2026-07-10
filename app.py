@@ -759,40 +759,38 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
             todos_saldos = dict(saldos_pat)
             modo = "apenas_patrimonial"
-elif modo == "aberto_com_resultado":
-    if not saldos_i355:
-        log.append("  AVISO: Nenhum registro I355 — usando apenas patrimonial.")
-        todos_saldos = dict(saldos_pat)
-    elif not conta_pl_resultado:
-        log.append("  ERRO: Conta PL não informada — usando apenas patrimonial.")
-        todos_saldos = dict(saldos_pat)
-        modo = "apenas_patrimonial"
-    else:
-        res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-        total_rec = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="C"), 2)
-        total_des = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="D"), 2)
-        log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
-        log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
-        log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
-                   f"({'Superávit' if dc_res=='C' else 'Déficit'})")
-
-        # ← SEM AJUSTE NA CONTA PL
-        # O I155 já traz o saldo do PL com o resultado encerrado.
-        # Não mexer — o I355 já vai equilibrar o balanço.
-        todos_saldos = dict(saldos_pat)
-
-        if conta_pl_resultado in todos_saldos:
-            saldo_pl_orig, dc_pl_orig = todos_saldos[conta_pl_resultado]
-            log.append(f"  Conta PL           : {conta_pl_resultado} | "
-                       f"Saldo original: R$ {saldo_pl_orig:,.2f} {dc_pl_orig}")
-            log.append(f"  Conta PL mantida   : saldo original preservado (sem ajuste)")
         else:
-            log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155.")
+            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
+            total_rec = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="C"), 2)
+            total_des = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="D"), 2)
+            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
+            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
+            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
+                       f"({'Superávit' if dc_res=='C' else 'Déficit'})")
 
-        # Adiciona contas de resultado (I355)
-        todos_saldos.update(saldos_i355)
-        log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                   f"(patrimoniais + resultado I355 aberto)")
+            # SEM AJUSTE NA CONTA PL
+            # O I155 já traz o PL com o encerramento embutido.
+            todos_saldos = dict(saldos_pat)
+
+            if conta_pl_resultado in todos_saldos:
+                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+                log.append(f"  Conta PL           : {conta_pl_resultado} | "
+                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl} "
+                           f"(sem ajuste — encerramento já embutido no I155)")
+            else:
+                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155.")
+
+            # Adiciona contas de resultado abertas (I355)
+            todos_saldos.update(saldos_i355)
+            log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
+                       f"(patrimoniais sem ajuste + resultado I355 aberto)")
+
+    else:
+        todos_saldos = dict(saldos_pat)
+        log.append("  Modo inválido — usando apenas_patrimonial.")
+
+    # Remove saldos zero
+    todos_saldos = {cta:(v,dc) for cta,(v,dc) in todos_saldos.items() if abs(v) > 1e-6}
                 # Lógica de ajuste:
                 # O encerramento CREDITOU o PL com o superávit (ou DEBITOU com o déficit).
                 # Para reverter: se superávit → reduz crédito do PL; se déficit → reduz débito.
