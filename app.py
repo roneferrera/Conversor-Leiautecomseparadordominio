@@ -866,9 +866,9 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                        f"Verifique se a conta de PL/Resultado informada está correta."),
             "conteudo": "",
         })
-    return resultado_bytes, resumo, erros_outdef
-    
-    _pre_scan_conta_pl_sugerida(conteudo: bytes):
+    return resultado_bytes, resumo, erros_out
+                                    
+    def _pre_scan_conta_pl_sugerida(conteudo: bytes): 
     """
     Lê apenas I050, I150, I155 e I355 para sugerir a conta PL
     sem precisar processar o arquivo completo.
