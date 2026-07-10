@@ -752,7 +752,6 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
                        f"({'Superávit' if dc_res == 'C' else 'Déficit'})")
 
-            # Começa apenas com patrimonial — I355 NÃO entra como linhas separadas
             todos_saldos = dict(saldos_pat)
 
             if conta_pl_resultado in todos_saldos:
@@ -760,16 +759,13 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                 log.append(f"  Conta PL           : {conta_pl_resultado} | "
                            f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
 
-                                # Mede o desequilíbrio real do I155 puro antes de ajustar
                 deb_pat  = sum(v for _, (v, dc) in todos_saldos.items() if dc == "D")
                 cred_pat = sum(v for _, (v, dc) in todos_saldos.items() if dc == "C")
                 dif_pat  = round(deb_pat - cred_pat, 2)
-
                 log.append(f"  Balanço I155 puro  : D={deb_pat:,.2f} C={cred_pat:,.2f} Dif={dif_pat:,.2f}")
 
                 if abs(dif_pat) > TOL_VALOR:
                     if dif_pat > 0:
-                        # Falta crédito → aumenta lado C da conta PL
                         if dc_pl == "C":
                             novo_saldo = round(saldo_pl + abs(dif_pat), 2)
                             todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
@@ -780,7 +776,6 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                             else:
                                 todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "C")
                     else:
-                        # Falta débito → aumenta lado D da conta PL
                         if dc_pl == "D":
                             novo_saldo = round(saldo_pl + abs(dif_pat), 2)
                             todos_saldos[conta_pl_resultado] = (novo_saldo, "D")
@@ -790,20 +785,14 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                                 todos_saldos[conta_pl_resultado] = (novo_saldo, "C")
                             else:
                                 todos_saldos[conta_pl_resultado] = (abs(novo_saldo), "D")
-                    else:
-                        todos_saldos[conta_pl_resultado] = (abs(novo_saldo), dc_ajuste)
+
                 novo_v, novo_dc = todos_saldos[conta_pl_resultado]
                 log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
-                           f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+                           f"(ajuste de R$ {abs(dif_pat):,.2f} aplicado)")
             else:
                 log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
                            f"balanço não fechará.")
 
-            # ── PONTO CRÍTICO ────────────────────────────────────────────────
-            # NÃO chamar todos_saldos.update(saldos_i355)
-            # O resultado do I355 já foi absorvido pelo ajuste da conta PL acima.
-            # Contas de receita/despesa NÃO aparecem como linhas no saldo inicial.
-            # ─────────────────────────────────────────────────────────────────
             log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
                        f"(somente patrimoniais, PL ajustado pelo resultado I355)")
 
@@ -811,7 +800,6 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
         todos_saldos = dict(saldos_pat)
         log.append("  Modo inválido — usando apenas_patrimonial.")
 
-    # Remove saldos zero
     todos_saldos = {cta: (v, dc) for cta, (v, dc) in todos_saldos.items() if abs(v) > 1e-6}
 
     if not todos_saldos:
@@ -885,8 +873,7 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
                        f"Verifique se a conta de PL/Resultado informada está correta."),
             "conteudo": "",
         })
-    return resultado_bytes, resumo, erros_out
-                                    
+    return resultado_bytes, resumo, erros_out                                    
 def _pre_scan_conta_pl_sugerida(conteudo: bytes):
     """
     Lê apenas I050, I150, I155 e I355 para sugerir a conta PL
