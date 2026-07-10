@@ -759,32 +759,54 @@ def _gerar_saldo_inicial_dominio(parsed: dict, ni: str,
             log.append("  ERRO: Conta de PL/Resultado não informada — usando apenas patrimonial.")
             todos_saldos = dict(saldos_pat)
             modo = "apenas_patrimonial"
-        else:
-            res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-            total_rec = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="C"), 2)
-            total_des = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="D"), 2)
-            log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
-            log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
-            log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
-                       f"({'Superávit' if dc_res=='C' else 'Déficit'})")
+else:
+    res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
+    total_rec = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="C"), 2)
+    total_des = round(sum(v for _,(v,dc) in saldos_i355.items() if dc=="D"), 2)
+    log.append(f"  I355 — Receitas    : R$ {total_rec:,.2f}")
+    log.append(f"  I355 — Despesas    : R$ {total_des:,.2f}")
+    log.append(f"  Resultado líquido  : R$ {res_liq:,.2f} "
+               f"({'Superávit' if dc_res=='C' else 'Déficit'})")
 
-            # SEM AJUSTE NA CONTA PL
-            # O I155 já traz o PL com o encerramento embutido.
-            todos_saldos = dict(saldos_pat)
+    todos_saldos = dict(saldos_pat)
 
-            if conta_pl_resultado in todos_saldos:
-                saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
-                log.append(f"  Conta PL           : {conta_pl_resultado} | "
-                           f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl} "
-                           f"(sem ajuste — encerramento já embutido no I155)")
+    if conta_pl_resultado in todos_saldos:
+        saldo_pl, dc_pl = todos_saldos[conta_pl_resultado]
+        log.append(f"  Conta PL           : {conta_pl_resultado} | "
+                   f"Saldo original: R$ {saldo_pl:,.2f} {dc_pl}")
+
+        # Aplica o ajuste: deduz o resultado líquido da conta PL
+        # Déficit → reduz o crédito do PL (ou aumenta débito)
+        # Superávit → reduz o débito do PL (ou aumenta crédito)
+        if dc_res == "D":  # Déficit
+            if dc_pl == "C":
+                novo = round(saldo_pl - res_liq, 2)
+                if novo >= 0:
+                    todos_saldos[conta_pl_resultado] = (novo, "C")
+                else:
+                    todos_saldos[conta_pl_resultado] = (abs(novo), "D")
             else:
-                log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155.")
+                todos_saldos[conta_pl_resultado] = (round(saldo_pl + res_liq, 2), "D")
+        else:  # Superávit
+            if dc_pl == "D":
+                novo = round(saldo_pl - res_liq, 2)
+                if novo >= 0:
+                    todos_saldos[conta_pl_resultado] = (novo, "D")
+                else:
+                    todos_saldos[conta_pl_resultado] = (abs(novo), "C")
+            else:
+                todos_saldos[conta_pl_resultado] = (round(saldo_pl + res_liq, 2), "C")
 
-            # Adiciona contas de resultado abertas (I355)
-            todos_saldos.update(saldos_i355)
-            log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
-                       f"(patrimoniais sem ajuste + resultado I355 aberto)")
+        novo_v, novo_dc = todos_saldos[conta_pl_resultado]
+        log.append(f"  Conta PL ajustada  : R$ {novo_v:,.2f} {novo_dc} "
+                   f"(ajuste de R$ {res_liq:,.2f} aplicado)")
+    else:
+        log.append(f"  AVISO: Conta {conta_pl_resultado} não encontrada no I155 — "
+                   f"balanço não fechará.")
 
+    todos_saldos.update(saldos_i355)
+    log.append(f"  Contas incluídas   : {len(todos_saldos):,} "
+               f"(patrimoniais ajustadas + resultado I355 aberto)")
     else:
         todos_saldos = dict(saldos_pat)
         log.append("  Modo inválido — usando apenas_patrimonial.")
