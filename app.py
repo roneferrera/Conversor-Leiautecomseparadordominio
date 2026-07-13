@@ -1676,6 +1676,360 @@ def _reset():
             None if k.endswith("_bytes") else
             False if k in ("processado","modo_saldo_inicial") else "")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MÓDULO COMPARAÇÃO I052 — ECD ANTERIOR vs. ECD ATUAL
+# ═══════════════════════════════════════════════════════════════════════════════
+def _parse_i052_completo(conteudo: bytes, log: list) -> dict:
+    """
+    Lê um SPED ECD e extrai:
+      - I050 → mapa conta → nome/natureza
+      - I052 → vínculos conta → COD_AGL (plano referencial)
+      - I150/I155 → saldo final de cada conta (último período)
+      - I350/I355 → saldo inicial de cada conta
+      - 0000 → CNPJ e período
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    log.append(f"  Encoding           : {enc}")
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+    linhas = texto.splitlines()
+    log.append(f"  Total de linhas    : {len(linhas):,}")
+
+    cnpj = ""; dt_ini_0000 = ""; dt_fin_0000 = ""
+    mapa_nome: dict  = {}   # cod_cta → nome
+    mapa_nat:  dict  = {}   # cod_cta → cod_nat
+    i052: dict       = {}   # cod_cta → list[cod_agl]
+
+    # Saldos finais (I155) — último período
+    i155_por_periodo: dict = {}
+    periodo_atual_idx = -1
+
+    # Saldos iniciais (I355) — abertura
+    saldos_i355: dict = {}  # cod_cta → (valor, dc)
+
+    cnt = {"0000": 0, "I050": 0, "I052": 0, "I150": 0, "I155": 0, "I355": 0}
+    erros = []
+
+    for num_linha, linha in enumerate(linhas, 1):
+        linha = linha.strip()
+        if not linha:
+            continue
+        campos = _split_pipe(linha)
+        if not campos:
+            continue
+        reg = campos[0]
+
+        try:
+            if reg == "0000":
+                cnt["0000"] += 1
+                if len(campos) > 3: dt_ini_0000 = _campo(campos, 3).strip()
+                if len(campos) > 4: dt_fin_0000 = _campo(campos, 4).strip()
+                if len(campos) > 5: cnpj = re.sub(r"\D", "", _campo(campos, 5).strip())
+
+            elif reg == "I050":
+                cnt["I050"] += 1
+                if len(campos) < 6: continue
+                cod_nat  = _campo(campos, 2).strip()
+                cod_cta  = _campo(campos, 5).strip()
+                nome_cta = _campo(campos, 7).strip() if len(campos) > 7 else ""
+                if cod_cta:
+                    mapa_nome[cod_cta] = nome_cta
+                    mapa_nat[cod_cta]  = cod_nat
+
+            elif reg == "I052":
+                cnt["I052"] += 1
+                # Layout: |I052|COD_CTA|COD_AGL|
+                cod_cta = _campo(campos, 1).strip()
+                cod_agl = _campo(campos, 2).strip()
+                if cod_cta and cod_agl:
+                    i052.setdefault(cod_cta, []).append(cod_agl)
+
+            elif reg == "I150":
+                cnt["I150"] += 1
+                periodo_atual_idx += 1
+                i155_por_periodo[periodo_atual_idx] = {}
+
+            elif reg == "I155":
+                cnt["I155"] += 1
+                if periodo_atual_idx < 0: continue
+                cod_cta   = _campo(campos, 1).strip()
+                vl_fin    = _campo(campos, 7).strip()
+                ind_dc    = _campo(campos, 8).strip().upper()
+                if not cod_cta: continue
+                if ind_dc not in ("D", "C"): ind_dc = "D"
+                try:    valor_f = _str2float(vl_fin)
+                except: valor_f = 0.0
+                i155_por_periodo[periodo_atual_idx][cod_cta] = (valor_f, ind_dc)
+
+            elif reg == "I355":
+                cnt["I355"] += 1
+                cod_cta = _campo(campos, 1).strip()
+                vl_cta  = _campo(campos, 3).strip()
+                ind_dc  = _campo(campos, 4).strip().upper()
+                if not cod_cta: continue
+                if ind_dc not in ("D", "C"): ind_dc = "D"
+                try:    valor_f = _str2float(vl_cta)
+                except: valor_f = 0.0
+                saldos_i355[cod_cta] = (valor_f, ind_dc)
+
+        except Exception as ex:
+            erros.append({"linha": num_linha, "motivo": str(ex), "conteudo": linha[:80]})
+
+    # Saldos finais do último período I155
+    saldos_i155_final: dict = {}
+    periodos_count = len(i155_por_periodo)
+    if i155_por_periodo:
+        ultimo_idx = max(i155_por_periodo.keys())
+        saldos_i155_final = i155_por_periodo[ultimo_idx]
+
+    log.append(f"  CNPJ               : {cnpj}")
+    log.append(f"  Período            : {_normalizar_data_ecd(dt_ini_0000)} a {_normalizar_data_ecd(dt_fin_0000)}")
+    log.append(f"  Registros I050     : {cnt['I050']:,}")
+    log.append(f"  Registros I052     : {cnt['I052']:,}  ({len(i052):,} contas com vínculo)")
+    log.append(f"  Períodos I150      : {periodos_count:,}")
+    log.append(f"  Saldos I155 finais : {len(saldos_i155_final):,}")
+    log.append(f"  Saldos I355        : {len(saldos_i355):,}")
+    if erros:
+        log.append(f"  Erros/avisos       : {len(erros):,}")
+
+    return {
+        "cnpj":              cnpj,
+        "dt_ini":            _normalizar_data_ecd(dt_ini_0000),
+        "dt_fin":            _normalizar_data_ecd(dt_fin_0000),
+        "mapa_nome":         mapa_nome,
+        "mapa_nat":          mapa_nat,
+        "i052":              i052,           # cod_cta → [cod_agl]
+        "saldos_finais":     saldos_i155_final,  # cod_cta → (valor, dc)
+        "saldos_iniciais":   saldos_i355,        # cod_cta → (valor, dc)
+        "erros":             erros,
+    }
+
+
+def _comparar_i052(ant: dict, atu: dict) -> dict:
+    """
+    Compara os I052 de dois ECDs e retorna:
+      - contas_mudaram_grupo : conta mudou de COD_AGL entre os dois arquivos
+      - contas_so_anterior   : conta existia no I052 anterior mas sumiu no atual
+      - contas_so_atual      : conta nova no I052 atual
+      - divergencias_saldo   : saldo final (ant) ≠ saldo inicial (atu) para o mesmo COD_AGL
+      - resumo_agl           : por COD_AGL → saldo_fin_ant, saldo_ini_atu, diferença
+    """
+    i052_ant = ant["i052"]  # cod_cta → [cod_agl]
+    i052_atu = atu["i052"]
+
+    contas_ant = set(i052_ant.keys())
+    contas_atu = set(i052_atu.keys())
+
+    contas_so_anterior = sorted(contas_ant - contas_atu)
+    contas_so_atual    = sorted(contas_atu - contas_ant)
+    contas_comuns      = contas_ant & contas_atu
+
+    contas_mudaram_grupo = []
+    for cta in sorted(contas_comuns):
+        agls_ant = set(i052_ant[cta])
+        agls_atu = set(i052_atu[cta])
+        if agls_ant != agls_atu:
+            contas_mudaram_grupo.append({
+                "conta":    cta,
+                "nome":     ant["mapa_nome"].get(cta, atu["mapa_nome"].get(cta, "")),
+                "agl_ant":  sorted(agls_ant),
+                "agl_atu":  sorted(agls_atu),
+                "adicionados": sorted(agls_atu - agls_ant),
+                "removidos":   sorted(agls_ant - agls_atu),
+            })
+
+    # ── Comparação de saldos por COD_AGL ─────────────────────────────────────
+    # Agrupa saldo final (ant I155) por COD_AGL
+    agl_saldo_fin: dict = {}   # cod_agl → float (signed: C positivo, D negativo)
+    for cta, agls in i052_ant.items():
+        if cta not in ant["saldos_finais"]: continue
+        v, dc = ant["saldos_finais"][cta]
+        signed = v if dc == "C" else -v
+        for agl in agls:
+            agl_saldo_fin[agl] = round(agl_saldo_fin.get(agl, 0.0) + signed, 2)
+
+    # Agrupa saldo inicial (atu I355) por COD_AGL
+    agl_saldo_ini: dict = {}   # cod_agl → float (signed)
+    for cta, agls in i052_atu.items():
+        if cta not in atu["saldos_iniciais"]: continue
+        v, dc = atu["saldos_iniciais"][cta]
+        signed = v if dc == "C" else -v
+        for agl in agls:
+            agl_saldo_ini[agl] = round(agl_saldo_ini.get(agl, 0.0) + signed, 2)
+
+    todos_agls = set(agl_saldo_fin.keys()) | set(agl_saldo_ini.keys())
+    resumo_agl = []
+    divergencias_saldo = []
+
+    for agl in sorted(todos_agls):
+        sf = agl_saldo_fin.get(agl, 0.0)
+        si = agl_saldo_ini.get(agl, 0.0)
+        dif = round(sf - si, 2)
+        row = {
+            "cod_agl":       agl,
+            "saldo_fin_ant": sf,
+            "saldo_ini_atu": si,
+            "diferenca":     dif,
+            "ok":            abs(dif) < TOL_VALOR,
+        }
+        resumo_agl.append(row)
+        if abs(dif) >= TOL_VALOR:
+            divergencias_saldo.append(row)
+
+    return {
+        "contas_mudaram_grupo":  contas_mudaram_grupo,
+        "contas_so_anterior":    contas_so_anterior,
+        "contas_so_atual":       contas_so_atual,
+        "divergencias_saldo":    divergencias_saldo,
+        "resumo_agl":            resumo_agl,
+        "total_contas_ant":      len(contas_ant),
+        "total_contas_atu":      len(contas_atu),
+        "total_agls":            len(todos_agls),
+    }
+
+
+def _render_comparacao_i052(resultado: dict, label_ant: str, label_atu: str,
+                             parsed_ant: dict, parsed_atu: dict):
+    """Renderiza o resultado da comparação I052 na interface Streamlit."""
+    st.markdown("---")
+    st.markdown("## 📊 Resultado da Comparação I052")
+
+    # ── Cabeçalho dos arquivos ────────────────────────────────────────────────
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(
+            f"<div class='filial-box'><b style='color:#6EC6FF;'>📁 ANTERIOR</b><br>"
+            f"<span style='color:#FFD166;'>{label_ant}</span><br>"
+            f"CNPJ: {fmt_cnpj(parsed_ant['cnpj']) if parsed_ant['cnpj'] else '—'}<br>"
+            f"Período: {parsed_ant['dt_ini']} a {parsed_ant['dt_fin']}<br>"
+            f"Contas I052: {resultado['total_contas_ant']:,}</div>",
+            unsafe_allow_html=True
+        )
+    with col_b:
+        st.markdown(
+            f"<div class='filial-box'><b style='color:#6EC6FF;'>📁 ATUAL</b><br>"
+            f"<span style='color:#FFD166;'>{label_atu}</span><br>"
+            f"CNPJ: {fmt_cnpj(parsed_atu['cnpj']) if parsed_atu['cnpj'] else '—'}<br>"
+            f"Período: {parsed_atu['dt_ini']} a {parsed_atu['dt_fin']}<br>"
+            f"Contas I052: {resultado['total_contas_atu']:,}</div>",
+            unsafe_allow_html=True
+        )
+
+    # ── Métricas resumo ───────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Contas — Anterior",    f"{resultado['total_contas_ant']:,}")
+    m2.metric("Contas — Atual",       f"{resultado['total_contas_atu']:,}")
+    m3.metric("Mudaram de grupo",     f"{len(resultado['contas_mudaram_grupo']):,}")
+    m4.metric("Só no anterior",       f"{len(resultado['contas_so_anterior']):,}")
+    m5.metric("Só no atual",          f"{len(resultado['contas_so_atual']):,}")
+
+    n_div = len(resultado["divergencias_saldo"])
+    if n_div == 0:
+        st.markdown(
+            "<div class='card-ok'>✅ <b style='color:#00C896;'>Todos os saldos por COD_AGL "
+            "batem entre o saldo final do anterior e o saldo inicial do atual.</b></div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div class='card-err'>⚠️ <b style='color:#FF4444;'>{n_div} COD_AGL(s) com "
+            f"divergência de saldo entre os dois arquivos.</b></div>",
+            unsafe_allow_html=True
+        )
+
+    # ── Seção 1: Contas que mudaram de grupo ─────────────────────────────────
+    st.markdown("#### 🔀 Contas que mudaram de COD_AGL")
+    if resultado["contas_mudaram_grupo"]:
+        rows_mud = []
+        for r in resultado["contas_mudaram_grupo"]:
+            rows_mud.append({
+                "Conta":       r["conta"],
+                "Nome":        r["nome"],
+                "AGL Anterior": ", ".join(r["agl_ant"]),
+                "AGL Atual":    ", ".join(r["agl_atu"]),
+                "Adicionados":  ", ".join(r["adicionados"]),
+                "Removidos":    ", ".join(r["removidos"]),
+            })
+        st.dataframe(pd.DataFrame(rows_mud), use_container_width=True, hide_index=True)
+    else:
+        st.success("Nenhuma conta mudou de grupo.")
+
+    # ── Seção 2: Contas apenas no anterior ───────────────────────────────────
+    with st.expander(f"📤 Contas presentes APENAS no anterior ({len(resultado['contas_so_anterior']):,})",
+                     expanded=False):
+        if resultado["contas_so_anterior"]:
+            rows_ant = [{"Conta": c,
+                         "Nome":  parsed_ant["mapa_nome"].get(c, ""),
+                         "Nat.":  parsed_ant["mapa_nat"].get(c, "")}
+                        for c in resultado["contas_so_anterior"]]
+            st.dataframe(pd.DataFrame(rows_ant), use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhuma.")
+
+    # ── Seção 3: Contas apenas no atual ──────────────────────────────────────
+    with st.expander(f"📥 Contas presentes APENAS no atual ({len(resultado['contas_so_atual']):,})",
+                     expanded=False):
+        if resultado["contas_so_atual"]:
+            rows_atu = [{"Conta": c,
+                         "Nome":  parsed_atu["mapa_nome"].get(c, ""),
+                         "Nat.":  parsed_atu["mapa_nat"].get(c, "")}
+                        for c in resultado["contas_so_atual"]]
+            st.dataframe(pd.DataFrame(rows_atu), use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhuma.")
+
+    # ── Seção 4: Divergências de saldo por COD_AGL ───────────────────────────
+    st.markdown("#### 💰 Saldo Final (anterior) vs. Saldo Inicial (atual) por COD_AGL")
+    st.caption(
+        "Saldo final = soma dos I155 do último período do arquivo anterior, agrupado por COD_AGL.  "
+        "Saldo inicial = soma dos I355 do arquivo atual, agrupado por COD_AGL."
+    )
+
+    filtro_agl = st.radio(
+        "Exibir:", ["Todos os COD_AGL", "✅ Somente OK", "❌ Somente com divergência"],
+        horizontal=True, key="filtro_agl_radio"
+    )
+
+    rows_agl = []
+    for r in resultado["resumo_agl"]:
+        if filtro_agl == "✅ Somente OK" and not r["ok"]: continue
+        if filtro_agl == "❌ Somente com divergência" and r["ok"]: continue
+        rows_agl.append({
+            "COD_AGL":         r["cod_agl"],
+            "Saldo Fin. Ant.": r["saldo_fin_ant"],
+            "Saldo Ini. Atu.": r["saldo_ini_atu"],
+            "Diferença":       r["diferenca"],
+            "Status":          "✔ OK" if r["ok"] else "✖ DIVERGE",
+        })
+
+    if rows_agl:
+        df_agl = pd.DataFrame(rows_agl)
+        styled = (
+            df_agl.style
+            .map(lambda v: "color:#00C896;font-weight:700" if v == "✔ OK"
+                           else "color:#FF4444;font-weight:700", subset=["Status"])
+            .map(lambda v: "color:#FF4444" if abs(v) >= TOL_VALOR else "color:#00C896",
+                 subset=["Diferença"])
+            .format({
+                "Saldo Fin. Ant.": "R$ {:,.2f}",
+                "Saldo Ini. Atu.": "R$ {:,.2f}",
+                "Diferença":       "R$ {:,.2f}",
+            })
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        # Download da tabela como CSV
+        csv_bytes = df_agl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+        st.download_button(
+            "⬇ Baixar comparação COD_AGL (.csv)",
+            data=csv_bytes,
+            file_name="comparacao_i052_agl.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    else:
+        st.info("Nenhum COD_AGL encontrado para os filtros selecionados.")
+
 def _pre_scan_cnpj_ecd(conteudo):
     enc=_detectar_encoding_bytes(conteudo)
     try: amostra=conteudo[:4096].decode(enc,errors="replace")
