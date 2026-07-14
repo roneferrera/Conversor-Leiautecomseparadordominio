@@ -1,5 +1,16 @@
-streamlit
-pandas
-numpy
-openpyxl
-xlrd>=2.0.1
+# ── Interface ────────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+
+# ── Dados ────────────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+openpyxl>=3.1.0          # leitura/escrita de .xlsx (pd.ExcelFile, pd.read_excel)
+xlsxwriter>=3.1.0         # geração do modelo de planilha (pd.ExcelWriter engine)
+xlrd>=2.0.1               # leitura de .xls legado (engine xlrd)
+
+# ── Fuzzy Matching (módulo DE/PARA) ──────────────────────────────────────────
+thefuzz>=0.22.1           # from thefuzz import process, fuzz
+python-Levenshtein>=0.25.0  # acelera thefuzz 4-10x (opcional mas recomendado)
+
+# ── Stdlib (já incluídas no Python — listadas apenas para referência) ────────
+# os, re, gc, io, time, json, traceback, unicodedata, datetime
