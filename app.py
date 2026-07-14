@@ -2660,7 +2660,1088 @@ def _render_passos_ecd(conteudo: bytes, exibir_log: bool):
         _render_resultados_v4(exibir_log)
 
     return btn_processar if "btn_processar" in dir() else False
-	
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCO COMPLEMENTAR — Funções faltantes no V4.0
+# Cole este bloco ANTES da função main()
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. _pre_scan_conta_pl_sugerida ───────────────────────────────────────────
+def _pre_scan_conta_pl_sugerida(conteudo: bytes):
+    """
+    Lê I050 / I150 / I155 / I355 para sugerir a conta PL
+    sem processar o arquivo completo.
+    Grava resultado no st.session_state.
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+
+    contas_pl_candidatas = []
+    saldos_i355          = {}
+    mapa_nome_cta        = {}
+    i155_por_periodo     = {}
+    periodo_atual_idx    = -1
+
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha: continue
+        campos = _split_pipe(linha)
+        if not campos: continue
+        reg = campos[0]
+
+        if reg == "I050":
+            if len(campos) < 6: continue
+            cod_nat  = _campo(campos, 2).strip()
+            ind_cta  = _campo(campos, 3).strip().upper()
+            cod_cta  = _campo(campos, 5).strip()
+            nome_cta = _campo(campos, 7).strip() if len(campos) > 7 else ""
+            if not cod_cta: continue
+            mapa_nome_cta[cod_cta] = nome_cta
+            eh_nat  = cod_nat in ("05", "09", "5", "9")
+            nome_up = nome_cta.upper()
+            eh_nome = any(p in nome_up for p in (
+                "SUPERAVIT","DÉFICIT","DEFICIT","RESULTADO",
+                "LUCRO","PREJUIZO","PREJUÍZO","SOBRA","PERDA",
+                "SURPLUS","RESULTADO DO EXERC","LUCROS OU PREJUIZ",
+            ))
+            if ind_cta == "A" and (eh_nat or eh_nome):
+                contas_pl_candidatas.append({
+                    "cod_cta":  cod_cta,
+                    "nome":     nome_cta,
+                    "cod_nat":  cod_nat,
+                    "cod_sup":  _campo(campos, 6).strip() if len(campos) > 6 else "",
+                    "criterio": "COD_NAT" if eh_nat else "NOME",
+                })
+
+        elif reg == "I150":
+            periodo_atual_idx += 1
+            i155_por_periodo[periodo_atual_idx] = {}
+
+        elif reg == "I155":
+            if periodo_atual_idx < 0: continue
+            cod_cta = _campo(campos, 1).strip()
+            vl_fin  = _campo(campos, 7).strip()
+            ind_dc  = _campo(campos, 8).strip().upper()
+            if not cod_cta: continue
+            if ind_dc not in ("D", "C"): ind_dc = "D"
+            try:    valor_f = _str2float(vl_fin)
+            except: valor_f = 0.0
+            i155_por_periodo[periodo_atual_idx][cod_cta] = (valor_f, ind_dc)
+
+        elif reg == "I355":
+            cod_cta = _campo(campos, 1).strip()
+            vl_cta  = _campo(campos, 3).strip()
+            ind_dc  = _campo(campos, 4).strip().upper()
+            if not cod_cta: continue
+            if ind_dc not in ("D", "C"): ind_dc = "D"
+            try:    valor_f = _str2float(vl_cta)
+            except: valor_f = 0.0
+            saldos_i355[cod_cta] = (valor_f, ind_dc)
+
+    saldos_i155_raw = {}
+    if i155_por_periodo:
+        ultimo_idx      = max(i155_por_periodo.keys())
+        saldos_i155_raw = i155_por_periodo[ultimo_idx]
+
+    total_rec     = sum(v for v, dc in saldos_i355.values() if dc == "C")
+    total_des     = sum(v for v, dc in saldos_i355.values() if dc == "D")
+    resultado_liq = round(abs(total_rec - total_des), 2)
+
+    log_tmp  = []
+    sugerida = _sugerir_conta_pl_v4(
+        contas_pl_candidatas, saldos_i155_raw, resultado_liq, log_tmp
+    )
+    if sugerida:
+        st.session_state["conta_pl_sugerida"]      = sugerida
+        st.session_state["conta_pl_sugerida_nome"] = mapa_nome_cta.get(sugerida, "")
+
+
+# ── 2. _pre_scan_posicional ───────────────────────────────────────────────────
+def _pre_scan_posicional(conteudo: bytes) -> list:
+    """
+    Varre rapidamente o TXT posicional e retorna lista de filiais detectadas.
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+
+    filiais = set()
+    for linha in texto.splitlines():
+        s = linha.rstrip("\r\n")
+        if len(s) >= 20 and s[:2] in ("01", "02", "03"):
+            try:
+                filial = s[2:6].strip()
+                if filial and filial.isdigit():
+                    filiais.add(filial)
+            except Exception:
+                pass
+    return sorted(filiais)
+
+
+# ── 3. _widget_de_para_filiais ────────────────────────────────────────────────
+def _widget_de_para_filiais(ativo: bool, filiais: list) -> dict:
+    """
+    Renderiza o widget de DE/PARA de filiais.
+    Retorna dict {cod_origem: cod_destino}.
+    """
+    if not ativo or not filiais:
+        return {}
+
+    st.markdown(
+        "<div class='filial-box'>"
+        "<b style='color:#6EC6FF;'>🏢 DE/PARA de Filiais</b><br>"
+        "<small style='color:#8AAAC8;'>Mapeie os códigos de filial do arquivo "
+        "para os códigos do sistema destino.</small>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    mapa = {}
+    cols = st.columns(min(len(filiais), 4))
+    for i, filial in enumerate(filiais):
+        with cols[i % len(cols)]:
+            destino = st.text_input(
+                f"Filial {filial} →",
+                value=filial,
+                key=f"depara_filial_{filial}",
+                max_chars=10,
+            )
+            if destino and destino != filial:
+                mapa[filial] = destino
+    return mapa
+
+
+# ── 4. detectar_cabecalho_excel ───────────────────────────────────────────────
+def detectar_cabecalho_excel(conteudo: bytes, sheet: str) -> tuple:
+    """
+    Detecta automaticamente a linha do cabeçalho em um Excel.
+    Retorna (linha_idx, confianca).
+    """
+    try:
+        buf = io.BytesIO(conteudo)
+        df_raw = pd.read_excel(
+            buf, sheet_name=sheet, header=None,
+            engine="openpyxl", nrows=20
+        )
+        palavras_chave = {
+            "data", "date", "conta", "account", "valor", "value",
+            "débito", "debito", "crédito", "credito", "histórico",
+            "historico", "lote", "filial", "centro", "custo",
+            "cód", "cod", "complemento", "desc",
+        }
+        melhor_linha = 0
+        melhor_score = 0
+        for i, row in df_raw.iterrows():
+            score = sum(
+                1 for cell in row
+                if isinstance(cell, str) and
+                any(p in cell.lower() for p in palavras_chave)
+            )
+            if score > melhor_score:
+                melhor_score = score
+                melhor_linha = i
+        return melhor_linha, melhor_score
+    except Exception:
+        return 3, 0
+
+
+# ── 5. ler_excel_lote ─────────────────────────────────────────────────────────
+def ler_excel_lote(conteudo: bytes, sheet: str, linha_header: int) -> tuple:
+    """
+    Lê o Excel e normaliza as colunas para o padrão interno.
+    Retorna (DataFrame, lista_colunas_encontradas).
+    """
+    buf = io.BytesIO(conteudo)
+    df  = pd.read_excel(
+        buf, sheet_name=sheet, header=linha_header,
+        engine="openpyxl", dtype=str
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # Normalização de nomes de coluna
+    mapa_cols = {}
+    for col in df.columns:
+        col_low = col.lower().strip()
+        if any(p in col_low for p in ("data",)):
+            mapa_cols[col] = "Data"
+        elif any(p in col_low for p in ("déb", "deb", "conta deb")):
+            mapa_cols[col] = "Cód. Conta Debito"
+        elif any(p in col_low for p in ("créd", "cred", "conta cred")):
+            mapa_cols[col] = "Cód. Conta Credito"
+        elif any(p in col_low for p in ("valor",)):
+            mapa_cols[col] = "Valor"
+        elif any(p in col_low for p in ("histórico", "historico", "hist", "complemento")):
+            mapa_cols[col] = "Complemento Histórico"
+        elif any(p in col_low for p in ("lote", "inicia")):
+            mapa_cols[col] = "Inicia Lote"
+        elif any(p in col_low for p in ("filial", "matriz")):
+            mapa_cols[col] = "Código Matriz/Filial"
+        elif any(p in col_low for p in ("cc deb", "custo deb", "centro deb")):
+            mapa_cols[col] = "Centro de Custo Débito"
+        elif any(p in col_low for p in ("cc cred", "custo cred", "centro cred")):
+            mapa_cols[col] = "Centro de Custo Crédito"
+        elif any(p in col_low for p in ("cód. hist", "cod hist", "código hist")):
+            mapa_cols[col] = "Cód. Histórico"
+
+    df = df.rename(columns=mapa_cols)
+    colunas_encontradas = [c for c in COLS_PADRAO if c in df.columns]
+    for col in COLS_PADRAO:
+        if col not in df.columns:
+            df[col] = ""
+    return df, colunas_encontradas
+
+
+# ── 6. montar_lotes_excel ─────────────────────────────────────────────────────
+def montar_lotes_excel(df: pd.DataFrame) -> tuple:
+    """
+    Agrupa as linhas do Excel em lotes contábeis.
+    Retorna (DataFrame com coluna _num_lote, modo_detectado).
+    """
+    df = df.copy()
+    df["_num_lote"] = 0
+    modo = "inicia_lote"
+
+    # Modo 1: coluna "Inicia Lote" explícita
+    if "Inicia Lote" in df.columns:
+        col_il = df["Inicia Lote"].fillna("").astype(str).str.strip().str.upper()
+        marcadores = col_il.isin(["S", "SIM", "X", "1", "TRUE", "LOTE"])
+        if marcadores.sum() > 0:
+            num_lote = 0
+            lotes    = []
+            for _, row in df.iterrows():
+                il = str(row.get("Inicia Lote", "")).strip().upper()
+                if il in ("S", "SIM", "X", "1", "TRUE", "LOTE"):
+                    num_lote += 1
+                lotes.append(num_lote)
+            df["_num_lote"] = lotes
+            return df, "inicia_lote"
+
+    # Modo 2: agrupamento por data + filial (cada linha = um lote simples)
+    modo = "linha_a_linha"
+    df["_num_lote"] = range(1, len(df) + 1)
+    return df, modo
+
+
+# ── 7. _ordenar_lotes_por_data_filial ────────────────────────────────────────
+def _ordenar_lotes_por_data_filial(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ordena o DataFrame por Data e depois por Filial.
+    """
+    df = df.copy()
+    if "Data" in df.columns:
+        df["_data_ord"] = pd.to_datetime(
+            df["Data"].fillna("").astype(str).str.strip(),
+            dayfirst=True, errors="coerce"
+        )
+        filial_col = "Código Matriz/Filial" if "Código Matriz/Filial" in df.columns else None
+        sort_cols  = ["_data_ord"]
+        if filial_col:
+            sort_cols.append(filial_col)
+        sort_cols.append("_num_lote")
+        df = df.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+        df = df.drop(columns=["_data_ord"])
+    return df
+
+
+# ── 8. _pre_scan_filiais_excel ────────────────────────────────────────────────
+def _pre_scan_filiais_excel(df: pd.DataFrame) -> list:
+    """
+    Extrai a lista de filiais únicas de um DataFrame Excel.
+    """
+    col = "Código Matriz/Filial"
+    if col not in df.columns:
+        return []
+    filiais = (
+        df[col].dropna().astype(str).str.strip()
+        .replace("", pd.NA).dropna().unique().tolist()
+    )
+    return sorted(set(f for f in filiais if f and f.lower() not in ("nan", "")))
+
+
+# ── 9. processar_excel ────────────────────────────────────────────────────────
+def processar_excel(df: pd.DataFrame, ni: str,
+                    mapa_filiais: dict, gerar_6110: bool,
+                    log: list) -> tuple:
+    """
+    Converte um DataFrame Excel no leiaute 6000/6100.
+    Retorna (bytes, resumo_list, erros_list).
+    """
+    buf    = io.StringIO()
+    resumo = []
+    erros  = []
+
+    buf.write(fmt_reg_0000(ni) + "\n")
+
+    lotes_ids = sorted(df["_num_lote"].unique())
+    for num_lote in lotes_ids:
+        grupo = df[df["_num_lote"] == num_lote].copy()
+        if grupo.empty: continue
+
+        linhas_lote = []
+        erros_lote  = []
+
+        # Filtra linhas válidas
+        for _, row in grupo.iterrows():
+            data  = str(row.get("Data", "")).strip()
+            deb   = str(row.get("Cód. Conta Debito", "")).strip()
+            cred  = str(row.get("Cód. Conta Credito", "")).strip()
+            valor = str(row.get("Valor", "")).strip()
+            hist  = _norm_hist(str(row.get("Complemento Histórico", "")))
+            filial = str(row.get("Código Matriz/Filial", "")).strip()
+            cc_deb  = str(row.get("Centro de Custo Débito", "")).strip()
+            cc_cred = str(row.get("Centro de Custo Crédito", "")).strip()
+
+            # Aplica DE/PARA de filiais
+            if mapa_filiais and filial in mapa_filiais:
+                filial = mapa_filiais[filial]
+
+            # Valida
+            if not data or not valor:
+                erros_lote.append(f"Lote {num_lote}: data/valor vazio")
+                continue
+
+            try:
+                val_f = _str2float(valor)
+            except Exception:
+                erros_lote.append(f"Lote {num_lote}: valor inválido '{valor}'")
+                continue
+
+            if abs(val_f) < 1e-6: continue
+
+            data_fmt = ""
+            try:
+                data_fmt = pd.to_datetime(data, dayfirst=True).strftime("%d/%m/%Y")
+            except Exception:
+                data_fmt = data
+
+            # Limpa contas
+            deb_arr  = limpar_contas_vec(pd.Series([deb]))
+            cred_arr = limpar_contas_vec(pd.Series([cred]))
+            deb_c    = deb_arr[0]
+            cred_c   = cred_arr[0]
+
+            linhas_lote.append({
+                "data": data_fmt, "deb": deb_c, "cred": cred_c,
+                "valor": val_f, "hist": hist, "filial": filial,
+                "cc_deb": cc_deb, "cc_cred": cc_cred,
+            })
+
+        if not linhas_lote:
+            if erros_lote:
+                erros.extend(erros_lote)
+            continue
+
+        # Determina tipo do lote
+        n_deb  = sum(1 for l in linhas_lote if l["deb"])
+        n_cred = sum(1 for l in linhas_lote if l["cred"])
+        if   n_deb == 1 and n_cred == 1: tp = "X"
+        elif n_deb == 1 and n_cred > 1:  tp = "D"
+        elif n_deb > 1  and n_cred == 1: tp = "C"
+        else:                             tp = "V"
+
+        buf.write(fmt_reg_6000(tp) + "\n")
+
+        for l in linhas_lote:
+            linha_6100 = fmt_reg_6100(
+                l["data"], l["deb"], l["cred"], l["valor"], "", l["hist"]
+            )
+            buf.write(linha_6100 + "\n")
+
+            if gerar_6110:
+                if l["deb"] and l["cred"]: modo_6110 = "ambos"
+                elif l["deb"]:             modo_6110 = "deb"
+                else:                      modo_6110 = "cred"
+                val_fmt = _fmt_valor_layout(l["valor"])
+                for l6110 in _gerar_6110_linha(l["deb"], l["cred"], val_fmt, modo_6110):
+                    buf.write(l6110 + "\n")
+
+        resumo.append({
+            "lote":    num_lote,
+            "linhas":  len(linhas_lote),
+            "tipo":    tp,
+            "data":    linhas_lote[0]["data"] if linhas_lote else "",
+            "filial":  linhas_lote[0]["filial"] if linhas_lote else "",
+        })
+        if erros_lote:
+            erros.extend(erros_lote)
+
+    resultado = buf.getvalue().encode("utf-8-sig")
+    del buf
+    return resultado, resumo, erros
+
+
+# ── 10. processar_streaming ───────────────────────────────────────────────────
+def processar_streaming(conteudo: bytes, ni: str,
+                         log: list) -> tuple:
+    """
+    Processa TXT separado por ';' em modo streaming (linha a linha).
+    Retorna (bytes, resumo, erros, total_linhas, ignoradas, encoding).
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+
+    buf      = io.StringIO()
+    resumo   = []
+    erros    = []
+    ignoradas = 0
+    total_linhas = 0
+
+    buf.write(fmt_reg_0000(ni) + "\n")
+
+    lote_atual   = []
+    num_lote     = 0
+    dentro_lote  = False
+
+    def _flush_lote(lote, num):
+        if not lote: return
+        n_deb  = sum(1 for l in lote if l.get("deb"))
+        n_cred = sum(1 for l in lote if l.get("cred"))
+        if   n_deb == 1 and n_cred == 1: tp = "X"
+        elif n_deb == 1 and n_cred > 1:  tp = "D"
+        elif n_deb > 1  and n_cred == 1: tp = "C"
+        else:                             tp = "V"
+        buf.write(fmt_reg_6000(tp) + "\n")
+        for l in lote:
+            buf.write(fmt_reg_6100(
+                l["data"], l.get("deb",""), l.get("cred",""),
+                l["valor"], "", l.get("hist","")
+            ) + "\n")
+        resumo.append({"lote": num, "linhas": len(lote), "tipo": tp})
+
+    for linha in texto.splitlines():
+        total_linhas += 1
+        linha = linha.strip()
+        if not linha or linha.startswith("#"): continue
+
+        partes = [p.strip() for p in linha.split(";")]
+        if len(partes) < 4:
+            ignoradas += 1
+            continue
+
+        data  = partes[0]
+        deb   = partes[1]
+        cred  = partes[2]
+        valor = partes[3]
+        hist  = partes[4] if len(partes) > 4 else ""
+        inicia = partes[6].upper() if len(partes) > 6 else ""
+
+        try:    val_f = _str2float(valor)
+        except: val_f = 0.0
+
+        if abs(val_f) < 1e-6:
+            ignoradas += 1
+            continue
+
+        try:
+            data_fmt = pd.to_datetime(data, dayfirst=True).strftime("%d/%m/%Y")
+        except Exception:
+            data_fmt = data
+
+        deb_arr  = limpar_contas_vec(pd.Series([deb]))
+        cred_arr = limpar_contas_vec(pd.Series([cred]))
+
+        registro = {
+            "data":  data_fmt,
+            "deb":   deb_arr[0],
+            "cred":  cred_arr[0],
+            "valor": val_f,
+            "hist":  _norm_hist(hist),
+        }
+
+        if inicia in ("S", "SIM", "X", "1", "LOTE") or not dentro_lote:
+            if lote_atual:
+                _flush_lote(lote_atual, num_lote)
+            num_lote    += 1
+            lote_atual   = [registro]
+            dentro_lote  = True
+        else:
+            lote_atual.append(registro)
+
+    if lote_atual:
+        _flush_lote(lote_atual, num_lote)
+
+    resultado = buf.getvalue().encode("utf-8-sig")
+    del buf
+    log.append(f"  Encoding           : {enc}")
+    log.append(f"  Total linhas       : {total_linhas:,}")
+    log.append(f"  Ignoradas          : {ignoradas:,}")
+    log.append(f"  Lotes gerados      : {len(resumo):,}")
+    return resultado, resumo, erros, total_linhas, ignoradas, enc
+
+
+# ── 11. processar_dominio_posicional ─────────────────────────────────────────
+def processar_dominio_posicional(conteudo: bytes, ni: str,
+                                  gerar_6110: bool,
+                                  usar_de_para: bool,
+                                  mapa_filiais: dict,
+                                  log: list,
+                                  prog_bar, status) -> tuple:
+    """
+    Converte TXT posicional Domínio para leiaute 6000/6100.
+    Retorna (bytes, metricas, erros, filiais_encontradas).
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+
+    linhas_txt   = texto.splitlines()
+    buf          = io.StringIO()
+    erros        = []
+    resumo       = []
+    filiais_enc  = set()
+    num_lote     = 0
+    lote_atual   = []
+    total_linhas = len(linhas_txt)
+
+    buf.write(fmt_reg_0000(ni) + "\n")
+
+    def _flush(lote, num):
+        if not lote: return
+        n_deb  = sum(1 for l in lote if l.get("deb"))
+        n_cred = sum(1 for l in lote if l.get("cred"))
+        if   n_deb == 1 and n_cred == 1: tp = "X"
+        elif n_deb == 1 and n_cred > 1:  tp = "D"
+        elif n_deb > 1  and n_cred == 1: tp = "C"
+        else:                             tp = "V"
+        buf.write(fmt_reg_6000(tp) + "\n")
+        for l in lote:
+            buf.write(fmt_reg_6100(
+                l["data"], l.get("deb",""), l.get("cred",""),
+                l["valor"], "", l.get("hist","")
+            ) + "\n")
+            if gerar_6110:
+                vf = _fmt_valor_layout(l["valor"])
+                if l.get("deb") and l.get("cred"): modo = "ambos"
+                elif l.get("deb"):                  modo = "deb"
+                else:                               modo = "cred"
+                for l6110 in _gerar_6110_linha(l.get("deb",""), l.get("cred",""), vf, modo):
+                    buf.write(l6110 + "\n")
+        resumo.append({"lote": num, "linhas": len(lote), "tipo": tp})
+
+    for idx, linha in enumerate(linhas_txt):
+        if idx % 5000 == 0:
+            pct = min(10 + int((idx / max(total_linhas, 1)) * 80), 90)
+            prog_bar.progress(pct)
+            status.text(f"Processando linha {idx:,}/{total_linhas:,}...")
+
+        s = linha.rstrip("\r\n")
+        if not s: continue
+        tp_reg = s[:2] if len(s) >= 2 else ""
+
+        if tp_reg == "01":
+            # Cabeçalho de lote
+            if lote_atual:
+                _flush(lote_atual, num_lote)
+                lote_atual = []
+            num_lote += 1
+
+        elif tp_reg == "02":
+            # Partida
+            if len(s) < 54: continue
+            try:
+                filial = s[2:6].strip()
+                filiais_enc.add(filial)
+                if usar_de_para and mapa_filiais and filial in mapa_filiais:
+                    filial = mapa_filiais[filial]
+
+                data_raw = s[6:14].strip()
+                try:
+                    data_fmt = datetime.strptime(data_raw, "%d%m%Y").strftime("%d/%m/%Y")
+                except Exception:
+                    data_fmt = data_raw
+
+                deb_raw  = s[14:28].strip()
+                cred_raw = s[28:42].strip()
+                val_raw  = s[42:54].strip()
+
+                deb_arr  = limpar_contas_vec(pd.Series([deb_raw]))
+                cred_arr = limpar_contas_vec(pd.Series([cred_raw]))
+
+                try:    val_f = _str2float(val_raw) / 100
+                except: val_f = 0.0
+
+                hist = _norm_hist(s[54:].strip() if len(s) > 54 else "")
+
+                lote_atual.append({
+                    "data":   data_fmt,
+                    "deb":    deb_arr[0],
+                    "cred":   cred_arr[0],
+                    "valor":  val_f,
+                    "hist":   hist,
+                    "filial": filial,
+                })
+            except Exception as ex:
+                erros.append({
+                    "linha": idx + 1, "motivo": str(ex), "conteudo": s
+                })
+
+    if lote_atual:
+        _flush(lote_atual, num_lote)
+
+    resultado = buf.getvalue().encode("utf-8-sig")
+    del buf
+
+    n6000 = resultado.count(b"|6000|")
+    n6100 = resultado.count(b"|6100|")
+    n6110 = resultado.count(b"|6110|")
+    metricas = {
+        "Lotes gerados":  f"{len(resumo):,}",
+        "Reg. 6000":      f"{n6000:,}",
+        "Reg. 6100":      f"{n6100:,}",
+        "Reg. 6110":      f"{n6110:,}" if gerar_6110 else "—",
+        "Filiais":        f"{len(filiais_enc):,}",
+        "Tamanho saída":  f"{len(resultado)/1024:.1f} KB",
+    }
+    log.append(f"  Encoding           : {enc}")
+    log.append(f"  Lotes gerados      : {len(resumo):,}")
+    log.append(f"  Filiais detectadas : {sorted(filiais_enc)}")
+    if erros: log.append(f"  Erros              : {len(erros):,}")
+
+    prog_bar.progress(95)
+    return resultado, metricas, erros, sorted(filiais_enc)
+
+
+# ── 12. processar_saldo_inicial_ecd (legado V3.6.2) ──────────────────────────
+def processar_saldo_inicial_ecd(conteudo: bytes, ni: str,
+                                 hist_prefixo: str,
+                                 modo_resultado: str,
+                                 conta_pl: str,
+                                 log: list,
+                                 prog_bar, status) -> tuple:
+    """
+    Wrapper legado — chama o parse unificado e depois _gerar_saldo_inicial_v4.
+    Retorna (bytes, metricas_dict, erros_list).
+    """
+    status.text("Lendo SPED ECD...")
+    prog_bar.progress(10)
+    log.append("── PARSE ECD (saldo inicial legado) ──")
+
+    ecd, saldos_dict, erros_parse = _parse_ecd_completo(conteudo, log)
+    if ecd is None:
+        return b"", {}, erros_parse
+
+    prog_bar.progress(40)
+    status.text("Gerando saldo inicial...")
+    log.append("── GERAÇÃO SALDO INICIAL ──")
+
+    sd_si = dict(saldos_dict)
+    sd_si["data_ref"] = _normalizar_data_ecd(ecd.dt_ini)
+
+    bytes_si, resumo, erros_si = _gerar_saldo_inicial_v4(
+        sd_si, ni, hist_prefixo, modo_resultado, conta_pl, log
+    )
+    prog_bar.progress(90)
+    status.text("Concluído!")
+
+    metricas = {
+        "Data referência":   resumo.get("data", ""),
+        "Contas I155":       f"{resumo.get('contas_i155', 0):,}",
+        "Contas I355":       f"{resumo.get('contas_i355', 0):,}",
+        "Reg. 6100 gerados": f"{resumo.get('n6100', 0):,}",
+        "Total Débito":      format_moeda(resumo.get("total_debito", 0)),
+        "Total Crédito":     format_moeda(resumo.get("total_credito", 0)),
+        "Diferença":         format_moeda(resumo.get("diferenca", 0)),
+        "Balanceado":        "✅ SIM" if resumo.get("balanceado") else "⚠ NÃO",
+        "Modo":              resumo.get("modo", ""),
+        "Tamanho saída":     f"{len(bytes_si)/1024:.1f} KB",
+    }
+    todos_erros = erros_parse + erros_si
+    prog_bar.progress(100)
+    return bytes_si, metricas, todos_erros
+
+
+# ── 13. _montar_log_lote ──────────────────────────────────────────────────────
+def _montar_log_lote(resumo: list, erros: list, ni: str,
+                      ti: str, inf: str, n_gravados: int,
+                      ignoradas: int, enc_usado: str,
+                      crono: Cronometro) -> str:
+    linhas = [
+        "=" * 60,
+        f"LOG DE CONVERSÃO — {ts_log()}",
+        f"CNPJ/CPF : {inf} ({ti})",
+        f"NI       : {ni}",
+        f"Encoding : {enc_usado}",
+        "=" * 60,
+        f"Lotes processados : {len(resumo):,}",
+        f"Lotes com erro    : {len(erros):,}",
+        f"Reg. 6000 gerados : {n_gravados:,}",
+        f"Linhas ignoradas  : {ignoradas:,}",
+        "",
+    ]
+    if erros:
+        linhas.append("── ERROS ──")
+        for e in erros[:50]:
+            linhas.append(f"  {e}")
+        if len(erros) > 50:
+            linhas.append(f"  ... e mais {len(erros)-50} erros")
+        linhas.append("")
+
+    linhas.append("── TEMPOS ──")
+    for e in crono.etapas:
+        linhas.append(f"  {e['nome']:<28} {Cronometro.fmt(e['segundos'])}")
+    linhas += ["=" * 60, "FIM DO LOG"]
+    return "\n".join(linhas)
+
+
+# ── 14. _render_resultados_lote ───────────────────────────────────────────────
+def _render_resultados_lote(exibir_log: bool):
+    st.markdown("---")
+    st.markdown("## 📦 Resultado — Lançamentos")
+
+    resultado_bytes = st.session_state.get("resultado_bytes")
+    metricas        = st.session_state.get("metricas", {})
+    resumo          = st.session_state.get("resumo", [])
+    erros_lote      = st.session_state.get("erros_lote", [])
+    log_linhas      = st.session_state.get("log_linhas", [])
+
+    if not resultado_bytes:
+        st.warning("Nenhum resultado disponível.")
+        return
+
+    # Métricas
+    if metricas:
+        cols = st.columns(min(len(metricas), 4))
+        for i, (k, v) in enumerate(metricas.items()):
+            cols[i % len(cols)].metric(k, v)
+
+    # Alertas
+    if erros_lote:
+        st.warning(f"⚠ {len(erros_lote)} lote(s) com problemas.")
+
+    # Download principal
+    st.download_button(
+        "⬇ Baixar arquivo de lançamentos",
+        data=resultado_bytes,
+        file_name=st.session_state.get("resultado_nome", "lancamentos.txt"),
+        mime="text/plain",
+        use_container_width=True,
+        key="dl_resultado_lote",
+    )
+
+    # Download log
+    if st.session_state.get("log_bytes"):
+        st.download_button(
+            "⬇ Baixar log de conversão",
+            data=st.session_state.log_bytes,
+            file_name=st.session_state.get("log_nome", "log.txt"),
+            mime="text/plain",
+            use_container_width=True,
+            key="dl_log_lote",
+        )
+
+    # Log na tela
+    if exibir_log and log_linhas:
+        st.markdown("### 🖥 Log")
+        log_txt = "\n".join(str(l) for l in log_linhas)
+        st.markdown(
+            f"<div class='bloco-log'>{log_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ── 15. _render_resultados_saldo_inicial ─────────────────────────────────────
+def _render_resultados_saldo_inicial(exibir_log: bool):
+    st.markdown("---")
+    st.markdown("## 📦 Resultado — Saldo Inicial")
+
+    resultado_bytes = st.session_state.get("resultado_bytes")
+    metricas        = st.session_state.get("metricas", {})
+    log_linhas      = st.session_state.get("log_linhas", [])
+
+    if not resultado_bytes:
+        st.warning("Nenhum resultado disponível.")
+        return
+
+    if metricas:
+        bal = metricas.get("Balanceado", "")
+        if "NÃO" in str(bal):
+            st.error(f"⚠ Lançamento desbalanceado! Diferença: {metricas.get('Diferença','')}")
+        else:
+            st.success("✅ Lançamento balanceado (D = C)")
+
+        cols = st.columns(min(len(metricas), 4))
+        for i, (k, v) in enumerate(metricas.items()):
+            cols[i % len(cols)].metric(k, str(v))
+
+    st.download_button(
+        "⬇ Baixar Saldo Inicial",
+        data=resultado_bytes,
+        file_name=st.session_state.get("resultado_nome", "saldo_inicial.txt"),
+        mime="text/plain",
+        use_container_width=True,
+        key="dl_resultado_si",
+    )
+
+    if st.session_state.get("erros_bytes"):
+        st.download_button(
+            "⬇ Baixar relatório de erros",
+            data=st.session_state.erros_bytes,
+            file_name=st.session_state.get("erros_nome", "erros.txt"),
+            mime="text/plain",
+            use_container_width=True,
+            key="dl_erros_si",
+        )
+
+    if exibir_log and log_linhas:
+        st.markdown("### 🖥 Log")
+        log_txt = "\n".join(str(l) for l in log_linhas)
+        st.markdown(
+            f"<div class='bloco-log'>{log_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ── 16. _render_resultados_posicional ────────────────────────────────────────
+def _render_resultados_posicional(exibir_log: bool):
+    st.markdown("---")
+    st.markdown("## 📦 Resultado — TXT Posicional Domínio")
+
+    resultado_bytes = st.session_state.get("resultado_bytes")
+    metricas        = st.session_state.get("metricas", {})
+    log_linhas      = st.session_state.get("log_linhas", [])
+
+    if not resultado_bytes:
+        st.warning("Nenhum resultado disponível.")
+        return
+
+    if metricas:
+        cols = st.columns(min(len(metricas), 4))
+        for i, (k, v) in enumerate(metricas.items()):
+            cols[i % len(cols)].metric(k, str(v))
+
+    st.download_button(
+        "⬇ Baixar arquivo convertido",
+        data=resultado_bytes,
+        file_name=st.session_state.get("resultado_nome", "posicional_convertido.txt"),
+        mime="text/plain",
+        use_container_width=True,
+        key="dl_resultado_pos",
+    )
+
+    if st.session_state.get("erros_bytes"):
+        st.download_button(
+            "⬇ Baixar relatório de erros",
+            data=st.session_state.erros_bytes,
+            file_name=st.session_state.get("erros_nome", "erros.txt"),
+            mime="text/plain",
+            use_container_width=True,
+            key="dl_erros_pos",
+        )
+
+    if exibir_log and log_linhas:
+        st.markdown("### 🖥 Log")
+        log_txt = "\n".join(str(l) for l in log_linhas)
+        st.markdown(
+            f"<div class='bloco-log'>{log_txt}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ── 17. _parse_i052_completo ──────────────────────────────────────────────────
+def _parse_i052_completo(conteudo: bytes, log: list) -> dict:
+    """
+    Extrai registros I052 + saldos I155 de um SPED ECD.
+    Retorna dict com cnpj, nome, periodo, mapa_i052, saldos_ini, saldos_fin.
+    """
+    enc = _detectar_encoding_bytes(conteudo)
+    try:    texto = conteudo.decode(enc, errors="replace")
+    except: texto = conteudo.decode("utf-8", errors="replace")
+
+    cnpj = nome = dt_ini = dt_fin = ""
+    mapa_i052   = {}   # cod_cta → cod_agl
+    saldos_ini  = {}   # cod_cta → (val_float, dc)
+    saldos_fin  = {}   # cod_cta → (val_float, dc)
+    i155_periodos = {}
+    periodo_idx   = -1
+    rtl_i150      = 0
+
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha: continue
+        campos = _split_pipe(linha)
+        if not campos: continue
+        reg = campos[0]
+
+        if reg == "0000":
+            if len(campos) > 5: cnpj   = re.sub(r"\D", "", campos[5].strip())
+            if len(campos) > 6: nome   = campos[6].strip()
+            if len(campos) > 3: dt_ini = campos[3].strip()
+            if len(campos) > 4: dt_fin = campos[4].strip()
+
+        elif reg == "I052":
+            cod_cta = _campo(campos, 1).strip()
+            cod_agl = _campo(campos, 2).strip()
+            if cod_cta and cod_agl:
+                mapa_i052[cod_cta] = cod_agl
+
+        elif reg == "I150":
+            rtl_i150 += 1
+            periodo_idx += 1
+            i155_periodos[periodo_idx] = {}
+
+        elif reg == "I155":
+            if periodo_idx < 0: continue
+            cod_cta = _campo(campos, 1).strip()
+            val_ini = _campo(campos, 4).strip()
+            dc_ini  = _campo(campos, 5).strip().upper()
+            val_fin = _campo(campos, 7).strip()
+            dc_fin  = _campo(campos, 8).strip().upper()
+            if not cod_cta: continue
+            if dc_ini not in ("D","C"): dc_ini = "D"
+            if dc_fin not in ("D","C"): dc_fin = "D"
+            try:    vi = _str2float(val_ini)
+            except: vi = 0.0
+            try:    vf = _str2float(val_fin)
+            except: vf = 0.0
+            if cod_cta not in saldos_ini and rtl_i150 <= 1:
+                saldos_ini[cod_cta] = (vi, dc_ini)
+            saldos_fin[cod_cta] = (vf, dc_fin)
+
+    log.append(f"  CNPJ               : {cnpj}")
+    log.append(f"  Nome               : {nome}")
+    log.append(f"  Período            : {_normalizar_data_ecd(dt_ini)} a {_normalizar_data_ecd(dt_fin)}")
+    log.append(f"  Registros I052     : {len(mapa_i052):,}")
+    log.append(f"  Saldos I155        : {len(saldos_fin):,}")
+
+    return {
+        "cnpj": cnpj, "nome": nome,
+        "dt_ini": dt_ini, "dt_fin": dt_fin,
+        "mapa_i052": mapa_i052,
+        "saldos_ini": saldos_ini,
+        "saldos_fin": saldos_fin,
+    }
+
+
+# ── 18. _comparar_i052 ────────────────────────────────────────────────────────
+def _comparar_i052(ant: dict, atu: dict) -> dict:
+    """
+    Compara os I052 de dois ECDs.
+    Retorna dict com listas: iguais, divergentes, novos, removidos, mudou_grupo.
+    """
+    mapa_ant = ant.get("mapa_i052", {})
+    mapa_atu = atu.get("mapa_i052", {})
+    sal_fin_ant = ant.get("saldos_fin", {})
+    sal_ini_atu = atu.get("saldos_ini", {})
+
+    todas_contas = set(mapa_ant) | set(mapa_atu)
+    iguais = []; divergentes = []; novos = []; removidos = []; mudou_grupo = []
+
+    for cta in sorted(todas_contas):
+        em_ant = cta in mapa_ant
+        em_atu = cta in mapa_atu
+        agl_ant = mapa_ant.get(cta, "")
+        agl_atu = mapa_atu.get(cta, "")
+        sf_ant  = sal_fin_ant.get(cta, (0.0, "D"))
+        si_atu  = sal_ini_atu.get(cta, (0.0, "D"))
+
+        if em_ant and em_atu:
+            if agl_ant == agl_atu:
+                diff = round(abs(sf_ant[0] - si_atu[0]), 2)
+                iguais.append({
+                    "conta": cta, "agl": agl_atu,
+                    "sf_ant": sf_ant, "si_atu": si_atu, "diff": diff,
+                })
+            else:
+                mudou_grupo.append({
+                    "conta": cta,
+                    "agl_ant": agl_ant, "agl_atu": agl_atu,
+                    "sf_ant": sf_ant, "si_atu": si_atu,
+                })
+        elif em_ant and not em_atu:
+            removidos.append({"conta": cta, "agl": agl_ant, "sf_ant": sf_ant})
+        elif not em_ant and em_atu:
+            novos.append({"conta": cta, "agl": agl_atu, "si_atu": si_atu})
+
+    divergentes = [i for i in iguais if i["diff"] > 0.01]
+    iguais      = [i for i in iguais if i["diff"] <= 0.01]
+
+    return {
+        "iguais":      iguais,
+        "divergentes": divergentes,
+        "novos":       novos,
+        "removidos":   removidos,
+        "mudou_grupo": mudou_grupo,
+    }
+
+
+# ── 19. _render_comparacao_i052 ───────────────────────────────────────────────
+def _render_comparacao_i052(resultado: dict,
+                              label_ant: str, label_atu: str,
+                              parsed_ant: dict, parsed_atu: dict):
+    """Renderiza o resultado da comparação I052."""
+    st.markdown("---")
+    st.markdown("### 📊 Resultado da Comparação")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("✅ Iguais",       len(resultado["iguais"]))
+    col2.metric("⚠ Divergentes",  len(resultado["divergentes"]), delta_color="inverse")
+    col3.metric("🆕 Novos",        len(resultado["novos"]))
+    col4.metric("🗑 Removidos",    len(resultado["removidos"]), delta_color="inverse")
+    col5.metric("🔀 Mudou Grupo",  len(resultado["mudou_grupo"]), delta_color="inverse")
+
+    if resultado["divergentes"]:
+        st.markdown("#### ⚠ Contas com Saldo Divergente (Fin. Anterior ≠ Ini. Atual)")
+        rows = []
+        for r in resultado["divergentes"]:
+            sf_v, sf_dc = r["sf_ant"]
+            si_v, si_dc = r["si_atu"]
+            rows.append({
+                "Conta":       r["conta"],
+                "COD_AGL":     r["agl"],
+                "SF Anterior": f"{format_moeda(sf_v)} {sf_dc}",
+                "SI Atual":    f"{format_moeda(si_v)} {si_dc}",
+                "Diferença":   format_moeda(r["diff"]),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    if resultado["mudou_grupo"]:
+        st.markdown("#### 🔀 Contas que Mudaram de Grupo (COD_AGL)")
+        rows = []
+        for r in resultado["mudou_grupo"]:
+            rows.append({
+                "Conta":     r["conta"],
+                "AGL Ant.":  r["agl_ant"],
+                "AGL Atu.":  r["agl_atu"],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    if resultado["novos"]:
+        st.markdown("#### 🆕 Contas Novas (só no atual)")
+        rows = [{"Conta": r["conta"], "COD_AGL": r["agl"]} for r in resultado["novos"]]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    if resultado["removidos"]:
+        st.markdown("#### 🗑 Contas Removidas (só no anterior)")
+        rows = [{"Conta": r["conta"], "COD_AGL": r["agl"]} for r in resultado["removidos"]]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # Download CSV completo
+    todas = []
+    for r in resultado["iguais"]:
+        todas.append({"Situação":"OK","Conta":r["conta"],"AGL":r["agl"],"Diff":0})
+    for r in resultado["divergentes"]:
+        todas.append({"Situação":"DIVERGENTE","Conta":r["conta"],"AGL":r["agl"],"Diff":r["diff"]})
+    for r in resultado["mudou_grupo"]:
+        todas.append({"Situação":"MUDOU_GRUPO","Conta":r["conta"],"AGL_ANT":r["agl_ant"],"AGL_ATU":r["agl_atu"],"Diff":0})
+    for r in resultado["novos"]:
+        todas.append({"Situação":"NOVO","Conta":r["conta"],"AGL":r["agl"],"Diff":0})
+    for r in resultado["removidos"]:
+        todas.append({"Situação":"REMOVIDO","Conta":r["conta"],"AGL":r["agl"],"Diff":0})
+
+    if todas:
+        csv = pd.DataFrame(todas).to_csv(index=False, sep=";", encoding="utf-8-sig")
+        st.download_button(
+            "⬇ Baixar comparação completa (.csv)",
+            data=csv.encode("utf-8-sig"),
+            file_name="comparacao_i052.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_i052_csv",
+        )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BLOCO 5 — MAIN() UNIFICADO V4.0
 # Integra: ECD V4.0 (multi-saída) + Lote TXT + Excel + Posicional +
