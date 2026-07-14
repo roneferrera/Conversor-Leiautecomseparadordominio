@@ -1963,7 +1963,6 @@ def _init_state():
         # Modos de saída V4.0
         "modo_lancamentos":     True,
         "modo_saldo_inicial":   False,
-        "modo_saldo_final":     False,
         "modo_i157":            False,
         "modo_sped_ajustado":   False,
         "modo_6110":            False,
@@ -2552,31 +2551,6 @@ def _render_passos_ecd(conteudo: bytes, exibir_log: bool):
             if not conta_pl:
                 st.warning("⚠ Informe a conta PL para que o balanço feche (D = C).")
 
-    # ── Sub-opções Saldo Final ────────────────────────────────────────────────
-    data_ref_sf = ""; hist_prefixo_sf = "SALDO FINAL"
-    if modo_sf:
-        st.markdown("##### 📤 Opções — Saldo Final")
-        col_sf1, col_sf2 = st.columns(2)
-        with col_sf1:
-            dt_fin_ecd = ecd.dt_fin if st.session_state.get("v4_ecd") else ""
-            dt_pad_sf  = datetime.today()
-            if dt_fin_ecd:
-                try:
-                    dt_pad_sf = datetime.strptime(
-                        _normalizar_data_ecd(dt_fin_ecd), "%d/%m/%Y"
-                    )
-                except Exception:
-                    pass
-            data_sf_widget = st.date_input(
-                "Data de referência (Saldo Final):",
-                value=dt_pad_sf, format="DD/MM/YYYY", key="data_sf_v4"
-            )
-            data_ref_sf = data_sf_widget.strftime("%d/%m/%Y")
-        with col_sf2:
-            hist_prefixo_sf = st.text_input(
-                "Prefixo do histórico (Saldo Final)",
-                value="SALDO FINAL", max_chars=60, key="hist_sf_v4"
-            )
 
     # ── Validação antes de processar ──────────────────────────────────────────
     algum_modo = any([
