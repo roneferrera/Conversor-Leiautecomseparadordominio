@@ -3186,23 +3186,18 @@ def main():
 
         # ── Seção DE/PARA — renderizada independente de upload principal ──────
         st.markdown("---")
-        st.markdown(
-            "<div class='depara-box'>"
-            "<b style='color:#00E5CC;font-size:15px;'>🔀 DE/PARA — Plano de Contas SPED ECD</b><br>"
-            "<small style='color:#9BB0C8;'>Carregue o arquivo SPED ECD e o Plano de Contas "
-            "Novo na sidebar para iniciar o mapeamento de contas.</small>"
-            "</div>", unsafe_allow_html=True
-        )
         _aba_depara()
         st.markdown("---")
 
-        # ── Sem arquivo: encerra sem st.stop() (não afeta aba_i052) ──────────
+        # ── Sem arquivo: encerra sem st.stop() ────────────────────────────────
         if uploaded is None:
             st.markdown(
                 "<div class='info-box'>⬆ Selecione um arquivo para usar o Conversor.</div>",
                 unsafe_allow_html=True
             )
             return
+
+        # ... resto do fluxo normal (leitura, detecção, CNPJ, opções, conversão)
 
         # ── Leitura e detecção ────────────────────────────────────────────────
         conteudo = uploaded.read()
