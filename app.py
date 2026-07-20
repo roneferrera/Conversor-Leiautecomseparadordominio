@@ -3077,26 +3077,9 @@ def main():
     # SIDEBAR
     # ═════════════════════════════════════════════════════════════════════════
     with st.sidebar:
-        st.markdown("### ⚙ Configurações"); st.markdown("---")
-        exibir_log = st.checkbox("Exibir log de processamento", value=True)
-        st.markdown("---"); st.markdown(f"**Versão:** {VERSAO}")
-        st.markdown("**Thomson Reuters — Domínio Sistemas**"); st.markdown("---")
-        st.markdown("**Formatos suportados:**")
-        st.markdown(
-            "- 📊 Excel (.xlsx / .xls)\n"
-            "- 📄 TXT separado por `;`\n"
-            "- 📋 SPED ECD (.txt) — lançamentos\n"
-            "- 📋 SPED ECD (.txt) — saldo inicial\n"
-            "- 📋 TXT Posicional Domínio"
-        )
+        st.markdown("### ⚙ Configurações")
         st.markdown("---")
-        st.code(
-            "|0000|CNPJ|\n|6000|TIPO||||\n"
-            "|6100|DATA|DEB|CRED|VALOR||HIST||FILIAL||\n"
-            "|6110|CC_DEB|CC_CRED|VALOR|",
-            language=None
-        )
-        st.markdown(f"**Limite:** {MAX_UPLOAD_MB} MB")
+        exibir_log = st.checkbox("Exibir log de processamento", value=True)
 
         # ── Seção DE/PARA na sidebar ──────────────────────────────────────────
         ocultar_mapeadas = _sidebar_depara()
