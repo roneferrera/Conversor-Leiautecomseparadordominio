@@ -3156,18 +3156,25 @@ def main():
     # ═════════════════════════════════════════════════════════════════════════
     # ABA 1 — CONVERSOR / SALDO INICIAL / DE/PARA
     # ═════════════════════════════════════════════════════════════════════════
-    with aba_conv:
+with aba_conv:
 
-        # ── Passo 1 — Upload ──────────────────────────────────────────────────
+        # ── Passo 1 — arquivo vem da sidebar ─────────────────────────────────
         st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
-        uploaded = st.file_uploader(
-            f"Arraste ou clique (Excel, TXT separado por ';', SPED ECD ou TXT Posicional "
-            f"— máx. {MAX_UPLOAD_MB} MB)",
-            type=["xlsx", "xls", "xlsm", "txt", "csv"],
-            key="upload_principal"
-        )
 
-        # ── Seção DE/PARA — renderizada independente de upload principal ──────
+        if st.session_state.get("arquivo_bytes") is None:
+            st.markdown(
+                "<div class='info-box'>⬆ Carregue o arquivo SPED ECD na sidebar "
+                "(seção <b>DE/PARA — Plano de Contas</b>) para usar o Conversor.</div>",
+                unsafe_allow_html=True
+            )
+            # ── Seção DE/PARA — sempre visível ───────────────────────────────
+            st.markdown("---")
+            _aba_depara()
+            return
+
+        conteudo = st.session_state.arquivo_bytes
+
+        # ── Seção DE/PARA — renderizada independente ──────────────────────────
         st.markdown("---")
         _aba_depara()
         st.markdown("---")
