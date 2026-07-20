@@ -2539,521 +2539,117 @@ def _sidebar_depara():
 # ═══════════════════════════════════════════════════════════════════════════════
 # ABA DE/PARA — CONTEÚDO PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
-def _aba_depara():
-    """Renderiza todo o conteúdo da seção DE/PARA dentro da aba_conv."""
-    if not FUZZ_OK:
-        st.error("⛔ Biblioteca 'thefuzz' não instalada. Execute: pip install thefuzz python-Levenshtein")
-        return
-
-    content_sped = st.session_state.get("depara_content_sped")
-    df_novo      = st.session_state.get("depara_df_novo")
-
-    if content_sped is None or df_novo is None:
-        st.markdown(
-            "<div class='depara-box'>"
-            "<b style='color:#00E5CC;'>🔀 DE/PARA — Plano de Contas SPED ECD</b><br>"
-            "<small style='color:#9BB0C8;'>Carregue o <b>Arquivo SPED ECD</b> e o "
-            "<b>Plano de Contas Novo</b> na sidebar para iniciar o mapeamento.</small>"
-            "</div>", unsafe_allow_html=True
-        )
-        return
-
-    st.markdown(
-        "<div class='depara-box'>"
-        "<b style='color:#00E5CC;font-size:15px;'>🔀 DE/PARA — Plano de Contas SPED ECD</b><br>"
-        "<small style='color:#9BB0C8;'>Substitua os códigos antigos pelos códigos reduzidos "
-        "do novo plano com sugestão por IA (thefuzz).</small>"
-        "</div>", unsafe_allow_html=True
-    )
-
-    nome_empresa = st.session_state.get("depara_nome_empresa", "EMPRESA")
-    dt_ini_sped  = st.session_state.get("depara_dt_ini")
-    dt_fin_sped  = st.session_state.get("depara_dt_fin")
-
-    ocultar_mapeadas = st.session_state.get("chk_ocultar_mapeadas", False)
-
-    # ── Preparar plano novo ───────────────────────────────────────────────────
-    df_novo = df_novo.astype(str)
-    df_novo["Display"] = (df_novo["Código"] + " | " + df_novo["Classificação"]
-                          + " - " + df_novo["Nome"])
-    df_novo["Grupo"] = df_novo["Classificação"].str[0]
-
-    # ── Extrair saldos e contas do SPED ──────────────────────────────────────
-    initial_balances, final_balances, contas_origem_data = _extrair_saldos_sped_depara(content_sped)
-    contas_com_movimento = set(c["cod"] for c in contas_origem_data)
-
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=["cod"])
-
-    if df_origem.empty:
-        st.error("Nenhuma conta com movimento detectada no SPED.")
-        return
-
-    # ── Processar mapeamento com IA ───────────────────────────────────────────
-    total_mapeadas_count = 0
-    map_final_para_geracao = st.session_state.de_para_map.copy()
-    process_data = []
-
-    for _, row in df_origem.iterrows():
-        cod_atual   = str(row["cod"])
-        grupo_atual = row["grupo"]
-
-        df_filtrado = df_novo[df_novo["Grupo"] == grupo_atual]
-        df_busca    = df_filtrado if not df_filtrado.empty else df_novo
-        if grupo_atual in ("1", "2"):
-            df_opcoes = df_filtrado if not df_filtrado.empty else df_novo
-        else:
-            df_opcoes = df_novo[~df_novo["Grupo"].isin(["1", "2"])]
-            if df_opcoes.empty: df_opcoes = df_novo
-
-        lista_nomes = df_busca["Nome"].tolist()
-        candidatos  = fuzz_process.extract(
-            row["nome"], lista_nomes, scorer=fuzz.token_set_ratio, limit=5
-        )
-        melhor_match = None; melhor_score_final = -1
-        for nome_cand, score_flex in candidatos:
-            score_rig = fuzz.token_sort_ratio(row["nome"], nome_cand)
-            media = (score_flex + score_rig) / 2
-            if media > melhor_score_final:
-                melhor_score_final = media; melhor_match = nome_cand
-        score = int(melhor_score_final)
-
-        cod_sugerido_ia = None; display_sugerido_ia = None
-        if score >= 65 and melhor_match:
-            match_row = df_busca[df_busca["Nome"] == melhor_match]
-            if not match_row.empty:
-                cod_sugerido_ia     = match_row.iloc[0]["Código"]
-                display_sugerido_ia = match_row.iloc[0]["Display"]
-
-        esta_no_mapa  = cod_atual in st.session_state.de_para_map
-        valor_no_mapa = str(st.session_state.de_para_map.get(cod_atual, ""))
-        resolvida = False; is_manual = False
-
-        if esta_no_mapa:
-            resolvida = True
-            if valor_no_mapa != cod_sugerido_ia: is_manual = True
-        elif score >= 65:
-            resolvida = True
-            map_final_para_geracao[cod_atual] = cod_sugerido_ia
-
-        if resolvida: total_mapeadas_count += 1
-
-        process_data.append({
-            "row": row, "df_busca": df_busca, "df_opcoes": df_opcoes,
-            "score": score, "cod_sugerido_ia": cod_sugerido_ia,
-            "display_sugerido_ia": display_sugerido_ia, "resolvida": resolvida,
-            "is_manual": is_manual, "esta_no_mapa": esta_no_mapa,
-            "valor_no_mapa": valor_no_mapa,
-        })
-
-    # ── Exibição do mapeamento ────────────────────────────────────────────────
-    st.markdown("#### 🔗 Mapeamento de Contas")
-    for item in process_data:
-        row       = item["row"]
-        cod_atual = str(row["cod"])
-        if ocultar_mapeadas and item["resolvida"]: continue
-
-        with st.container():
-            col_orig, col_dest = st.columns([1, 1])
-            with col_orig:
-                st.markdown(f"**{row['nome']}**")
-                st.caption(f"Cod no SPED: {cod_atual} | Grupo: {row['grupo']}")
-            with col_dest:
-                df_opcoes = item["df_opcoes"]
-                opcoes    = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_opcoes["Display"].tolist()
-                chave_sel = f"dp_sel_{cod_atual}"
-                valor_ini = opcoes[0]
-
-                if item["esta_no_mapa"]:
-                    match_row = df_novo[df_novo["Código"] == item["valor_no_mapa"]]
-                    if not match_row.empty:
-                        disp = match_row.iloc[0]["Display"]
-                        if disp not in opcoes: opcoes.insert(2, disp)
-                        valor_ini = disp
-                    else:
-                        valor_ini = "📝 -- DIGITAR MANUALMENTE --"
-                        if f"dp_in_{cod_atual}" not in st.session_state:
-                            st.session_state[f"dp_in_{cod_atual}"] = item["valor_no_mapa"]
-                elif item["display_sugerido_ia"]:
-                    if item["display_sugerido_ia"] not in opcoes:
-                        opcoes.insert(2, item["display_sugerido_ia"])
-                    if chave_sel not in st.session_state:
-                        valor_ini = item["display_sugerido_ia"]
-                    else:
-                        valor_ini = st.session_state[chave_sel]
-
-                if chave_sel not in st.session_state:
-                    st.session_state[chave_sel] = valor_ini
-
-                if item["is_manual"]:   st.info("📌 Mapeado Manualmente")
-                elif item["score"] >= 65: st.success(f"✅ Sugestão: {item['score']}%")
-                else:                   st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
-
-                escolha = st.selectbox(
-                    label=f"dp_sel_{cod_atual}", options=opcoes,
-                    key=chave_sel, label_visibility="collapsed"
-                )
-
-                novo_valor = None
-                if escolha == "📝 -- DIGITAR MANUALMENTE --": pass
-                elif escolha != "-- SELECIONE --":
-                    try:
-                        cod_red = escolha.split(" | ")[0]
-                        if str(cod_red) != item["valor_no_mapa"]: novo_valor = str(cod_red)
-                    except: pass
-                elif escolha == "-- SELECIONE --" and item["esta_no_mapa"]:
-                    del st.session_state.de_para_map[cod_atual]; st.rerun()
-
-                if novo_valor:
-                    st.session_state.de_para_map[cod_atual] = novo_valor; st.rerun()
-
-                if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                    valor_ant = st.session_state.de_para_map.get(cod_atual, "")
-                    st.text_input(
-                        f"Cód. manual para {cod_atual}:", value=valor_ant,
-                        key=f"dp_in_{cod_atual}",
-                        on_change=_atualizar_manual_depara, args=(cod_atual,)
-                    )
-            st.markdown("---")
-
-    # ── Métricas ──────────────────────────────────────────────────────────────
-    st.markdown("---")
-    col_m1, col_m2, col_m3 = st.columns(3)
-    pendentes    = len(df_origem) - total_mapeadas_count
-    perc_conc    = (total_mapeadas_count / len(df_origem) * 100) if len(df_origem) > 0 else 0
-    col_m1.metric("Total",    len(df_origem))
-    col_m2.metric("Mapeadas", total_mapeadas_count, f"{perc_conc:.1f}%")
-    col_m3.metric("Pendentes", pendentes, f"-{pendentes}", delta_color="inverse")
-
-    # ── Finalização ───────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### 📂 Finalização, Relatórios e Downloads")
-
-    # Extrai CNPJ do SPED para o |0000|
-    cnpj_depara = ""
-    for line in content_sped:
-        if line.startswith("|0000|"):
-            parts = line.split("|")
-            if len(parts) > 5:
-                cnpj_depara = re.sub(r"\D", "", parts[5].strip())
-            break
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    # ── 1. SPED AJUSTADO ─────────────────────────────────────────────────────
-    with col1:
-        st.markdown("**1. Arquivo Final**")
-        if pendentes > 0:
-            st.warning(f"⚠️ Faltam {pendentes} contas.")
-            st.button("🚀 Gerar SPED", disabled=True, key="btn_sped_depara")
-        else:
-            saida = []
-            for line in content_sped:
-                if line.startswith("|9999|"):
-                    saida.append(line); break
-                if line.startswith("|I250|"):
-                    reg = line.split("|")
-                    if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                        novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
-                        reg[2]   = novo_cod
-                    saida.append("|".join(reg))
-                else:
-                    saida.append(line)
-            sped_buffer = "\r\n".join(saida).encode("latin-1", errors="replace")
-            st.download_button(
-                "💾 Baixar SPED Ajustado",
-                data=sped_buffer,
-                file_name=f"SPED_AJUSTADO_{_limpar_nome_arquivo_depara(nome_empresa)}.txt",
-                mime="text/plain", use_container_width=True,
-            )
-            if os.path.exists("Conjunto SPED.xml"):
-                with open("Conjunto SPED.xml", "rb") as f:
-                    st.download_button(
-                        "⬇ Baixar Conjunto SPED (XML)", f.read(),
-                        "Conjunto SPED.xml", "application/xml",
-                        use_container_width=True,
-                    )
-
-    # ── 2. BALANÇO (I155) ────────────────────────────────────────────────────
-    with col2:
-        st.markdown("**2. Balanço (I155)**")
-
-        tipo_saldo_bal = st.radio(
-            "Modo do Balanço:",
-            ["Inicial (Abertura)", "Final (Fechamento)", "Aberto com Resultado (I355)"],
-            key="radio_balanco_modo"
-        )
-        data_padrao_bal = datetime.today().date()
-        if tipo_saldo_bal == "Inicial (Abertura)" and dt_ini_sped:
-            from datetime import timedelta
-            data_padrao_bal = dt_ini_sped - timedelta(days=1)
-        elif tipo_saldo_bal == "Final (Fechamento)" and dt_fin_sped:
-            data_padrao_bal = dt_fin_sped
-
-        data_balanco = st.date_input(
-            "Data p/ Balanço:", data_padrao_bal,
-            format="DD/MM/YYYY", key="date_balanco_depara"
-        )
-        dt_fmt_bal = data_balanco.strftime("%d/%m/%Y")
-
-        # Opção Centro de Custo
-        gerar_6110_bal = st.checkbox(
-            "Gerar 6110 (Centro de Custo)", value=False, key="chk_6110_bal"
-        )
-        cc_deb_bal = cc_cred_bal = ""
-        if gerar_6110_bal:
-            cc_deb_bal  = st.text_input("CC Débito", key="cc_deb_bal")
-            cc_cred_bal = st.text_input("CC Crédito", key="cc_cred_bal")
-
-        # Campo conta PL para modo Aberto
-        conta_pl_bal = ""
-        if tipo_saldo_bal == "Aberto com Resultado (I355)":
-            # Tenta sugerir o código novo via mapa
-            conta_pl_sugerida_ant = st.session_state.get("conta_pl_sugerida", "")
-            conta_pl_sugerida_nov = map_final_para_geracao.get(conta_pl_sugerida_ant, "")
-            if conta_pl_sugerida_nov:
-                st.info(f"💡 Sugestão (código novo): **{conta_pl_sugerida_nov}** "
-                        f"(convertida de {conta_pl_sugerida_ant})")
-            else:
-                st.warning("⚠ Conta PL detectada ainda não mapeada. Informe o código novo.")
-            conta_pl_bal = st.text_input(
-                "Código PL/Resultado (código NOVO):",
-                value=conta_pl_sugerida_nov,
-                key="conta_pl_bal_depara"
-            )
-
-        if st.button("🔍 Processar Balanço", key="btn_balanco_depara"):
-            log_bal = []
-            try:
-                bytes_sped = st.session_state["depara_file_sped_bytes"]
-                parsed = _parse_saldo_inicial_ecd(bytes_sped, log_bal)
-
-                if tipo_saldo_bal == "Inicial (Abertura)":
-                    modo_bal = "apenas_patrimonial"
-                    # Usa saldos do primeiro período I150
-                    parsed_uso = dict(parsed)
-                elif tipo_saldo_bal == "Final (Fechamento)":
-                    modo_bal = "apenas_patrimonial"
-                    # Substitui saldos_i155_pat pelos saldos finais do I155
-                    parsed_uso = dict(parsed)
-                    saldos_fin = {}
-                    for line in content_sped:
-                        if line.startswith("|I155|"):
-                            reg = line.split("|")
-                            if len(reg) >= 10:
-                                cod    = reg[2].strip()
-                                v_str  = reg[8].strip()
-                                dc_str = reg[9].strip().upper()
-                                if dc_str not in ("D", "C"): dc_str = "D"
-                                try: vf = _str2float(v_str)
-                                except: vf = 0.0
-                                saldos_fin[cod] = (vf, dc_str)
-                    contas_i355_set = set(parsed["saldos_i355"].keys())
-                    parsed_uso["saldos_i155_pat"] = {
-                        cta: sv for cta, sv in saldos_fin.items()
-                        if cta not in contas_i355_set
-                    }
-                else:
-                    modo_bal  = "aberto_com_resultado"
-                    parsed_uso = dict(parsed)
-
-                # Aplica DE/PARA nos códigos
-                parsed_novo = _aplicar_depara_no_parsed(
-                    parsed_uso, map_final_para_geracao, conta_pl_bal
-                )
-
-                resultado_bytes_bal, resumo_bal, erros_bal = _gerar_saldo_inicial_dominio(
-                    parsed_novo, cnpj_depara,
-                    f"SALDO DE ABERTURA EM {dt_fmt_bal}",
-                    modo_bal, conta_pl_bal, log_bal
-                )
-
-                # Injeta 6110 se solicitado
-                if gerar_6110_bal and resultado_bytes_bal:
-                    linhas_bal = resultado_bytes_bal.decode("utf-8-sig").splitlines()
-                    novas = []
-                    for l in linhas_bal:
-                        novas.append(l)
-                        if l.startswith("|6100|"):
-                            campos_l = l.split("|")
-                            if len(campos_l) >= 6:
-                                v_fmt = campos_l[5].strip()
-                                dc_l  = "D" if campos_l[3].strip() else "C"
-                                if dc_l == "D":
-                                    for l6110 in _gerar_6110_linha(cc_deb_bal, "", v_fmt, "deb"):
-                                        novas.append(l6110)
-                                else:
-                                    for l6110 in _gerar_6110_linha("", cc_cred_bal, v_fmt, "cred"):
-                                        novas.append(l6110)
-                    resultado_bytes_bal = "\r\n".join(novas).encode("utf-8-sig")
-
-                tot_d = resumo_bal.get("total_debito", 0)
-                tot_c = resumo_bal.get("total_credito", 0)
-                diff  = round(abs(tot_d - tot_c), 2)
-                bal_ok = diff < TOL_VALOR
-
-                st.session_state.balanco_dados     = resultado_bytes_bal
-                st.session_state.balanco_totais    = {"D": tot_d, "C": tot_c, "diff": diff}
-                st.session_state.balanco_processado = True
-                st.session_state.balanco_has_data  = bool(resultado_bytes_bal)
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Erro ao processar balanço: {ex}")
-
-        if st.session_state.balanco_processado:
-            tot = st.session_state.balanco_totais
-            diff = tot.get("diff", abs(tot.get("D", 0) - tot.get("C", 0)))
-            st.markdown("---")
-            st.caption(f"Débitos : {_format_moeda_depara(tot['D'])}")
-            st.caption(f"Créditos: {_format_moeda_depara(tot['C'])}")
-            if diff < TOL_VALOR:
-                st.markdown("<div class='card-ok'>✅ <b style='color:#00C896;'>Balanço balanceado (D = C).</b></div>",
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div class='card-err'>⚠️ <b style='color:#FF4444;'>Diferença: "
-                            f"{_format_moeda_depara(diff)}</b></div>", unsafe_allow_html=True)
-            if st.session_state.balanco_has_data and pendentes == 0:
-                st.download_button(
-                    "💾 Baixar Balanço",
-                    data=st.session_state.balanco_dados,
-                    file_name=f"BALANCO_{_limpar_nome_arquivo_depara(nome_empresa)}_{dt_fmt_bal.replace('/','')}.txt",
-                    mime="text/plain", use_container_width=True,
-                )
-            elif pendentes > 0:
-                st.warning("Resolva as pendências primeiro.")
-
-    # ── 3. I157 ──────────────────────────────────────────────────────────────
-    with col3:
-        st.markdown("**3. Troca de Plano (I157)**")
-
-        tipo_i157 = st.radio(
-            "Modo I157:",
-            ["Apenas Patrimonial", "Aberto com Resultado"],
-            key="radio_i157_modo"
-        )
-        conta_pl_i157 = ""
-        if tipo_i157 == "Aberto com Resultado":
-            conta_pl_sugerida_ant = st.session_state.get("conta_pl_sugerida", "")
-            conta_pl_sugerida_nov = map_final_para_geracao.get(conta_pl_sugerida_ant, "")
-            if conta_pl_sugerida_nov:
-                st.info(f"💡 Sugestão (código novo): **{conta_pl_sugerida_nov}**")
-            else:
-                st.warning("⚠ Conta PL não mapeada. Informe o código novo.")
-            conta_pl_i157 = st.text_input(
-                "Código PL/Resultado (código NOVO):",
-                value=conta_pl_sugerida_nov,
-                key="conta_pl_i157_depara"
-            )
-
-        if st.button("🔄 Processar I157", key="btn_i157_depara"):
-            log_i157 = []
-            try:
-                bytes_sped = st.session_state["depara_file_sped_bytes"]
-                parsed_i157 = _parse_saldo_inicial_ecd(bytes_sped, log_i157)
-
-                # Monta saldos conforme modo
-                if tipo_i157 == "Apenas Patrimonial":
-                    todos_saldos_i157 = dict(parsed_i157["saldos_i155_pat"])
-                else:
-                    saldos_pat_i157 = dict(parsed_i157["saldos_i155_pat"])
-                    saldos_i355_i157 = dict(parsed_i157["saldos_i355"])
-                    if not saldos_i355_i157:
-                        st.warning("Nenhum I355 encontrado — usando apenas patrimonial.")
-                        todos_saldos_i157 = saldos_pat_i157
-                    elif not conta_pl_i157:
-                        st.warning("Informe a conta PL — usando apenas patrimonial.")
-                        todos_saldos_i157 = saldos_pat_i157
-                    else:
-                        # Deduz resultado líquido da conta PL
-                        res_liq_i157, dc_res_i157 = _calcular_resultado_liquido_i355(saldos_i355_i157)
-                        todos_saldos_i157 = dict(saldos_pat_i157)
-                        # conta_pl_i157 já é o código NOVO — busca reverso para encontrar no parsed
-                        # parsed usa códigos ANTIGOS; conta_pl_i157 é código NOVO
-                        # Encontra o código antigo correspondente
-                        cod_ant_pl = None
-                        for c_ant, c_nov in map_final_para_geracao.items():
-                            if c_nov == conta_pl_i157:
-                                cod_ant_pl = c_ant; break
-                        if cod_ant_pl and cod_ant_pl in todos_saldos_i157:
-                            saldo_pl_v, dc_pl = todos_saldos_i157[cod_ant_pl]
-                            if dc_pl == "C" and dc_res_i157 == "C":   novo_s = round(saldo_pl_v - res_liq_i157, 2)
-                            elif dc_pl == "D" and dc_res_i157 == "D": novo_s = round(saldo_pl_v - res_liq_i157, 2)
-                            elif dc_pl == "C" and dc_res_i157 == "D": novo_s = round(saldo_pl_v + res_liq_i157, 2)
-                            else:                                       novo_s = round(saldo_pl_v + res_liq_i157, 2)
-                            if novo_s >= 0:
-                                todos_saldos_i157[cod_ant_pl] = (novo_s, dc_pl)
-                            else:
-                                dc_inv = "D" if dc_pl == "C" else "C"
-                                todos_saldos_i157[cod_ant_pl] = (abs(novo_s), dc_inv)
-                        for cta_r, sv_r in saldos_i355_i157.items():
-                            todos_saldos_i157[cta_r] = sv_r
-
-                # Filtra zeros e gera linhas I157
-                todos_saldos_i157 = {
-                    cta: (v, dc) for cta, (v, dc) in todos_saldos_i157.items() if abs(v) > 1e-6
-                }
-                i157_linhas = ["ID;;;;;;"]
-                i157_data_list = []
-                for cod_antigo, (v, dc) in todos_saldos_i157.items():
-                    if cod_antigo not in map_final_para_geracao: continue
-                    novo = map_final_para_geracao[cod_antigo].replace("|", "")
-                    val_str = f"{v:.2f}".replace(".", ",")
-                    i157_data_list.append((novo, cod_antigo, val_str, dc))
-
-                has_i157 = bool(i157_data_list)
-                if has_i157:
-                    i157_data_list.sort(key=lambda x: str(x[0]))
-                    for novo, cod_antigo, val_str, dc in i157_data_list:
-                        if "." in cod_antigo or not cod_antigo.isnumeric():
-                            linha_i157 = f"C;{novo};;{cod_antigo};{val_str};{dc};"
-                        else:
-                            linha_i157 = f"C;{novo};{cod_antigo};;{val_str};{dc};"
-                        i157_linhas.append(linha_i157)
-
-                st.session_state.i157_dados      = "\r\n".join(i157_linhas).encode("latin-1", errors="replace")
-                st.session_state.i157_processado = True
-                st.session_state.i157_has_data   = has_i157
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Erro ao processar I157: {ex}")
-
-        if st.session_state.get("i157_processado"):
-            st.markdown("---")
-            if st.session_state.i157_has_data and pendentes == 0:
-                st.success("✅ Arquivo I157 gerado!")
-                st.download_button(
-                    "💾 Baixar I157",
-                    data=st.session_state.i157_dados,
-                    file_name=f"I157_Saldos_{_limpar_nome_arquivo_depara(nome_empresa)}.txt",
-                    mime="text/plain", use_container_width=True,
-                )
-                if os.path.exists("Conjunto I157.xml"):
-                    with open("Conjunto I157.xml", "rb") as f:
-                        st.download_button(
-                            "⬇ Baixar Conjunto I157 (XML)", f.read(),
-                            "Conjunto I157.xml", "application/xml",
-                            use_container_width=True,
-                        )
-            elif pendentes > 0:
-                st.warning("Resolva as pendências primeiro.")
-            else:
-                st.warning("Sem dados para gerar.")
-
-    # ── 4. CONFERÊNCIA ────────────────────────────────────────────────────────
-    with col4:
-        st.markdown("**4. Conferência**")
-        df_pend = df_origem[~df_origem["cod"].isin(map_final_para_geracao.keys())]
-        if not df_pend.empty:
-            st.warning(f"{len(df_pend)} conta(s) pendente(s).")
-            st.download_button(
-                "📑 Relatório CSV",
-                data=df_pend.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig"),
-                file_name="contas_pendentes.csv", mime="text/csv",
-                use_container_width=True,
-            )
-        else:
-            st.success("✅ Tudo mapeado!")
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
+# ABA DE/PARA — SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
+def _sidebar_depara():
+    """Renderiza a seção DE/PARA na sidebar. Upload único — alimenta Conversor + DE/PARA."""
+    st.markdown("---")
+    st.markdown("### 🔀 DE/PARA — Plano de Contas")
+
+    # ── Upload SPED (único — alimenta tudo) ──────────────────────────────────
+    file_sped_depara = st.file_uploader(
+        "Arquivo SPED ECD (.txt)", type=["txt"], key="upload_depara_sped"
+    )
+    if file_sped_depara is not None:
+        bytes_novo = file_sped_depara.getvalue()
+        if bytes_novo != st.session_state.get("depara_file_sped_bytes"):
+            # ── Alimenta o módulo DE/PARA ─────────────────────────────────────
+            st.session_state["depara_file_sped_bytes"] = bytes_novo
+            st.session_state["depara_file_sped_nome"]  = file_sped_depara.name
+            content = _ler_sped_como_linhas(bytes_novo)
+            st.session_state["depara_content_sped"]    = content
+            nome_emp, dt_ini, dt_fin = _extrair_cabecalho_sped_depara(content)
+            st.session_state["depara_nome_empresa"]    = nome_emp
+            st.session_state["depara_dt_ini"]          = dt_ini
+            st.session_state["depara_dt_fin"]          = dt_fin
+            st.session_state["balanco_processado"]     = False
+            st.session_state["i157_processado"]        = False
+
+            # ── Alimenta também o Conversor principal ─────────────────────────
+            _reset()
+            st.session_state["arquivo_bytes"] = bytes_novo
+            st.session_state["arquivo_nome"]  = file_sped_depara.name
+            tipo = identificar_tipo(file_sped_depara.name, bytes_novo)
+            st.session_state["tipo_detectado"] = tipo
+            if tipo == "ecd":
+                cnpj_num = _pre_scan_cnpj_ecd(bytes_novo)
+                st.session_state["cnpj_ecd"]     = cnpj_num
+                st.session_state["cnpj_ecd_fmt"] = fmt_cnpj(cnpj_num) if cnpj_num else ""
+                _pre_scan_conta_pl_sugerida(bytes_novo)
+
+    # ── Plano de Contas ───────────────────────────────────────────────────────
+    depara_usar_padrao = st.checkbox(
+        "Usar Plano de Contas Padrão?", value=True, key="chk_depara_padrao"
+    )
+    if depara_usar_padrao:
+        caminho_padrao = "plano_padrao.xlsx"
+        if os.path.exists(caminho_padrao):
+            try:
+                df_novo = pd.read_excel(caminho_padrao, header=None).iloc[:, [0, 1, 2]]
+                df_novo.columns = ["Código", "Classificação", "Nome"]
+                st.session_state["depara_df_novo"] = df_novo
+                st.caption("✅ Plano padrão carregado do disco.")
+            except Exception as ex:
+                st.error(f"Erro ao ler plano_padrao.xlsx: {ex}")
+        else:
+            st.warning("'plano_padrao.xlsx' não encontrado no servidor.")
+    else:
+        file_excel_depara = st.file_uploader(
+            "Plano de Contas Novo (Excel)", type=["xlsx"], key="upload_depara_excel"
+        )
+        if file_excel_depara:
+            try:
+                df_novo = pd.read_excel(file_excel_depara, header=None).iloc[:, [0, 1, 2]]
+                df_novo.columns = ["Código", "Classificação", "Nome"]
+                st.session_state["depara_df_novo"] = df_novo
+                st.caption(f"✅ Plano carregado: {len(df_novo):,} contas.")
+            except Exception as ex:
+                st.error(f"Erro ao ler Excel: {ex}")
+
+    # ── Backup ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**💾 Backup do Mapeamento**")
+    arquivo_backup = st.file_uploader(
+        "Carregar Progresso (.json)", type=["json"], key="backup_upload_depara"
+    )
+    if arquivo_backup is not None:
+        try:
+            file_id = f"{arquivo_backup.name}_{arquivo_backup.size}"
+            if st.session_state.get("backup_id") != file_id:
+                dados = json.load(arquivo_backup)
+                dados_limpos = {str(k): str(v) for k, v in dados.items()}
+                st.session_state.de_para_map.update(dados_limpos)
+                for cod, val in dados_limpos.items():
+                    st.session_state[f"dp_in_{cod}"] = val
+                st.session_state["backup_id"] = file_id
+                st.success(f"Backup carregado! {len(dados_limpos)} contas.")
+                st.rerun()
+        except Exception as ex:
+            st.error(f"Erro no backup: {ex}")
+
+    # ── Botão salvar progresso ────────────────────────────────────────────────
+    if st.session_state.de_para_map:
+        st.download_button(
+            "⬇ Salvar Progresso (.json)",
+            data=json.dumps(st.session_state.de_para_map, indent=4).encode("utf-8"),
+            file_name="backup_mapeamento_ecd.json",
+            mime="application/json",
+            help="Baixe para continuar depois.",
+            use_container_width=True,
+        )
+
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**Filtros de Tela**")
+    ocultar_mapeadas = st.checkbox(
+        "Ocultar contas já mapeadas?", value=False, key="chk_ocultar_mapeadas"
+    )
+    return ocultar_mapeadas
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — bloco with st.sidebar e início da aba_conv
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     st.set_page_config(
@@ -3074,14 +2670,12 @@ def main():
     )
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SIDEBAR
+    # SIDEBAR — upload único + DE/PARA
     # ═════════════════════════════════════════════════════════════════════════
     with st.sidebar:
         st.markdown("### ⚙ Configurações")
         st.markdown("---")
         exibir_log = st.checkbox("Exibir log de processamento", value=True)
-
-        # ── Seção DE/PARA na sidebar ──────────────────────────────────────────
         ocultar_mapeadas = _sidebar_depara()
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -3091,6 +2685,434 @@ def main():
         "🔄 Conversor / Saldo Inicial",
         "🔍 Comparar I052 entre ECDs",
     ])
+
+    # ── ABA 1 — CONVERSOR / SALDO INICIAL / DE/PARA ──────────────────────────
+    with aba_conv:
+
+        # ── Passo 1 — arquivo vem da sidebar (sem segundo upload) ─────────────
+        st.markdown("#### 📂 Passo 1 — Selecionar Arquivo")
+
+        if st.session_state.get("arquivo_bytes") is None:
+            st.markdown(
+                "<div class='info-box'>⬆ Carregue o arquivo SPED ECD na sidebar "
+                "para usar o Conversor e o DE/PARA.</div>",
+                unsafe_allow_html=True
+            )
+            st.markdown("---")
+            _aba_depara()
+            # não usa return — deixa o resto da aba renderizar normalmente
+        else:
+            conteudo = st.session_state["arquivo_bytes"]
+            mb_info  = len(conteudo) / (1024 * 1024)
+            tipo     = st.session_state.tipo_detectado
+
+            # ── Badge ─────────────────────────────────────────────────────────
+            badges = {
+                "ecd":         "<span class='badge-ecd'>📋 SPED ECD</span>",
+                "ecd_saldo":   "<span class='badge-si'>📥 SPED ECD — Saldo Inicial</span>",
+                "excel":       "<span class='badge-excel'>📊 Excel</span>",
+                "lote":        "<span class='badge-lote'>📄 TXT Lote (;)</span>",
+                "dominio_pos": "<span class='badge-pos'>📋 TXT Posicional Domínio</span>",
+            }
+            st.markdown(
+                f"{badges.get(tipo, '')} "
+                f"<span style='color:#6B7A8D;font-size:13px;margin-left:12px;'>"
+                f"{st.session_state.arquivo_nome} — {mb_info:.1f} MB</span>",
+                unsafe_allow_html=True
+            )
+            st.markdown("")
+
+            # ── Seção DE/PARA ─────────────────────────────────────────────────
+            st.markdown("---")
+            _aba_depara()
+            st.markdown("---")
+
+            # ── CNPJ ──────────────────────────────────────────────────────────
+            ni = ""; ok_insc = False; ti = ""; inf = ""
+
+            if tipo in ("ecd", "ecd_saldo"):
+                st.markdown("#### 🏢 Passo 2 — CNPJ (preenchido automaticamente)")
+                cnpj_ecd = st.session_state.cnpj_ecd
+                if cnpj_ecd and validar_cnpj(cnpj_ecd):
+                    st.markdown(
+                        f"<div class='cnpj-auto'>✔ CNPJ extraído: "
+                        f"<span>{st.session_state.cnpj_ecd_fmt}</span></div>",
+                        unsafe_allow_html=True
+                    )
+                    st.code(fmt_reg_0000(cnpj_ecd), language=None)
+                    ok_insc = True; ti = "CNPJ"; ni = cnpj_ecd
+                    inf = st.session_state.cnpj_ecd_fmt
+                else:
+                    st.warning("⚠ CNPJ não encontrado. Informe manualmente.")
+                    cnpj_raw = st.text_input(
+                        "CNPJ / CPF", placeholder="00.000.000/0001-00",
+                        key="cnpj_manual_ecd"
+                    )
+                    ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+                    if cnpj_raw:
+                        if ok_insc:
+                            inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
+                            st.success(f"✔ {ti} válido: {inf}")
+                        else:
+                            st.error("✖ CNPJ/CPF inválido")
+
+                # ── Módulo Saldo Inicial ──────────────────────────────────────
+                st.markdown("---")
+                st.markdown(
+                    "<div class='si-box'><b style='color:#FF9EBC;font-size:15px;'>"
+                    "📥 Módulo Saldo Inicial</b><br>"
+                    "<small style='color:#C8A0B8;'>Extrai o saldo final do SPED ECD e gera um único "
+                    "lançamento de saldo inicial no leiaute Domínio.</small></div>",
+                    unsafe_allow_html=True
+                )
+                col_si1, col_si2 = st.columns([1, 2])
+                with col_si1:
+                    modo_saldo = st.checkbox(
+                        "🔄 Gerar Saldo Inicial",
+                        value=st.session_state.get("modo_saldo_inicial", False),
+                        key="chk_saldo_inicial"
+                    )
+                    st.session_state.modo_saldo_inicial = modo_saldo
+                with col_si2:
+                    hist_prefixo = st.text_input(
+                        "Prefixo do histórico",
+                        value=st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
+                        max_chars=60, key="hist_prefixo_si_widget"
+                    )
+                    st.session_state.hist_prefixo_si = hist_prefixo
+
+                if modo_saldo:
+                    st.markdown("##### Tratamento das contas de Resultado")
+                    modo_resultado = st.radio(
+                        "Como tratar as contas de Resultado (I355)?",
+                        options=["apenas_patrimonial", "aberto_com_resultado"],
+                        format_func=lambda x: {
+                            "apenas_patrimonial":
+                                "✅ Apenas Patrimonial — Ativo/Passivo/PL (balanço fechado)",
+                            "aberto_com_resultado":
+                                "📂 Aberto com Resultado — inclui Receitas/Despesas",
+                        }[x],
+                        index=0 if st.session_state.get(
+                            "modo_resultado_si", "apenas_patrimonial"
+                        ) == "apenas_patrimonial" else 1,
+                        key="modo_resultado_si_widget"
+                    )
+                    st.session_state.modo_resultado_si = modo_resultado
+
+                    conta_pl = ""
+                    if modo_resultado == "aberto_com_resultado":
+                        sugerida      = st.session_state.get("conta_pl_sugerida", "")
+                        sugerida_nome = st.session_state.get("conta_pl_sugerida_nome", "")
+                        if sugerida:
+                            st.markdown(
+                                f"<div class='si-box'>"
+                                f"<b style='color:#FF9EBC;'>💡 Conta sugerida automaticamente:</b><br>"
+                                f"<span style='color:#FFD166;font-size:18px;font-weight:700;'>"
+                                f"{sugerida}</span>"
+                                f"<span style='color:#9BB0C8;margin-left:12px;'>{sugerida_nome}</span>"
+                                f"</div>", unsafe_allow_html=True
+                            )
+                        conta_pl = st.text_input(
+                            "Código da conta de Superávit/Déficit (PL)",
+                            value=sugerida if sugerida else st.session_state.get(
+                                "conta_pl_resultado_si", ""
+                            ),
+                            placeholder="Ex: 311010101",
+                            key="conta_pl_resultado_si_widget"
+                        )
+                        st.session_state.conta_pl_resultado_si = conta_pl
+                        if not conta_pl:
+                            st.warning("⚠ Informe a conta de PL/Resultado.")
+                    else:
+                        conta_pl = ""
+                        st.session_state.conta_pl_resultado_si = ""
+
+                    st.session_state.tipo_detectado = "ecd_saldo"
+                    tipo = "ecd_saldo"
+                else:
+                    if (st.session_state.tipo_detectado == "ecd_saldo"
+                            and not st.session_state.processado):
+                        st.session_state.tipo_detectado = "ecd"
+                        tipo = "ecd"
+
+            else:
+                st.markdown("#### 🏢 Passo 2 — Informar CNPJ / CPF")
+                cnpj_raw = st.text_input(
+                    "CNPJ / CPF", placeholder="00.000.000/0001-00 ou 000.000.000-00",
+                    key="cnpj_lote"
+                )
+                ok_insc, ti, ni = validar_inscricao(cnpj_raw)
+                if cnpj_raw:
+                    if ok_insc:
+                        inf = fmt_cnpj(ni) if ti == "CNPJ" else fmt_cpf(ni)
+                        col_a, col_b = st.columns([1, 2])
+                        with col_a: st.success(f"✔ {ti} válido")
+                        with col_b: st.code(fmt_reg_0000(ni), language=None)
+                    else:
+                        st.error("✖ CNPJ/CPF inválido")
+
+            # ── Opções ────────────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### ⚙ Passo 3 — Opções e Conversão")
+            col_op1, col_op2 = st.columns(2)
+            with col_op1:
+                gerar_6110 = st.checkbox(
+                    "Gerar registro 6110 (Centro de Custos)", value=False,
+                    disabled=(tipo not in ("ecd", "dominio_pos", "excel"))
+                )
+            with col_op2:
+                usar_de_para = st.checkbox(
+                    "🏢 Habilitar De/Para de filiais", value=False,
+                    disabled=(tipo not in ("dominio_pos", "excel"))
+                )
+
+            mapa_filiais = {}
+            if tipo == "dominio_pos" and usar_de_para:
+                mapa_filiais = _widget_de_para_filiais(
+                    True, st.session_state.get("filiais_detectadas", [])
+                )
+            elif tipo == "excel" and usar_de_para:
+                filiais_excel = []
+                if st.session_state.get("arquivo_bytes") and st.session_state.get("sheet_sel"):
+                    try:
+                        sh_scan = st.session_state.sheet_sel
+                        lh_scan, _ = detectar_cabecalho_excel(
+                            st.session_state.arquivo_bytes, sh_scan
+                        )
+                        df_scan, _ = ler_excel_lote(
+                            st.session_state.arquivo_bytes, sh_scan, lh_scan
+                        )
+                        filiais_excel = _pre_scan_filiais_excel(df_scan)
+                        del df_scan
+                    except:
+                        filiais_excel = []
+                mapa_filiais = _widget_de_para_filiais(True, filiais_excel)
+
+            col_b1, col_b2 = st.columns([2, 1])
+            with col_b1:
+                btn_converter = st.button(
+                    "▶ CONVERTER", disabled=(not ok_insc),
+                    use_container_width=True, type="primary"
+                )
+            with col_b2:
+                btn_limpar = st.button("🗑 Limpar tudo", use_container_width=True)
+
+            if btn_limpar:
+                _reset(); st.rerun()
+
+            # ── Processamento (igual ao original — sem alterações) ─────────────
+            if btn_converter and ok_insc:
+                conteudo  = st.session_state.arquivo_bytes
+                log       = []; crono = Cronometro(); crono.iniciar()
+                status_txt = st.empty(); prog_bar = st.progress(0)
+                try:
+                    if tipo == "ecd_saldo":
+                        crono.etapa("Saldo Inicial ECD")
+                        log.append("── SALDO INICIAL — SPED ECD V4.0.0 ──")
+                        resultado_bytes, metricas, todos_erros = processar_saldo_inicial_ecd(
+                            conteudo, ni,
+                            st.session_state.get("hist_prefixo_si", "SALDO INICIAL"),
+                            st.session_state.get("modo_resultado_si", "apenas_patrimonial"),
+                            st.session_state.get("conta_pl_resultado_si", ""),
+                            log, prog_bar, status_txt
+                        )
+                        st.session_state.resultado_bytes = resultado_bytes
+                        st.session_state.resultado_nome  = f"SALDO_INI_{ni}.txt"
+                        st.session_state.metricas        = metricas
+                        st.session_state.processado      = True
+                        if todos_erros:
+                            st.session_state.erros_bytes = (
+                                _txt_erros_ecd(todos_erros, ni).encode("utf-8-sig")
+                            )
+                            st.session_state.erros_nome = f"SALDO_INI_{ni}_erros.txt"
+                        total_seg = crono.encerrar()
+                        log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                        for e in crono.etapas:
+                            log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                        st.session_state.log_linhas = log
+
+                    elif tipo == "ecd":
+                        status_txt.text("Lendo SPED ECD...")
+                        log.append("── LEITURA SPED ECD ──")
+                        crono.etapa("Leitura SPED ECD"); prog_bar.progress(10)
+                        ecd, registros_erro = _parse_ecd(conteudo, log)
+                        if ecd is None:
+                            st.error("Falha na leitura do SPED ECD.")
+                            st.session_state.log_linhas = log
+                        else:
+                            prog_bar.progress(50)
+                            status_txt.text("Gerando registros...")
+                            crono.etapa("Geração dos registros")
+                            log.append("\n── GERAÇÃO ──")
+                            linhas_ecd = _gerar_ecd(ecd, log, prog_bar, status_txt)
+                            if gerar_6110:
+                                linhas_ecd = _injetar_6110_ecd(linhas_ecd)
+                                n6110 = sum(1 for l in linhas_ecd if l.startswith("|6110|"))
+                                log.append(f"  Reg. 6110 gerados  : {n6110:,}")
+                            crono.etapa("Montagem do arquivo")
+                            prog_bar.progress(90); status_txt.text("Montando arquivo...")
+                            buf_out = io.StringIO()
+                            for i in range(0, len(linhas_ecd), WRITE_CHUNK):
+                                buf_out.write("\n".join(linhas_ecd[i:i + WRITE_CHUNK]) + "\n")
+                            resultado_bytes = buf_out.getvalue().encode("utf-8-sig")
+                            del buf_out, linhas_ecd; gc.collect()
+                            st.session_state.resultado_bytes = resultado_bytes
+                            st.session_state.resultado_nome  = f"ECD_{ni}_dominio.txt"
+                            n6000   = resultado_bytes.count(b"|6000|")
+                            n6100   = resultado_bytes.count(b"|6100|")
+                            n6110_f = resultado_bytes.count(b"|6110|")
+                            metricas = {
+                                "CNPJ":               ecd.cnpj,
+                                "Lançamentos (I200)": f"{len(ecd.lancamentos):,}",
+                                "Registros 6000":     f"{n6000:,}",
+                                "Registros 6100":     f"{n6100:,}",
+                                "Tamanho saída":      f"{len(resultado_bytes)/1024:.1f} KB",
+                            }
+                            if gerar_6110:
+                                metricas["Registros 6110"] = f"{n6110_f:,}"
+                            st.session_state.metricas   = metricas
+                            st.session_state.processado = True
+                            if registros_erro:
+                                st.session_state.erros_bytes = (
+                                    _txt_erros_ecd(registros_erro, ecd.cnpj).encode("utf-8-sig")
+                                )
+                                st.session_state.erros_nome = f"ECD_{ni}_erros.txt"
+                            total_seg = crono.encerrar()
+                            log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                            for e in crono.etapas:
+                                log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                            st.session_state.log_linhas = log
+                            prog_bar.progress(100); status_txt.text("Concluído!")
+
+                    elif tipo == "excel":
+                        crono.etapa("Leitura Excel")
+                        status_txt.text("Lendo Excel..."); prog_bar.progress(8)
+                        sh = st.session_state.sheet_sel
+                        lh_det, _ = detectar_cabecalho_excel(conteudo, sh)
+                        lh = lh_det if auto_head else linha_h
+                        df, _ = ler_excel_lote(conteudo, sh, lh)
+                        log.append(f"Excel — Aba: {sh} | Cabeçalho: linha {lh+1}")
+                        log.append(f"Linhas carregadas: {len(df):,}"); prog_bar.progress(20)
+                        crono.etapa("Montagem de lotes")
+                        status_txt.text("Agrupando lotes...")
+                        df, modo = montar_lotes_excel(df)
+                        n_lotes = int(df["_num_lote"].max()) if len(df) > 0 else 0
+                        log.append(f"Lotes detectados  : {n_lotes:,} [modo: {modo}]")
+                        prog_bar.progress(35)
+                        crono.etapa("Ordenação")
+                        status_txt.text("Reordenando lotes...")
+                        df = _ordenar_lotes_por_data_filial(df)
+                        log.append(f"Lotes reordenados : {n_lotes:,}"); prog_bar.progress(50)
+                        crono.etapa("Processamento")
+                        status_txt.text("Processando lotes...")
+                        resultado_bytes, resumo, erros = processar_excel(
+                            df, ni, mapa_filiais, gerar_6110, log
+                        )
+                        del df; gc.collect(); prog_bar.progress(85)
+                        n_gravados = resultado_bytes.count(b"|6000|")
+                        n6110_f    = resultado_bytes.count(b"|6110|")
+                        st.session_state.resultado_bytes = resultado_bytes
+                        st.session_state.resultado_nome  = "lancamentos.txt"
+                        st.session_state.resumo          = resumo
+                        st.session_state.erros_lote      = erros
+                        crono.etapa("Log")
+                        log_txt = _montar_log_lote(
+                            resumo, erros, ni, ti, inf, n_gravados, 0, "N/A (Excel)", crono
+                        )
+                        st.session_state.log_bytes = log_txt.encode("utf-8-sig")
+                        st.session_state.log_nome  = "log_conversao.txt"
+                        total_seg = crono.encerrar()
+                        log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
+                        metricas = {
+                            "Lotes total":   f"{len(resumo):,}",
+                            "Lotes OK":      f"{len(resumo)-len(erros):,}",
+                            "Lotes erro":    f"{len(erros):,}",
+                            "Reg. gerados":  f"{n_gravados:,}",
+                            "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
+                        }
+                        if gerar_6110:
+                            metricas["Reg. 6110"] = f"{n6110_f:,}"
+                        st.session_state.metricas   = metricas
+                        st.session_state.log_linhas = log
+                        st.session_state.processado = True
+                        prog_bar.progress(100); status_txt.text("Concluído!")
+
+                    elif tipo == "dominio_pos":
+                        crono.etapa("Parse posicional")
+                        log.append("── TXT POSICIONAL DOMÍNIO ──")
+                        resultado_bytes, metricas, erros_parse, filiais_enc = (
+                            processar_dominio_posicional(
+                                conteudo, ni, gerar_6110, usar_de_para,
+                                mapa_filiais, log, prog_bar, status_txt
+                            )
+                        )
+                        st.session_state.filiais_detectadas = filiais_enc
+                        st.session_state.resultado_bytes    = resultado_bytes
+                        st.session_state.resultado_nome     = f"DOM_POS_{ni}_dominio.txt"
+                        st.session_state.metricas           = metricas
+                        st.session_state.processado         = True
+                        if erros_parse:
+                            st.session_state.erros_bytes = (
+                                _txt_erros_ecd(erros_parse, ni).encode("utf-8-sig")
+                            )
+                            st.session_state.erros_nome = f"DOM_POS_{ni}_erros.txt"
+                        total_seg = crono.encerrar()
+                        log.append(f"\n── TEMPO TOTAL: {Cronometro.fmt(total_seg)} ──")
+                        for e in crono.etapas:
+                            log.append(f"  {e['nome']}: {Cronometro.fmt(e['segundos'])}")
+                        st.session_state.log_linhas = log
+
+                    else:
+                        crono.etapa("Streaming")
+                        mb_txt = len(conteudo) / (1024 * 1024)
+                        status_txt.text(f"Processando {mb_txt:.1f} MB..."); prog_bar.progress(5)
+                        log.append(f"── TXT STREAMING — {mb_txt:.1f} MB ──")
+                        resultado_bytes, resumo, erros, total_lins, ignoradas, enc_usado = (
+                            processar_streaming(conteudo, ni, log)
+                        )
+                        prog_bar.progress(90)
+                        n_gravados = resultado_bytes.count(b"|6000|")
+                        st.session_state.resultado_bytes = resultado_bytes
+                        st.session_state.resultado_nome  = "lancamentos.txt"
+                        st.session_state.resumo          = resumo
+                        st.session_state.erros_lote      = erros
+                        crono.etapa("Log")
+                        log_txt = _montar_log_lote(
+                            resumo, erros, ni, ti, inf,
+                            n_gravados, ignoradas, enc_usado, crono
+                        )
+                        st.session_state.log_bytes = log_txt.encode("utf-8-sig")
+                        st.session_state.log_nome  = "log_conversao.txt"
+                        total_seg = crono.encerrar()
+                        log.append(f"\nTempo total: {Cronometro.fmt(total_seg)}")
+                        st.session_state.metricas = {
+                            "Linhas lidas":  f"{total_lins:,}",
+                            "Lotes total":   f"{len(resumo):,}",
+                            "Lotes OK":      f"{len(resumo)-len(erros):,}",
+                            "Lotes erro":    f"{len(erros):,}",
+                            "Reg. gerados":  f"{n_gravados:,}",
+                            "Tamanho saída": f"{len(resultado_bytes)/1024:.1f} KB",
+                        }
+                        st.session_state.log_linhas = log
+                        st.session_state.processado = True
+                        prog_bar.progress(100); status_txt.text("Concluído!")
+
+                except Exception as ex:
+                    tb = traceback.format_exc()
+                    st.error(f"⛔ Erro inesperado: {ex}")
+                    log.append(f"ERRO FATAL: {ex}\n{tb}")
+                    st.session_state.log_linhas = log
+                    prog_bar.progress(0); status_txt.text("Falha.")
+
+                st.rerun()
+
+            # ── Renderização dos resultados ────────────────────────────────────
+            if st.session_state.processado:
+                tipo_proc = st.session_state.tipo_detectado
+                if   tipo_proc == "ecd_saldo":   _render_resultados_saldo_inicial(exibir_log)
+                elif tipo_proc == "ecd":         _render_resultados_ecd(exibir_log)
+                elif tipo_proc == "dominio_pos": _render_resultados_posicional(exibir_log)
+                else:                            _render_resultados_lote(exibir_log)
 
     # ═════════════════════════════════════════════════════════════════════════
     # ABA 2 — COMPARAÇÃO I052
